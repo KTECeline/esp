@@ -1,0 +1,102 @@
+# One command per line. Blank lines and lines starting with # are ignored.
+# 100-command set for a presentation-grade accuracy run.
+What time is it
+Turn on the lights
+What's the weather today
+Set a timer for five minutes
+Play some music
+What's the capital of France
+How are you doing today
+Remind me to call mom
+What's on my calendar
+Turn off the lights
+Tell me a joke
+What's two plus two
+Set an alarm for seven a m
+Play the news
+How far is the moon
+What's the capital of Japan
+Add milk to my shopping list
+Turn up the volume
+What day is it today
+Stop the timer
+Turn down the volume
+What's the capital of Italy
+What's the capital of Germany
+What's the capital of Spain
+What's the capital of China
+What's the capital of Malaysia
+Set a timer for ten minutes
+Set a timer for one minute
+Cancel the alarm
+Wake me up at six thirty
+What's the date today
+What's tomorrow's date
+Play my favorite playlist
+Pause the music
+Skip this song
+Next song please
+Turn off the television
+Turn on the television
+Dim the lights
+Brighten the lights
+Lock the front door
+Unlock the front door
+Is it going to rain today
+What's the temperature outside
+Set the thermostat to seventy degrees
+Add eggs to my shopping list
+Add bread to my shopping list
+Remove milk from my shopping list
+Read my shopping list
+Clear my shopping list
+What's on my to do list
+Add buy groceries to my to do list
+Remind me to take out the trash
+Remind me to water the plants
+Remind me about my meeting at three
+Cancel my three o'clock reminder
+What's three plus five
+What's ten minus four
+What's six times seven
+What's a hundred divided by four
+How many days until Friday
+What's the capital of Canada
+What's the capital of Australia
+What's the capital of Brazil
+What's the capital of Egypt
+What's the capital of India
+Tell me another joke
+Tell me a fun fact
+Tell me about the weather this week
+How's the traffic right now
+Call my mom
+Call my dad
+Send a message to John
+What's my battery percentage
+Increase the brightness
+Decrease the brightness
+Mute the speaker
+Unmute the speaker
+Start a five minute meditation
+Play some relaxing music
+Play some upbeat music
+What genre is this song
+Who sings this song
+What's the news today
+Give me a weather update
+What's the humidity today
+Will it be sunny tomorrow
+Set a reminder for tomorrow morning
+What's on my schedule tomorrow
+Do I have any meetings today
+How long until my next meeting
+What's the capital of South Korea
+What's the capital of Thailand
+What's the capital of Vietnam
+What's the population of Tokyo
+How tall is Mount Everest
+How deep is the ocean
+What's the speed of light
+Good morning
+Good night

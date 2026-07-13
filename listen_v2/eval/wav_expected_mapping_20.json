@@ -1,0 +1,122 @@
+[
+  {
+    "expected": "What time is it",
+    "actual": "What time is it?",
+    "wav": "rec001_120007.wav",
+    "correct": true
+  },
+  {
+    "expected": "Turn on the lights",
+    "actual": "Turn on the lights.",
+    "wav": "rec002_120107.wav",
+    "correct": true
+  },
+  {
+    "expected": "What's the weather today",
+    "actual": "What's the weather today?",
+    "wav": "rec003_120128.wav",
+    "correct": true
+  },
+  {
+    "expected": "Set a timer for five minutes",
+    "actual": "Set a timer for 5 minutes.",
+    "wav": "rec004_120157.wav",
+    "correct": true
+  },
+  {
+    "expected": "Play some music",
+    "actual": "Taste some music",
+    "wav": "rec005_120235.wav",
+    "correct": false
+  },
+  {
+    "expected": "What's the capital of France",
+    "actual": "What's the capital of France?",
+    "wav": "rec006_120258.wav",
+    "correct": true
+  },
+  {
+    "expected": "How are you doing today",
+    "actual": "How are you doing today?",
+    "wav": "rec007_120316.wav",
+    "correct": true
+  },
+  {
+    "expected": "Remind me to call mom",
+    "actual": "Remind me to call mom?",
+    "wav": "rec008_120342.wav",
+    "correct": true
+  },
+  {
+    "expected": "What's on my calendar",
+    "actual": "What's on my calendar?",
+    "wav": "rec009_120406.wav",
+    "correct": true
+  },
+  {
+    "expected": "Turn off the lights",
+    "actual": "Turn off the lights",
+    "wav": "rec010_120433.wav",
+    "correct": true
+  },
+  {
+    "expected": "Tell me a joke",
+    "actual": "Tell me a joke.",
+    "wav": "rec011_120447.wav",
+    "correct": true
+  },
+  {
+    "expected": "What's two plus two",
+    "actual": "What's 2+2?",
+    "wav": "rec012_120502.wav",
+    "correct": false
+  },
+  {
+    "expected": "Set an alarm for seven a m",
+    "actual": "Set an alarm for 7am.",
+    "wav": "rec013_120519.wav",
+    "correct": false
+  },
+  {
+    "expected": "Play the news",
+    "actual": "Play the news",
+    "wav": "rec014_120538.wav",
+    "correct": true
+  },
+  {
+    "expected": "How far is the moon",
+    "actual": "How far is the moon?",
+    "wav": "rec015_120604.wav",
+    "correct": true
+  },
+  {
+    "expected": "What's the capital of Japan",
+    "actual": "What's the capital of Japan?",
+    "wav": "rec016_120629.wav",
+    "correct": true
+  },
+  {
+    "expected": "Add milk to my shopping list",
+    "actual": "Add milk to my shopping list",
+    "wav": "rec017_120645.wav",
+    "correct": true
+  },
+  {
+    "expected": "Turn up the volume",
+    "actual": "Turn up the volume.",
+    "wav": "rec018_120701.wav",
+    "correct": true
+  },
+  {
+    "expected": "What day is it today",
+    "actual": "What day is it today?",
+    "wav": "rec019_120716.wav",
+    "correct": true
+  },
+  {
+    "expected": "Stop the timer",
+    "actual": "Stop the timer.",
+    "wav": "rec020_120743.wav",
+    "correct": true
+  }
+]

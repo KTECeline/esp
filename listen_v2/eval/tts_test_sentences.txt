@@ -1,0 +1,32 @@
+# One sentence per line — realistic assistant replies, varied length/content.
+# Extend to 50 for the full test; this is a starter set of 30.
+Hello! How can I help you today?
+The weather today is sunny with a high of twenty eight degrees.
+Sure, I've set a timer for five minutes.
+The capital of France is Paris.
+I'm sorry, I didn't quite catch that. Could you say it again?
+Your meeting starts in fifteen minutes.
+I've added milk to your shopping list.
+It's currently ten thirty in the morning.
+That's a great question, let me think about it for a moment.
+I've turned off the lights for you.
+Two plus two equals four.
+Today is Wednesday, the ninth of July.
+I don't have access to that information right now.
+Would you like me to remind you again later?
+The moon is about three hundred eighty four thousand kilometers away.
+Here's a joke: why did the scarecrow win an award? Because he was outstanding in his field.
+I've set your alarm for seven a m tomorrow.
+Playing your favorite playlist now.
+I'm not able to do that just yet, but I'm learning.
+Your calendar is clear for the rest of the day.
+The volume has been turned up.
+Let me know if there's anything else you need.
+That sounds like a wonderful plan.
+I've stopped the timer as requested.
+Good morning! I hope you slept well.
+It looks like it might rain later this afternoon.
+I've noted that down for you.
+Thanks for asking, I'm doing well today.
+Just to confirm, you'd like the alarm set for six thirty?
+Have a great rest of your day!

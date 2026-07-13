@@ -1,0 +1,9 @@
+## IDF Component Manager Manifest File
+dependencies:
+  idf:
+    version: '>=5.0.0'
+  # ES7210 mic + I2S/I2C helpers. This is the ONLY external dep we need.
+  # No esp-box-3 BSP -> no esp_lvgl_port -> no LVGL version conflict.
+  espressif/esp_codec_dev: '^1.1.0'
+  # ILI9341 LCD driver (esp_lcd, NOT LVGL) for the status display.
+  espressif/esp_lcd_ili9341: '^1.2.0'

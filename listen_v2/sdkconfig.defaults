@@ -1,0 +1,16 @@
+# BOX-3 has only the native USB-C (ESP32-S3 USB-Serial-JTAG). The default
+# console is UART0 on GPIO43/44, which are NOT connected to the USB-C port,
+# so printf/logs never reach the PC. Route the console to USB-Serial-JTAG.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_UART_DEFAULT=n
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# BOX-3 has 8MB Octal PSRAM. RE-ENABLED — the earlier "all-zero mic" bug
+# that PSRAM was suspected of causing was actually the front button (GPIO1)
+# hardware-muting the mic while held; PSRAM was never the real cause (ruled
+# out by testing with it disabled — mic was STILL zero on GPIO1, only fixed
+# by switching to the BOOT button). Recording buffer lives in PSRAM again so
+# it isn't capped to a few seconds by internal-RAM scarcity.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y

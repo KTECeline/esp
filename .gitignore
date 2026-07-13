@@ -1,0 +1,81 @@
+# =========================
+# Python
+# =========================
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.pyo
+
+# =========================
+# Node.js
+# =========================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# =========================
+# ESP-IDF
+# =========================
+**/build/
+**/managed_components/
+sdkconfig
+sdkconfig.old
+**/log/
+*.elf
+*.bin
+*.map
+
+# =========================
+# Audio files
+# =========================
+*.wav
+*.mp3
+*.pcm
+*.raw
+
+# =========================
+# ML Models
+# =========================
+*.gguf
+*.bin
+*.onnx
+*.pt
+*.pth
+*.safetensors
+
+# =========================
+# Logs / Results
+# =========================
+*.log
+*.jsonl
+*_report*.json
+
+# =========================
+# OS / IDE
+# =========================
+.DS_Store
+.vscode/*
+!.vscode/extensions.json
+
+# =========================
+# Environment secrets
+# =========================
+.env
+.env.*
+
+# =========================
+# External repositories
+# =========================
+whisper.cpp/
+MOSS-TTS-Nano/
+
+# =========================
+# Build outputs
+# =========================
+dist/
+out/
+tmp/

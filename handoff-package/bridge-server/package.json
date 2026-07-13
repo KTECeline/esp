@@ -1,0 +1,9 @@
+{
+  "name": "bridge-server",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Bridge server: receives audio from ESP32, calls voice-mcp-server tools, asks OpenClaw, returns spoken reply",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.25.3"
+  }
+}
