@@ -33,11 +33,10 @@
 #include "esp_codec_dev_defaults.h"
 #include "display.h"
 
-// ======== EDIT THESE ========================================================
-#define WIFI_SSID   "Moses-Mesh"
-#define WIFI_PASS   "5974MAXIS5974.,"
-#define POST_URL    "http://192.168.68.111:8000/upload"
-// ============================================================================
+// WiFi + PC endpoint config lives in wifi_config.h, which is gitignored so real
+// credentials never get committed. First-time setup:
+//   cp main/wifi_config.example.h main/wifi_config.h   (then edit the copy)
+#include "wifi_config.h"
 
 // ---- BOX-3 wiring ----
 #define I2C_PORT        I2C_NUM_0

@@ -66,6 +66,7 @@ sdkconfig.old
 # =========================
 .env
 .env.*
+listen_v2/main/wifi_config.h
 
 # =========================
 # External repositories
