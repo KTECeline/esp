@@ -48,8 +48,12 @@ static const ili9341_lcd_init_cmd_t ili_init[] = {
 // use are filled; everything else is blank. Index = ASCII - 0x20. ----
 static const uint8_t FONT[96][7] = {
     [' '-0x20] = {0,0,0,0,0,0,0},
+    ['!'-0x20] = {0x04,0x04,0x04,0x04,0x04,0,0x04},
+    ['\''-0x20] = {0x0C,0x04,0x08,0,0,0,0},
+    [','-0x20] = {0,0,0,0,0,0x0C,0x08},
     ['.'-0x20] = {0,0,0,0,0,0x0C,0x0C},
     [':'-0x20] = {0,0x0C,0x0C,0,0x0C,0x0C,0},
+    ['?'-0x20] = {0x0E,0x11,0x01,0x02,0x04,0,0x04},
     ['-'-0x20] = {0,0,0,0x1F,0,0,0},
     ['0'-0x20] = {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E},
     ['1'-0x20] = {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E},
@@ -232,6 +236,53 @@ void display_order(const char *title, const order_line_t *lines, int count,
     fill_rect(0, ty, LCD_W, TOTAL_H, blue);
     draw_text_left(12, ty + 11, 3, COL_WHITE, blue, "TOTAL");
     if (total) draw_text_right(LCD_W - 12, ty + 11, 3, COL_WHITE, blue, total);
+}
+
+void display_caption(const char *speaker, uint16_t bar, const char *text)
+{
+    if (!s_panel) return;
+    const int BAR_H = 30;
+
+    fill_screen(COL_BLACK);
+    fill_rect(0, 0, LCD_W, BAR_H, bar);
+    draw_text_left(10, 5, 3, COL_WHITE, bar, speaker ? speaker : "");
+
+    if (!text) return;
+
+    // Word-wrap the body at scale 2, uppercasing as we go (no lowercase glyphs).
+    const int SC = 2, ADV = 6 * SC, LH = 20, X0 = 8, Y0 = BAR_H + 12;
+    const int max_cols  = (LCD_W - 2 * X0) / ADV;     // ~25 chars/line
+    const int max_lines = (LCD_H - Y0 - 4) / LH;      // ~9 lines
+
+    char line[48];
+    int ll = 0, ly = Y0, used = 0;
+    const char *p = text;
+    while (*p && used < max_lines) {
+        while (*p == ' ') p++;
+        if (!*p) break;
+        const char *w = p;
+        int fullwl = 0;
+        while (w[fullwl] && w[fullwl] != ' ') fullwl++;
+        p = w + fullwl;
+        int drawwl = fullwl > max_cols ? max_cols : fullwl;   // hard-break long words
+        int need = (ll ? ll + 1 : 0) + drawwl;
+        if (ll && need > max_cols) {
+            line[ll] = 0;
+            draw_text_left(X0, ly, SC, COL_WHITE, COL_BLACK, line);
+            ly += LH; used++; ll = 0;
+            if (used >= max_lines) break;
+        }
+        if (ll && ll < (int)sizeof(line) - 1) line[ll++] = ' ';
+        for (int i = 0; i < drawwl && ll < (int)sizeof(line) - 1; i++) {
+            char c = w[i];
+            if (c >= 'a' && c <= 'z') c -= 32;
+            line[ll++] = c;
+        }
+    }
+    if (ll && used < max_lines) {
+        line[ll] = 0;
+        draw_text_left(X0, ly, SC, COL_WHITE, COL_BLACK, line);
+    }
 }
 
 void display_init(void)

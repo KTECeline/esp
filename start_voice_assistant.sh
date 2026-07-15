@@ -11,14 +11,17 @@ pkill -f "assistant_via_bridge.py" 2>/dev/null
 pkill -f "assistant_server.py" 2>/dev/null
 sleep 2
 
+# nohup everywhere: closing this terminal must not kill the services. (Learned
+# the hard way — uvicorn exits on terminal hangup, so TTS silently died and the
+# box stopped replying while everything else kept running.)
 echo "Starting Ollama..."
-ollama serve > /tmp/ollama.log 2>&1 &
+nohup ollama serve > /tmp/ollama.log 2>&1 &
 OLLAMA_PID=$!
 
 echo "Starting MOSS-TTS..."
 cd ~/MOSS-TTS-Nano
 # no conda on this machine — MOSS lives in a plain venv
-.venv/bin/uvicorn server:app --host 0.0.0.0 --port 8080 > /tmp/moss-tts.log 2>&1 &
+nohup .venv/bin/uvicorn server:app --host 0.0.0.0 --port 8080 > /tmp/moss-tts.log 2>&1 &
 TTS_PID=$!
 
 echo "Waiting for TTS/Ollama to warm up..."
@@ -36,14 +39,14 @@ cd ~/esp/bridge-server
 export WHISPER_MODEL="$HOME/esp/whisper.cpp/models/ggml-small.bin"
 # export WHISPER_MODEL="$HOME/esp/whisper.cpp/models/ggml-small.en.bin"  # English-only fallback
 export WHISPER_PROMPT_FILE="$HOME/esp/voice-mcp-server/manglish_prompt.txt"
-node bridge-server.js > /tmp/bridge.log 2>&1 &
+nohup node bridge-server.js > /tmp/bridge.log 2>&1 &
 BRIDGE_PID=$!
 
 sleep 2
 
 echo "Starting box adapter (box -> this bridge -> box)..."
 cd ~/esp/listen_v2
-python3 assistant_via_bridge.py "$BOX_IP" > /tmp/box-adapter.log 2>&1 &
+nohup python3 assistant_via_bridge.py "$BOX_IP" > /tmp/box-adapter.log 2>&1 &
 ADAPTER_PID=$!
 
 sleep 1

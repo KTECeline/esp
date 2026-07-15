@@ -38,6 +38,14 @@
 //   cp main/wifi_config.example.h main/wifi_config.h   (then edit the copy)
 #include "wifi_config.h"
 
+// Caption-vs-READY race guard: STT on the Mac is fast enough (~0.7s) that the
+// "YOU: ..." caption arrives while the post-upload SENT screen is still up, and
+// the main loop's READY write 1.2s later was wiping it after a blink. The main
+// loop only draws READY if no caption has arrived since the last upload.
+// FreeRTOS ticks (not esp_timer) — 10ms resolution is plenty for this.
+static volatile TickType_t s_caption_at_tick = 0;
+static volatile TickType_t s_upload_done_tick = 0;
+
 // ---- BOX-3 wiring ----
 #define I2C_PORT        I2C_NUM_0
 #define PIN_I2C_SDA     8
@@ -342,6 +350,7 @@ static void record_toggle_and_send(void)
     s_record_buf = NULL;
     s_record_len = 0;
 
+    s_upload_done_tick = xTaskGetTickCount();
     if (status == 200) display_status("SENT", NULL, rgb565(0, 150, 0));
     else if (status < 0) display_status("NO PC", "START SERVER", rgb565(180, 0, 0));
     else display_status("SEND", "FAILED", rgb565(180, 0, 0));
@@ -407,7 +416,16 @@ static esp_err_t play_handler(httpd_req_t *req)
     if (bits != 16) bits = 16;
     ESP_LOGI(TAG, "playing: %u Hz, %u ch, %u-bit", (unsigned)rate, ch, bits);
 
-    display_status("PLAYING", NULL, rgb565(0, 150, 0));
+    // If the Mac sent the reply text alongside the audio, show it as a caption
+    // that stays up while the box talks; otherwise fall back to "PLAYING".
+    char reply_txt[256];
+    bool had_caption = (httpd_req_get_hdr_value_str(req, "X-Reply-Text", reply_txt,
+                                                    sizeof(reply_txt)) == ESP_OK) && reply_txt[0];
+    if (had_caption) {
+        display_caption("BOX", rgb565(0, 150, 0), reply_txt);
+    } else {
+        display_status("PLAYING", NULL, rgb565(0, 150, 0));
+    }
     esp_codec_dev_sample_info_t fs = { .bits_per_sample = bits, .channel = ch, .sample_rate = rate };
     esp_codec_dev_open(s_spk, &fs);
     esp_codec_dev_set_out_vol(s_spk, 85);
@@ -437,8 +455,39 @@ static esp_err_t play_handler(httpd_req_t *req)
 
     esp_codec_dev_close(s_spk);
     ESP_LOGI(TAG, "playback done");
-    display_status("READY", s_ip_str, rgb565(0, 90, 160));
+
+    // Answer the Mac first, THEN linger, so the reply caption stays readable for
+    // a few seconds after the audio ends without delaying the Mac's next turn.
     httpd_resp_sendstr(req, "played");
+    if (had_caption) vTaskDelay(pdMS_TO_TICKS(3500));
+    display_status("READY", s_ip_str, rgb565(0, 90, 160));
+    return ESP_OK;
+}
+
+// Show a live caption. Body = the text; optional "X-Speaker" header ("YOU"/"BOX")
+// picks the bar label + color (defaults to YOU / amber). Used by the Mac to push
+// "what was heard" the moment STT finishes, before the reply audio arrives.
+static esp_err_t caption_handler(httpd_req_t *req)
+{
+    int len = req->content_len;
+    if (len < 0) len = 0;
+    if (len > 255) len = 255;
+    char text[256];
+    int got = 0;
+    while (got < len) {
+        int r = httpd_req_recv(req, text + got, len - got);
+        if (r <= 0) break;
+        got += r;
+    }
+    text[got] = 0;
+
+    char who[16] = "YOU";
+    httpd_req_get_hdr_value_str(req, "X-Speaker", who, sizeof(who));
+    uint16_t bar = (strcmp(who, "BOX") == 0) ? rgb565(0, 150, 0)   // green
+                                             : rgb565(200, 120, 0); // amber
+    s_caption_at_tick = xTaskGetTickCount();
+    display_caption(who, bar, text);
+    httpd_resp_sendstr(req, "ok");
     return ESP_OK;
 }
 
@@ -452,6 +501,8 @@ static void start_http_server(void)
     if (httpd_start(&server, &cfg) == ESP_OK) {
         httpd_uri_t play = { .uri = "/play", .method = HTTP_POST, .handler = play_handler };
         httpd_register_uri_handler(server, &play);
+        httpd_uri_t caption = { .uri = "/caption", .method = HTTP_POST, .handler = caption_handler };
+        httpd_register_uri_handler(server, &caption);
         ESP_LOGI(TAG, "TALK server up: POST a WAV to http://%s/play", s_ip_str);
     } else {
         ESP_LOGE(TAG, "failed to start HTTP server");
@@ -510,7 +561,11 @@ void app_main(void)
             while (high < 5) { high = (gpio_get_level(PIN_REC_BTN) != 0) ? high + 1 : 0; vTaskDelay(pdMS_TO_TICKS(10)); }
 
             record_toggle_and_send();   // records until the next tap
-            display_status("READY", s_ip_str, rgb565(0, 90, 160));
+            // Don't wipe a caption that arrived while SENT was showing — the
+            // reply flow (BOX caption -> linger -> READY) owns the screen now.
+            if ((int32_t)(s_caption_at_tick - s_upload_done_tick) <= 0) {
+                display_status("READY", s_ip_str, rgb565(0, 90, 160));
+            }
             ESP_LOGI(TAG, "done — tap BOOT again for another take.");
 
             // Consume the STOP tap's release too.

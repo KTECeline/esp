@@ -52,9 +52,29 @@ def downmix_for_box(wav_bytes):
     with open("/tmp/bridge_tts_box.wav", "rb") as f:
         return f.read()
 
-def send_to_box(wav_bytes):
+# The box font is ASCII-only (renders uppercase); HTTP headers must be latin-1
+# and single-line — strip anything else so captions don't corrupt the request.
+def _ascii_oneline(s, limit=200):
+    s = (s or "").replace("\n", " ").replace("\r", " ")
+    return s.encode("ascii", "ignore").decode("ascii")[:limit]
+
+def send_caption(text, who="YOU"):
+    try:
+        req = urllib.request.Request(f"http://{BOX_IP}/caption",
+                                     data=_ascii_oneline(text).encode("ascii"),
+                                     method="POST", headers={"X-Speaker": who})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status
+    except Exception as e:
+        print(f"       (caption to box failed: {e})")
+        return None
+
+def send_to_box(wav_bytes, reply_text=""):
+    headers = {"Content-Type": "audio/wav"}
+    if reply_text:
+        headers["X-Reply-Text"] = _ascii_oneline(reply_text)
     req = urllib.request.Request(f"http://{BOX_IP}/play", data=wav_bytes, method="POST",
-                                 headers={"Content-Type": "audio/wav"})
+                                 headers=headers)
     with urllib.request.urlopen(req, timeout=60) as r:
         return r.status
 
@@ -105,6 +125,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             print(f"       assistant: {reply!r}")
             print(f"       [bridge breakdown: {bridge_lat}]")
 
+            # Show what was heard on the box immediately (before TTS finishes).
+            if transcript:
+                send_caption(transcript, "YOU")
+
             box_wav = downmix_for_box(reply_wav)
             # playback_start: about to POST the reply to the box's /play.
             # Since the box's play_handler streams incoming bytes straight
@@ -115,7 +139,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # also means fully played).
             playback_start = now_ms()
             print(f"[3/3] sending reply ({len(box_wav)} bytes, downmixed from {len(reply_wav)}) -> box {BOX_IP}")
-            status = send_to_box(box_wav)
+            status = send_to_box(box_wav, reply_text=reply)
             playback_end = now_ms()
             stages["playback_start"] = playback_start
             stages["playback_end"] = playback_end

@@ -28,3 +28,8 @@ typedef struct {
 // Rows past the 5th are dropped (no scrolling yet). title e.g. "YOUR ORDER".
 void display_order(const char *title, const order_line_t *lines, int count,
                    const char *total);
+
+// Live-caption screen: colored speaker bar ("YOU"/"BOX") on top, then the text
+// word-wrapped below. Text is uppercased for the font; overflow past the screen
+// is dropped. Used to show what was heard / what is being said in realtime.
+void display_caption(const char *speaker, uint16_t bar, const char *text);
