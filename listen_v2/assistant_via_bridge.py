@@ -16,7 +16,8 @@ Run:  python3 assistant_via_bridge.py [box_ip]
 Requires already running: ollama serve, MOSS uvicorn (:8080), bridge-server.js (:3000)
     (bridge-server.js auto-starts voice-mcp-server as a subprocess over stdio)
 """
-import http.server, socketserver, datetime, sys, os, time, json, subprocess, urllib.request, urllib.parse
+import http.server, socketserver, datetime, sys, os, time, json, re, subprocess
+import threading, queue, urllib.request, urllib.parse
 
 PORT       = 8000
 BOX_IP     = sys.argv[1] if len(sys.argv) > 1 else "192.168.68.142"
@@ -44,6 +45,29 @@ def bridge_transcribe(wav_bytes):
                                  headers={"Content-Type": "audio/wav"})
     with urllib.request.urlopen(req, timeout=60) as r:
         return json.loads(r.read().decode()).get("transcript", "").strip()
+
+def bridge_reply(text):
+    """LLM only — returns (reply, order, llm_ms). Fast; lets the caption show
+    and the first TTS chunk start while nothing has been synthesized yet."""
+    body = json.dumps({"text": text}).encode()
+    req = urllib.request.Request(f"{BRIDGE_BASE}/reply", data=body, method="POST",
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        d = json.loads(r.read().decode())
+        return d.get("reply", ""), d.get("order"), d.get("llm_ms", 0)
+
+def bridge_speak(text):
+    """TTS only — returns raw 48kHz WAV for one sentence."""
+    body = json.dumps({"text": text}).encode()
+    req = urllib.request.Request(f"{BRIDGE_BASE}/speak", data=body, method="POST",
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        return r.read()
+
+def split_sentences(text):
+    """Split a reply into speakable chunks at sentence boundaries."""
+    parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", text.strip()) if p.strip()]
+    return parts or [text.strip()]
 
 def bridge_respond(text):
     """Phase 2 (after confirm): LLM + TTS. Returns (audio, reply, order, latencies, stages)."""
@@ -97,10 +121,14 @@ def send_caption(text, who="YOU", confirm=False):
         print(f"       (caption to box failed: {e})")
         return None
 
-def send_to_box(wav_bytes, reply_text=""):
+def send_to_box(wav_bytes, reply_text="", quiet=False, final=False):
     headers = {"Content-Type": "audio/wav"}
     if reply_text:
         headers["X-Reply-Text"] = _ascii_oneline(reply_text)
+    if quiet:
+        headers["X-Quiet"] = "1"    # sentence chunk: don't touch the display
+    if final:
+        headers["X-Final"] = "1"    # last chunk: linger caption, then READY
     req = urllib.request.Request(f"http://{BOX_IP}/play", data=wav_bytes, method="POST",
                                  headers=headers)
     with urllib.request.urlopen(req, timeout=60) as r:
@@ -222,42 +250,67 @@ class Handler(http.server.BaseHTTPRequestHandler):
                   "confirmed_transcript": transcript,
                   "recording": (PENDING["record"] or {}).get("recording")}
         try:
+            confirm_at = now_ms()
             print(f"[2/2] confirmed -> LLM: {transcript!r}")
-            reply_wav, reply, order, bridge_lat, bridge_stages = bridge_respond(transcript)
-            stages.update(bridge_stages)
-            print(f"       assistant: {reply!r}")
+            reply, order, llm_ms = bridge_reply(transcript)
+            print(f"       assistant: {reply!r}  [LLM {llm_ms}ms]")
 
-            box_wav = downmix_for_box(reply_wav)
+            # Caption first: the customer READS the answer while the first
+            # sentence is still being synthesized.
+            send_caption(reply, "BOX")
+
+            # Sentence-chunked TTS pipeline: a producer thread synthesizes
+            # sentence N+1 while the box is playing sentence N. MOSS generates
+            # ~2.8x faster than realtime, so after the first chunk there are
+            # no gaps. First audio starts after TTS of ONE sentence instead
+            # of the whole reply.
+            sentences = split_sentences(reply)
+            audio_q = queue.Queue(maxsize=2)
+            def producer():
+                try:
+                    for s in sentences:
+                        audio_q.put(downmix_for_box(bridge_speak(s)))
+                    audio_q.put(None)
+                except Exception as e:
+                    print(f"       (tts producer failed: {e})")
+                    audio_q.put(None)
+            threading.Thread(target=producer, daemon=True).start()
+
+            first_audio_ms = None
+            status = None
+            chunk_i = 0
             playback_start = now_ms()
-            status = send_to_box(box_wav, reply_text=reply)
+            while True:
+                box_wav = audio_q.get()
+                if box_wav is None:
+                    break
+                chunk_i += 1
+                if first_audio_ms is None:
+                    first_audio_ms = now_ms() - confirm_at
+                is_final = (chunk_i == len(sentences))
+                status = send_to_box(box_wav, quiet=True, final=is_final)
             playback_end = now_ms()
             stages["playback_start"] = playback_start
             stages["playback_end"] = playback_end
 
-            # /play returns when playback finishes; the box lingers the reply
-            # caption ~3.5s. The order screen then takes over as resting state.
+            # The order screen then takes over as the resting state.
             if order and order.get("items"):
                 print(f"       order -> box: {order.get('status')} "
                       f"{len(order['items'])} items, total {order.get('currency','RM')}{order.get('total')}")
                 send_order_to_box(order)
 
-            playback_wall_ms = playback_end - playback_start
-            expected_audio_ms = int(len(box_wav) / (22050 * 2) * 1000)
-            stutter_risk = playback_wall_ms > expected_audio_ms + 500
-            print(f"       box replied {status}. playback {playback_wall_ms}ms for {expected_audio_ms}ms audio"
-                 f"{'  <-- possible stutter/underrun' if stutter_risk else ''}\n")
+            total_ms = playback_end - confirm_at
+            print(f"       {chunk_i}/{len(sentences)} chunks played (box {status}). "
+                  f"first audio at {first_audio_ms}ms after confirm, done at {total_ms}ms\n")
 
             record.update({
                 "reply": reply, "order": order, "box_status": status,
                 "stages_epoch_ms": stages,
-                "expected_audio_ms": expected_audio_ms,
-                "playback_wall_ms": playback_wall_ms,
-                "stutter_risk": stutter_risk,
+                "tts_chunks": chunk_i,
                 "latency_ms": {
-                    "llm": stages.get("llm_end", 0) - stages.get("llm_start", 0),
-                    "tts": stages.get("tts_end", 0) - stages.get("tts_start", 0),
-                    "playback": playback_wall_ms,
-                    **{f"bridge_{k}": v for k, v in bridge_lat.items()},
+                    "llm": llm_ms,
+                    "first_audio_after_confirm": first_audio_ms,
+                    "confirm_to_done": total_ms,
                 },
             })
         except Exception as e:

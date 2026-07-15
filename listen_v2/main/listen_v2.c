@@ -426,14 +426,24 @@ static esp_err_t play_handler(httpd_req_t *req)
     if (bits != 16) bits = 16;
     ESP_LOGI(TAG, "playing: %u Hz, %u ch, %u-bit", (unsigned)rate, ch, bits);
 
-    // If the Mac sent the reply text alongside the audio, show it as a caption
-    // that stays up while the box talks; otherwise fall back to "PLAYING".
+    // Display policy per chunk-protocol headers:
+    //   X-Reply-Text (legacy /respond path): show reply caption, linger after.
+    //   X-Quiet: sentence chunk of a pipelined reply — the BOX caption is
+    //            already on screen via /caption, so touch nothing.
+    //   X-Final: last chunk — after playback, linger the caption then READY.
+    //   none of the above (talk.sh etc.): old PLAYING/READY behavior.
     char reply_txt[256];
     bool had_caption = (httpd_req_get_hdr_value_str(req, "X-Reply-Text", reply_txt,
                                                     sizeof(reply_txt)) == ESP_OK) && reply_txt[0];
+    char hdr[4] = "";
+    bool quiet = (httpd_req_get_hdr_value_str(req, "X-Quiet", hdr, sizeof(hdr)) == ESP_OK)
+                 && hdr[0] == '1';
+    hdr[0] = 0;
+    bool final = (httpd_req_get_hdr_value_str(req, "X-Final", hdr, sizeof(hdr)) == ESP_OK)
+                 && hdr[0] == '1';
     if (had_caption) {
         display_caption("BOX", rgb565(0, 150, 0), reply_txt);
-    } else {
+    } else if (!quiet) {
         display_status("PLAYING", NULL, rgb565(0, 150, 0));
     }
     esp_codec_dev_sample_info_t fs = { .bits_per_sample = bits, .channel = ch, .sample_rate = rate };
@@ -470,9 +480,11 @@ static esp_err_t play_handler(httpd_req_t *req)
     // a few seconds after the audio ends without delaying the Mac's next turn.
     // If the Mac pushes new content during the linger (the order screen arrives
     // right after /play returns), that content owns the screen — skip READY.
+    // Quiet middle chunks return immediately and leave the screen alone.
     TickType_t playback_end_tick = xTaskGetTickCount();
     httpd_resp_sendstr(req, "played");
-    if (had_caption) vTaskDelay(pdMS_TO_TICKS(3500));
+    if (quiet && !final) return ESP_OK;
+    if (had_caption || final) vTaskDelay(pdMS_TO_TICKS(3500));
     if ((int32_t)(s_caption_at_tick - playback_end_tick) <= 0) {
         display_status("READY", s_ip_str, rgb565(0, 90, 160));
     }

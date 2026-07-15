@@ -34,8 +34,11 @@ const SYSTEM_PROMPT = process.env.OPENCLAW_SYSTEM_PROMPT ||
   "- Only take orders for menu items. If asked for something not on the menu, say so and suggest something similar from the menu.\n" +
   "- If the customer asks a general question, answer briefly and steer back to the order.\n" +
   "- Track the customer's FULL order across the whole conversation.\n" +
-  "- When the customer says they are done ordering, read the order back and ask them to confirm.\n" +
-  "- Only after they confirm, set status to \"confirmed\" and thank them.\n\n" +
+  "- NEVER state prices or totals yourself — you are bad at arithmetic. Where you want to " +
+  "say the total, write exactly {TOTAL} and the till will fill in the correct amount.\n" +
+  "- When the customer says they are done ordering, read the order back with {TOTAL} and ask them to confirm.\n" +
+  "- Set status to \"confirmed\" ONLY when the customer explicitly says yes/confirm/correct " +
+  "AFTER hearing the order read back — never on the same turn they finish ordering.\n\n" +
   "Respond ONLY with JSON, exactly this shape:\n" +
   '{"reply": "<what you say out loud>", "order": {"status": "none|open|confirmed", "items": [{"qty": <number>, "name": "<menu item name>"}]}}\n' +
   'The items array is the complete order so far (not just new items). Use status "none" when nothing has been ordered yet.';
@@ -191,7 +194,12 @@ async function askOpenClaw(text) {
     // Shouldn't happen with response_format, but degrade to plain chat if so.
   }
   if (order) lastOrder = order;
-  return { reply, order: order || lastOrder };
+  const effective = order || lastOrder;
+  // The LLM is told to write {TOTAL} instead of doing arithmetic (it once
+  // spoke "RM17.00" for a RM13.50 order). Substitute the real computed total.
+  const totalStr = effective ? MENU.currency + effective.total.toFixed(2) : "";
+  reply = reply.split("{TOTAL}").join(totalStr).replace(/\s{2,}/g, " ").trim();
+  return { reply, order: effective };
 }
 
 function resetOrderSession(reason) {
@@ -239,6 +247,56 @@ const server = http.createServer(async (req, res) => {
       console.log("Transcript (confirm flow):", transcript, `[STT ${Date.now() - t0}ms]`);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ transcript, stt_ms: Date.now() - t0 }));
+    } catch (err) {
+      console.error("Error:", err.message);
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  // Chunked-TTS flow, step 1: confirmed text -> LLM only. Returns JSON fast so
+  // the adapter can show the reply caption immediately and start TTS on the
+  // first sentence while the rest is still being synthesized.
+  if (req.method === "POST" && req.url === "/reply") {
+    try {
+      const body = JSON.parse((await readBody(req)).toString("utf8") || "{}");
+      const text = (body.text || "").trim();
+      if (!text) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "No text" }));
+        return;
+      }
+      const t0 = Date.now();
+      const { reply, order } = await askOpenClaw(text);
+      console.log("Reply:", reply, `[LLM ${Date.now() - t0}ms]`);
+      if (order) console.log("Order:", JSON.stringify(order));
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ reply, order, llm_ms: Date.now() - t0 }));
+      if (order && order.status === "confirmed") resetOrderSession("order confirmed");
+    } catch (err) {
+      console.error("Error:", err.message);
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  // Chunked-TTS flow, step 2 (called per sentence): text -> TTS -> WAV.
+  if (req.method === "POST" && req.url === "/speak") {
+    try {
+      const body = JSON.parse((await readBody(req)).toString("utf8") || "{}");
+      const text = (body.text || "").trim();
+      if (!text) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "No text" }));
+        return;
+      }
+      const t0 = Date.now();
+      const audio = await speakViaMcp(text);
+      console.log(`[TTS chunk ${Date.now() - t0}ms] "${text.slice(0, 60)}"`);
+      res.writeHead(200, { "Content-Type": "audio/wav" });
+      res.end(audio);
     } catch (err) {
       console.error("Error:", err.message);
       res.writeHead(500, { "Content-Type": "application/json" });
