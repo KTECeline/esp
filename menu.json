@@ -1,0 +1,22 @@
+{
+  "restaurant": "MAMAK CORNER",
+  "currency": "RM",
+  "items": [
+    { "name": "nasi lemak",       "price": 5.50, "aliases": ["nasi lemak ayam"] },
+    { "name": "nasi goreng",      "price": 6.50, "aliases": ["fried rice"] },
+    { "name": "mee goreng",       "price": 6.00, "aliases": ["mee goreng mamak", "fried noodles"] },
+    { "name": "maggi goreng",     "price": 6.00, "aliases": [] },
+    { "name": "char kuey teow",   "price": 7.00, "aliases": ["kuey teow"] },
+    { "name": "roti canai",       "price": 2.00, "aliases": ["roti kosong"] },
+    { "name": "roti telur",       "price": 3.00, "aliases": [] },
+    { "name": "ayam goreng",      "price": 5.00, "aliases": ["fried chicken"] },
+    { "name": "satay ayam",       "price": 8.00, "aliases": ["satay", "chicken satay"] },
+    { "name": "teh tarik",        "price": 2.50, "aliases": ["teh"] },
+    { "name": "teh o ais",        "price": 2.00, "aliases": ["teh o", "iced tea"] },
+    { "name": "kopi o",           "price": 2.00, "aliases": ["kopi", "coffee"] },
+    { "name": "milo ais",         "price": 3.50, "aliases": ["milo", "iced milo"] },
+    { "name": "milo dinosaur",    "price": 4.50, "aliases": [] },
+    { "name": "limau ais",        "price": 2.50, "aliases": ["iced lime"] },
+    { "name": "sirap bandung",    "price": 2.50, "aliases": ["bandung"] }
+  ]
+}

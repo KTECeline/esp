@@ -14,3 +14,9 @@ CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y
+
+# BOX-3 has 16MB flash but the default config assumed 2MB with a 1MB app
+# partition (was 96% full). Custom table gives the app 4MB of headroom.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"

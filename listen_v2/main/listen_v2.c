@@ -458,9 +458,14 @@ static esp_err_t play_handler(httpd_req_t *req)
 
     // Answer the Mac first, THEN linger, so the reply caption stays readable for
     // a few seconds after the audio ends without delaying the Mac's next turn.
+    // If the Mac pushes new content during the linger (the order screen arrives
+    // right after /play returns), that content owns the screen — skip READY.
+    TickType_t playback_end_tick = xTaskGetTickCount();
     httpd_resp_sendstr(req, "played");
     if (had_caption) vTaskDelay(pdMS_TO_TICKS(3500));
-    display_status("READY", s_ip_str, rgb565(0, 90, 160));
+    if ((int32_t)(s_caption_at_tick - playback_end_tick) <= 0) {
+        display_status("READY", s_ip_str, rgb565(0, 90, 160));
+    }
     return ESP_OK;
 }
 
@@ -491,6 +496,57 @@ static esp_err_t caption_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+// Render an itemized order. Body is a line protocol (built by the Mac so the
+// firmware needs no JSON parsing):
+//   TITLE|YOUR ORDER
+//   ITEM|2X NASI LEMAK|RM11.00     (up to 5 ITEM lines)
+//   TOTAL|RM15.50
+static esp_err_t order_handler(httpd_req_t *req)
+{
+    static char body[512];   // static: keeps httpd task stack small
+    int len = req->content_len;
+    if (len < 0) len = 0;
+    if (len > (int)sizeof(body) - 1) len = sizeof(body) - 1;
+    int got = 0;
+    while (got < len) {
+        int r = httpd_req_recv(req, body + got, len - got);
+        if (r <= 0) break;
+        got += r;
+    }
+    body[got] = 0;
+
+    const char *title = "YOUR ORDER";
+    static char total[20];
+    order_line_t lines[5];
+    int count = 0;
+    total[0] = 0;
+
+    char *save = NULL;
+    for (char *ln = strtok_r(body, "\n", &save); ln; ln = strtok_r(NULL, "\n", &save)) {
+        char *p1 = strchr(ln, '|');
+        if (!p1) continue;
+        *p1++ = 0;
+        if (strcmp(ln, "TITLE") == 0) {
+            title = p1;
+        } else if (strcmp(ln, "ITEM") == 0 && count < 5) {
+            char *p2 = strchr(p1, '|');
+            if (!p2) continue;
+            *p2++ = 0;
+            lines[count].name = p1;
+            lines[count].price = p2;
+            count++;
+        } else if (strcmp(ln, "TOTAL") == 0) {
+            strlcpy(total, p1, sizeof(total));
+        }
+    }
+
+    s_caption_at_tick = xTaskGetTickCount();   // order owns the screen now
+    display_order(title, lines, count, total[0] ? total : NULL);
+    ESP_LOGI(TAG, "order screen: %d items, total %s", count, total);
+    httpd_resp_sendstr(req, "ok");
+    return ESP_OK;
+}
+
 static void start_http_server(void)
 {
     httpd_handle_t server = NULL;
@@ -503,6 +559,8 @@ static void start_http_server(void)
         httpd_register_uri_handler(server, &play);
         httpd_uri_t caption = { .uri = "/caption", .method = HTTP_POST, .handler = caption_handler };
         httpd_register_uri_handler(server, &caption);
+        httpd_uri_t order = { .uri = "/order", .method = HTTP_POST, .handler = order_handler };
+        httpd_register_uri_handler(server, &order);
         ESP_LOGI(TAG, "TALK server up: POST a WAV to http://%s/play", s_ip_str);
     } else {
         ESP_LOGE(TAG, "failed to start HTTP server");
@@ -521,21 +579,6 @@ void app_main(void)
     display_status("WIFI", "CONNECTING", COL_BLACK);
     wifi_init();
     start_http_server();
-
-    // Boot-time demo of the new order screen so the layout is visible on flash.
-    // Set to 0 (or delete) once you've seen it — it just delays READY by ~4s.
-#define DISPLAY_ORDER_DEMO 1
-#if DISPLAY_ORDER_DEMO
-    {
-        const order_line_t demo[] = {
-            { "2X NASI LEMAK", "RM11.00" },
-            { "1X TEH TARIK",  "RM 2.50" },
-            { "1X ROTI CANAI", "RM 2.00" },
-        };
-        display_order("YOUR ORDER", demo, 3, "RM15.50");
-        vTaskDelay(pdMS_TO_TICKS(4000));
-    }
-#endif
 
     display_status("READY", s_ip_str, rgb565(0, 90, 160));   // blue = ready
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import http from "node:http";
 import { writeFile, readFile, mkdtemp } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -15,12 +16,67 @@ const MCP_SERVER_PATH = process.env.MCP_SERVER_PATH || path.join(homedir(), "esp
 const OPENCLAW_URL = process.env.OPENCLAW_URL || "http://localhost:11434/v1/chat/completions";
 const OPENCLAW_MODEL = process.env.OPENCLAW_MODEL || "llama3.2:3b";
 const OPENCLAW_TOKEN = process.env.OPENCLAW_TOKEN || "";
-const SYSTEM_PROMPT = process.env.OPENCLAW_SYSTEM_PROMPT ||
-  "You are a helpful voice assistant having a spoken conversation. Keep replies " +
-  "short and natural, like a real person talking, 1-2 sentences maximum. Do not " +
-  "use lists, bullet points, or long explanations unless specifically asked. " +
-  "Reply in the same language the person spoke in, without mixing in other languages.";
 const TRANSCRIBE_LANGUAGE = process.env.TRANSCRIBE_LANGUAGE || "en";
+
+// ---- Restaurant menu + order-taking prompt -------------------------------
+// menu.json is the single source of truth for items and prices. The LLM only
+// decides WHAT was ordered; prices and totals are computed here from the menu
+// (a 3B model cannot be trusted with arithmetic).
+const MENU_PATH = process.env.MENU_PATH || path.join(homedir(), "esp", "menu.json");
+const MENU = JSON.parse(readFileSync(MENU_PATH, "utf8"));
+
+const menuLines = MENU.items.map((i) => `- ${i.name} (${MENU.currency}${i.price.toFixed(2)})`).join("\n");
+const SYSTEM_PROMPT = process.env.OPENCLAW_SYSTEM_PROMPT ||
+  `You are the voice order-taker at ${MENU.restaurant}, a Malaysian mamak stall. MENU:\n${menuLines}\n\n` +
+  "Rules:\n" +
+  "- Speak like a friendly mamak worker: short natural spoken replies, 1-2 sentences, no lists.\n" +
+  "- Only take orders for menu items. If asked for something not on the menu, say so and suggest something similar from the menu.\n" +
+  "- If the customer asks a general question, answer briefly and steer back to the order.\n" +
+  "- Track the customer's FULL order across the whole conversation.\n" +
+  "- When the customer says they are done ordering, read the order back and ask them to confirm.\n" +
+  "- Only after they confirm, set status to \"confirmed\" and thank them.\n\n" +
+  "Respond ONLY with JSON, exactly this shape:\n" +
+  '{"reply": "<what you say out loud>", "order": {"status": "none|open|confirmed", "items": [{"qty": <number>, "name": "<menu item name>"}]}}\n' +
+  'The items array is the complete order so far (not just new items). Use status "none" when nothing has been ordered yet.';
+
+// One order/conversation at a time — this is a single-kiosk system. History is
+// capped so a long chat can't grow the prompt without bound.
+let chatHistory = [];
+let lastOrder = null;
+const HISTORY_MAX = 12;
+
+// Map an LLM item name onto the menu (exact, alias, or substring match).
+function resolveMenuItem(name) {
+  const n = (name || "").toLowerCase().trim();
+  if (!n) return null;
+  for (const item of MENU.items) {
+    if (item.name === n || item.aliases.includes(n)) return item;
+  }
+  for (const item of MENU.items) {
+    if (n.includes(item.name) || item.name.includes(n) ||
+        item.aliases.some((a) => n.includes(a) || a.includes(n))) return item;
+  }
+  return null;
+}
+
+// Turn the LLM's claimed order into a priced one using menu truth. Items that
+// don't match the menu are dropped (the spoken reply still addresses them).
+function priceOrder(order) {
+  if (!order || !Array.isArray(order.items)) return null;
+  const items = [];
+  let total = 0;
+  for (const it of order.items) {
+    const menuItem = resolveMenuItem(it.name);
+    const qty = Math.max(1, Math.min(20, parseInt(it.qty, 10) || 1));
+    if (!menuItem) continue;
+    const line = { qty, name: menuItem.name, unit_price: menuItem.price, line_total: qty * menuItem.price };
+    total += line.line_total;
+    items.push(line);
+  }
+  if (items.length === 0) return null;
+  return { status: order.status === "confirmed" ? "confirmed" : "open",
+           currency: MENU.currency, items, total: Math.round(total * 100) / 100 };
+}
 
 let mcpClient = null;
 
@@ -93,7 +149,13 @@ async function speakViaMcp(text) {
   return await readFile(data.audio_file_path);
 }
 
+// One call returns both the spoken reply and the structured order. JSON output
+// is FORCED via response_format (verified supported by Ollama's OpenAI-compat
+// endpoint), so parsing can't fail on chatty non-JSON preambles.
 async function askOpenClaw(text) {
+  chatHistory.push({ role: "user", content: text });
+  if (chatHistory.length > HISTORY_MAX) chatHistory = chatHistory.slice(-HISTORY_MAX);
+
   const response = await fetch(OPENCLAW_URL, {
     method: "POST",
     headers: {
@@ -102,9 +164,10 @@ async function askOpenClaw(text) {
     },
     body: JSON.stringify({
       model: OPENCLAW_MODEL,
+      response_format: { type: "json_object" },
       messages: [
         { role: "system", content: SYSTEM_PROMPT },
-        { role: "user", content: text }
+        ...chatHistory
       ]
     })
   });
@@ -115,7 +178,25 @@ async function askOpenClaw(text) {
   }
 
   const data = await response.json();
-  return (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || "";
+  const raw = (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || "";
+  chatHistory.push({ role: "assistant", content: raw });
+
+  let reply = raw, order = null;
+  try {
+    const parsed = JSON.parse(raw);
+    reply = parsed.reply || raw;
+    order = priceOrder(parsed.order);
+  } catch {
+    // Shouldn't happen with response_format, but degrade to plain chat if so.
+  }
+  if (order) lastOrder = order;
+  return { reply, order: order || lastOrder };
+}
+
+function resetOrderSession(reason) {
+  chatHistory = [];
+  lastOrder = null;
+  console.log("Order session reset (" + reason + ")");
 }
 
 const server = http.createServer(async (req, res) => {
@@ -159,9 +240,10 @@ const server = http.createServer(async (req, res) => {
       }
 
       console.log("Asking OpenClaw...");
-      const reply = await askOpenClaw(transcript);
+      const { reply, order } = await askOpenClaw(transcript);
       const t3 = Date.now();
       console.log("Reply:", reply, `[LLM ${t3 - t2}ms]`);
+      if (order) console.log("Order:", JSON.stringify(order));
 
       console.log("Generating speech via MCP...");
       const audioReply = await speakViaMcp(reply);
@@ -172,6 +254,7 @@ const server = http.createServer(async (req, res) => {
         "Content-Type": "audio/wav",   // MOSS-TTS returns WAV, not mp3
         "X-Transcript": encodeURIComponent(transcript),
         "X-Reply-Text": encodeURIComponent(reply),
+        "X-Order-Json": encodeURIComponent(order ? JSON.stringify(order) : ""),
         "X-Latency-Normalize-Ms": String(t1 - t0),
         "X-Latency-STT-Ms": String(t2 - t1),
         "X-Latency-LLM-Ms": String(t3 - t2),
@@ -188,11 +271,22 @@ const server = http.createServer(async (req, res) => {
         "X-Ts-Tts-End": String(t4)
       });
       res.end(audioReply);
+
+      // A confirmed order ends the session: the next customer starts fresh.
+      if (order && order.status === "confirmed") resetOrderSession("order confirmed");
     } catch (err) {
       console.error("Error:", err.message);
       res.writeHead(500, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: err.message }));
     }
+    return;
+  }
+
+  // Manual reset between customers / demo runs: curl -X POST :3000/reset
+  if (req.method === "POST" && req.url === "/reset") {
+    resetOrderSession("manual /reset");
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: true }));
     return;
   }
 

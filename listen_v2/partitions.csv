@@ -1,0 +1,6 @@
+# BOX-3 has 16MB flash; the default 1MB app partition was 96% full, which
+# blocked adding anything (QR encoder etc). 4MB app leaves plenty of headroom.
+# Name,   Type, SubType, Offset,  Size
+nvs,      data, nvs,     0x9000,  0x6000
+phy_init, data, phy,     0xf000,  0x1000
+factory,  app,  factory, 0x10000, 4M

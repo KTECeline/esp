@@ -46,7 +46,9 @@ sleep 2
 
 echo "Starting box adapter (box -> this bridge -> box)..."
 cd ~/esp/listen_v2
-nohup python3 assistant_via_bridge.py "$BOX_IP" > /tmp/box-adapter.log 2>&1 &
+# -u: unbuffered stdout so the log is readable live (Python block-buffers
+# prints when stdout is a file, which made debugging look like silence).
+nohup python3 -u assistant_via_bridge.py "$BOX_IP" > /tmp/box-adapter.log 2>&1 &
 ADAPTER_PID=$!
 
 sleep 1

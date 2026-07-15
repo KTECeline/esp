@@ -35,12 +35,19 @@ def bridge_talk(wav_bytes):
     with urllib.request.urlopen(req, timeout=120) as r:
         transcript = urllib.parse.unquote(r.headers.get("X-Transcript", ""))
         reply = urllib.parse.unquote(r.headers.get("X-Reply-Text", ""))
+        order = None
+        order_raw = urllib.parse.unquote(r.headers.get("X-Order-Json", ""))
+        if order_raw:
+            try:
+                order = json.loads(order_raw)
+            except json.JSONDecodeError:
+                pass
         latencies = {k[10:].lower(): int(v) for k, v in r.headers.items()
                     if k.lower().startswith("x-latency-")}
         # Absolute epoch-ms stage boundaries bridge-server measured itself.
         stages = {k[5:].lower().replace("-", "_"): int(v) for k, v in r.headers.items()
                  if k.lower().startswith("x-ts-")}
-        return r.read(), transcript, reply, latencies, stages
+        return r.read(), transcript, reply, order, latencies, stages
 
 def downmix_for_box(wav_bytes):
     # MOSS-TTS returns 48kHz stereo; the box's speaker is mono, and sending
@@ -77,6 +84,34 @@ def send_to_box(wav_bytes, reply_text=""):
                                  headers=headers)
     with urllib.request.urlopen(req, timeout=60) as r:
         return r.status
+
+def send_order_to_box(order):
+    """Render the priced order onto the box screen via POST /order.
+
+    Body is a dead-simple line protocol (no JSON parsing needed in firmware):
+        TITLE|YOUR ORDER
+        ITEM|2X NASI LEMAK|RM11.00
+        TOTAL|RM15.50
+    The box font is uppercase-only, so names are uppercased here; item names
+    are truncated so name+price fit the 320px screen at scale 2 (~24 chars).
+    """
+    if not order or not order.get("items"):
+        return None
+    cur = order.get("currency", "RM")
+    title = "ORDER CONFIRMED" if order.get("status") == "confirmed" else "YOUR ORDER"
+    lines = [f"TITLE|{title}"]
+    for it in order["items"][:5]:
+        name = _ascii_oneline(f"{it['qty']}X {it['name']}").upper()[:15]
+        lines.append(f"ITEM|{name}|{cur}{it['line_total']:.2f}")
+    lines.append(f"TOTAL|{cur}{order['total']:.2f}")
+    body = "\n".join(lines).encode("ascii")
+    try:
+        req = urllib.request.Request(f"http://{BOX_IP}/order", data=body, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status
+    except Exception as e:
+        print(f"       (order screen to box failed: {e})")   # old firmware: 404, fine
+        return None
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
@@ -119,7 +154,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         }
         try:
             print(f"[2/3] forwarding to bridge ({BRIDGE_URL})...")
-            reply_wav, transcript, reply, bridge_lat, bridge_stages = bridge_talk(data)
+            reply_wav, transcript, reply, order, bridge_lat, bridge_stages = bridge_talk(data)
             stages.update(bridge_stages)   # stt_start/end, llm_start/end, tts_start/end
             print(f"       you said: {transcript!r}")
             print(f"       assistant: {reply!r}")
@@ -144,6 +179,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             stages["playback_start"] = playback_start
             stages["playback_end"] = playback_end
 
+            # /play returns when playback finishes; the box then lingers the
+            # reply caption ~3.5s. Pushing the order now means it takes over
+            # the screen and stays up as the resting state for this customer.
+            if order and order.get("items"):
+                print(f"       order -> box: {order.get('status')} "
+                      f"{len(order['items'])} items, total {order.get('currency','RM')}{order.get('total')}")
+                send_order_to_box(order)
+
             total_ms = playback_end - record_start
             playback_wall_ms = playback_end - playback_start
             # Box WAV is fixed 22050Hz/mono/16-bit (see downmix_for_box).
@@ -154,7 +197,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                  f"{'  <-- possible stutter/underrun' if stutter_risk else ''}\n")
 
             record.update({
-                "transcript": transcript, "reply": reply, "box_status": status,
+                "transcript": transcript, "reply": reply, "order": order, "box_status": status,
                 "stages_epoch_ms": stages,
                 "expected_audio_ms": expected_audio_ms,
                 "playback_wall_ms": playback_wall_ms,
