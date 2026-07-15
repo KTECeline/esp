@@ -46,6 +46,16 @@
 static volatile TickType_t s_caption_at_tick = 0;
 static volatile TickType_t s_upload_done_tick = 0;
 
+// Confirm-before-LLM: when the Mac pushes the transcript caption with an
+// X-Confirm header, the next BOOT tap within this window means "yes, send it"
+// (POSTed to the Mac's /confirm) instead of starting a new recording. No tap
+// -> cancelled, nothing reaches the LLM. Guards against STT mishearings
+// becoming wrong orders.
+#define CONFIRM_WINDOW_MS 8000
+static volatile bool s_confirm_pending = false;
+static volatile TickType_t s_confirm_deadline_tick = 0;
+static char s_confirm_url[112];   // derived from POST_URL in app_main
+
 // ---- BOX-3 wiring ----
 #define I2C_PORT        I2C_NUM_0
 #define PIN_I2C_SDA     8
@@ -490,10 +500,38 @@ static esp_err_t caption_handler(httpd_req_t *req)
     httpd_req_get_hdr_value_str(req, "X-Speaker", who, sizeof(who));
     uint16_t bar = (strcmp(who, "BOX") == 0) ? rgb565(0, 150, 0)   // green
                                              : rgb565(200, 120, 0); // amber
+
+    // X-Confirm: 1 arms the tap-to-confirm window; any other caption disarms
+    // it (a new screen means the pending question is no longer on display).
+    char cf[4] = "";
+    httpd_req_get_hdr_value_str(req, "X-Confirm", cf, sizeof(cf));
+    if (cf[0] == '1') {
+        s_confirm_deadline_tick = xTaskGetTickCount() + pdMS_TO_TICKS(CONFIRM_WINDOW_MS);
+        s_confirm_pending = true;
+    } else {
+        s_confirm_pending = false;
+    }
+
     s_caption_at_tick = xTaskGetTickCount();
     display_caption(who, bar, text);
     httpd_resp_sendstr(req, "ok");
     return ESP_OK;
+}
+
+// Tell the Mac the customer tap-confirmed the transcript on screen.
+static void post_confirm(void)
+{
+    esp_http_client_config_t cfg = { .url = s_confirm_url, .method = HTTP_METHOD_POST,
+                                     .timeout_ms = 5000 };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    esp_http_client_set_post_field(client, "1", 1);
+    esp_err_t err = esp_http_client_perform(client);
+    int status = (err == ESP_OK) ? esp_http_client_get_status_code(client) : -1;
+    esp_http_client_cleanup(client);
+    ESP_LOGI(TAG, "confirm -> %s (%d)", s_confirm_url, status);
+    if (status != 200) {
+        display_status("EXPIRED", "TAP TO RETRY", rgb565(180, 0, 0));
+    }
 }
 
 // Render an itemized order. Body is a line protocol (built by the Mac so the
@@ -587,6 +625,14 @@ void app_main(void)
     };
     gpio_config(&btn);
 
+    // Confirm endpoint lives next to /upload on the same Mac server: derive it
+    // from POST_URL so wifi_config.h stays the single place IPs are edited.
+    {
+        const char *slash = strrchr(POST_URL, '/');
+        int base_len = slash ? (int)(slash - POST_URL) : (int)strlen(POST_URL);
+        snprintf(s_confirm_url, sizeof(s_confirm_url), "%.*s/confirm", base_len, POST_URL);
+    }
+
     ESP_LOGI(TAG, "ready — TAP BOOT to start, auto-stops on silence, sends to %s", POST_URL);
 
     // Tap-to-toggle: tap BOOT to start, tap again to stop. Each tap is
@@ -603,6 +649,17 @@ void app_main(void)
             int high = 0;
             while (high < 5) { high = (gpio_get_level(PIN_REC_BTN) != 0) ? high + 1 : 0; vTaskDelay(pdMS_TO_TICKS(10)); }
 
+            // If a transcript is on screen awaiting confirmation, this tap
+            // means "yes, send it" — not "start a new recording".
+            if (s_confirm_pending &&
+                (int32_t)(s_confirm_deadline_tick - xTaskGetTickCount()) > 0) {
+                s_confirm_pending = false;
+                display_status("SENDING", "TO ASSISTANT", rgb565(0, 90, 160));
+                post_confirm();   // reply flow (BOX caption -> order) takes over
+                continue;
+            }
+            s_confirm_pending = false;
+
             record_toggle_and_send();   // records until the next tap
             // Don't wipe a caption that arrived while SENT was showing — the
             // reply flow (BOX caption -> linger -> READY) owns the screen now.
@@ -615,6 +672,13 @@ void app_main(void)
             high = 0;
             while (high < 5) { high = (gpio_get_level(PIN_REC_BTN) != 0) ? high + 1 : 0; vTaskDelay(pdMS_TO_TICKS(10)); }
             continue;
+        }
+        // Confirm window ran out with no tap: discard the pending transcript.
+        if (s_confirm_pending &&
+            (int32_t)(xTaskGetTickCount() - s_confirm_deadline_tick) >= 0) {
+            s_confirm_pending = false;
+            display_status("CANCELLED", "TAP TO RETRY", rgb565(180, 0, 0));
+            ESP_LOGI(TAG, "confirm window expired — transcript discarded");
         }
         if (++hb >= 500) { hb = 0; ESP_LOGI(TAG, "alive, waiting for REC tap..."); }
         vTaskDelay(pdMS_TO_TICKS(20));

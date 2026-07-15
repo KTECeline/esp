@@ -30,6 +30,7 @@ const SYSTEM_PROMPT = process.env.OPENCLAW_SYSTEM_PROMPT ||
   `You are the voice order-taker at ${MENU.restaurant}, a Malaysian mamak stall. MENU:\n${menuLines}\n\n` +
   "Rules:\n" +
   "- Speak like a friendly mamak worker: short natural spoken replies, 1-2 sentences, no lists.\n" +
+  "- Reply in English with light Manglish flavor (lah, boss). Do not reply in Malay — the voice output is English-only.\n" +
   "- Only take orders for menu items. If asked for something not on the menu, say so and suggest something similar from the menu.\n" +
   "- If the customer asks a general question, answer briefly and steer back to the order.\n" +
   "- Track the customer's FULL order across the whole conversation.\n" +
@@ -199,6 +200,22 @@ function resetOrderSession(reason) {
   console.log("Order session reset (" + reason + ")");
 }
 
+// Shared STT front half: raw WAV buffer -> normalized -> transcript.
+async function sttFromBuffer(audioBuffer) {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "bridge-"));
+  const rawPath = path.join(tempDir, "input_raw.wav");
+  const audioPath = path.join(tempDir, "input.wav");
+  await writeFile(rawPath, audioBuffer);
+  await normalizeAudio(rawPath, audioPath);
+  return await transcribeViaMcp(audioPath);
+}
+
+async function readBody(req) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  return Buffer.concat(chunks);
+}
+
 const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -206,13 +223,72 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Phase 1 of the confirm flow: STT only, no LLM/TTS. The adapter shows the
+  // transcript on the box and waits for the customer to tap-confirm before
+  // spending LLM+TTS time (and before acting on a possible mishearing).
+  if (req.method === "POST" && req.url === "/transcribe") {
+    try {
+      const audioBuffer = await readBody(req);
+      if (audioBuffer.length === 0) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "No audio data received" }));
+        return;
+      }
+      const t0 = Date.now();
+      const transcript = await sttFromBuffer(audioBuffer);
+      console.log("Transcript (confirm flow):", transcript, `[STT ${Date.now() - t0}ms]`);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ transcript, stt_ms: Date.now() - t0 }));
+    } catch (err) {
+      console.error("Error:", err.message);
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  // Phase 2: confirmed text -> LLM -> TTS -> audio (+ reply/order headers).
+  if (req.method === "POST" && req.url === "/respond") {
+    try {
+      const body = JSON.parse((await readBody(req)).toString("utf8") || "{}");
+      const text = (body.text || "").trim();
+      if (!text) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "No text" }));
+        return;
+      }
+      const t2 = Date.now();
+      const { reply, order } = await askOpenClaw(text);
+      const t3 = Date.now();
+      console.log("Reply:", reply, `[LLM ${t3 - t2}ms]`);
+      if (order) console.log("Order:", JSON.stringify(order));
+      const audioReply = await speakViaMcp(reply);
+      const t4 = Date.now();
+      console.log(`[TTS ${t4 - t3}ms]`);
+      res.writeHead(200, {
+        "Content-Type": "audio/wav",
+        "X-Reply-Text": encodeURIComponent(reply),
+        "X-Order-Json": encodeURIComponent(order ? JSON.stringify(order) : ""),
+        "X-Latency-LLM-Ms": String(t3 - t2),
+        "X-Latency-TTS-Ms": String(t4 - t3),
+        "X-Ts-Llm-Start": String(t2),
+        "X-Ts-Llm-End": String(t3),
+        "X-Ts-Tts-Start": String(t3),
+        "X-Ts-Tts-End": String(t4)
+      });
+      res.end(audioReply);
+      if (order && order.status === "confirmed") resetOrderSession("order confirmed");
+    } catch (err) {
+      console.error("Error:", err.message);
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
   if (req.method === "POST" && req.url === "/talk") {
     try {
-      const chunks = [];
-      for await (const chunk of req) {
-        chunks.push(chunk);
-      }
-      const audioBuffer = Buffer.concat(chunks);
+      const audioBuffer = await readBody(req);
 
       if (audioBuffer.length === 0) {
         res.writeHead(400, { "Content-Type": "application/json" });
@@ -221,15 +297,9 @@ const server = http.createServer(async (req, res) => {
       }
 
       const t0 = Date.now();
-      const tempDir = await mkdtemp(path.join(tmpdir(), "bridge-"));
-      const rawPath = path.join(tempDir, "input_raw.wav");
-      const audioPath = path.join(tempDir, "input.wav");
-      await writeFile(rawPath, audioBuffer);
-      await normalizeAudio(rawPath, audioPath);
-      const t1 = Date.now();
-
+      const t1 = t0;
       console.log("Received audio, transcribing via MCP...");
-      const transcript = await transcribeViaMcp(audioPath);
+      const transcript = await sttFromBuffer(audioBuffer);
       const t2 = Date.now();
       console.log("Transcript:", transcript, `[STT ${t2 - t1}ms]`);
 
