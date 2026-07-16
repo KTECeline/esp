@@ -3,8 +3,8 @@
 
 Reads a list of commands, prompts you to speak each one into the box (press
 BOOT after each prompt), waits for the corresponding transcript to show up in
-~/esp/listen_v2/interaction_log.jsonl (written automatically by
-assistant_via_bridge.py), and pairs (expected, actual) for scoring.
+~/esp/mcp-core/interaction_log.jsonl (written automatically by
+mcp-core/server.js), and pairs (expected, actual) for scoring.
 
 Reports:
   - Word Error Rate (WER), aggregate and per-command
@@ -13,13 +13,15 @@ Reports:
 Usage:
     python3 stt_eval.py [command_list.txt]
 Defaults to stt_test_commands.txt in this folder. Requires the full stack
-(ollama, MOSS, bridge-server, assistant_via_bridge.py) already running and the
+(ollama, MOSS, restaurant agent, mcp-core) already running and the
 box on and connected. Ctrl-C at any prompt to stop early and score what you have.
 """
 import sys, os, re, json, time, string
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-LOG_PATH = os.path.join(os.path.dirname(HERE), "interaction_log.jsonl")
+LOG_PATH = os.environ.get(
+    "INTERACTION_LOG",
+    os.path.expanduser("~/esp/mcp-core/interaction_log.jsonl"))
 DEFAULT_LIST = os.path.join(HERE, "stt_test_commands.txt")
 
 

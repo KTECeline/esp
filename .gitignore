@@ -67,6 +67,8 @@ sdkconfig.old
 .env
 .env.*
 listen_v2/main/wifi_config.h
+# runtime config: LAN IPs / webhook URLs (config.example.json is the template)
+config.json
 
 # =========================
 # External repositories

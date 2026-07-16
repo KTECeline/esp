@@ -1,0 +1,10 @@
+{
+  "name": "restaurant-agent",
+  "version": "1.0.0",
+  "description": "Mamak ordering agent (webhook) — menu, persona, pricing, order screen payloads",
+  "type": "module",
+  "main": "agent.js",
+  "scripts": {
+    "start": "node agent.js"
+  }
+}

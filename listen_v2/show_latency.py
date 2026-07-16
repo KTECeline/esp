@@ -5,7 +5,7 @@ Usage:
     python3 show_latency.py            # follow new interactions as they happen
     python3 show_latency.py --all      # print every interaction in the log so far
 
-Reads interaction_log.jsonl (written by assistant_via_bridge.py) and prints a
+Reads interaction_log.jsonl (written by mcp-core/server.js) and prints a
 clean timeline for each of the 12 stages:
     record_start / record_end                (approx — box streams while recording)
     audio_upload_start / audio_upload_end     (exact)
@@ -22,7 +22,9 @@ rather than normal real-time speech playback.
 import sys, os, json, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-LOG_PATH = os.environ.get("INTERACTION_LOG", os.path.join(HERE, "interaction_log.jsonl"))
+LOG_PATH = os.environ.get(
+    "INTERACTION_LOG",
+    os.path.expanduser("~/esp/mcp-core/interaction_log.jsonl"))
 
 STAGE_ORDER = [
     ("record_start", "record_end", "RECORD (~approx, streams while uploading)"),

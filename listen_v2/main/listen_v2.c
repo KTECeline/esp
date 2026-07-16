@@ -202,9 +202,14 @@ static void speaker_init(void)
 static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
+        // Connect is kicked off by wifi_init() instead, so the diagnostic scan
+        // can finish first (scanning and connecting are mutually exclusive).
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGW(TAG, "wifi disconnected, retrying...");
+        // Reason codes tell wrong-password apart from SSID-not-found:
+        //   201 NO_AP_FOUND = SSID invisible (typo, or network is 5GHz-only —
+        //       this chip is 2.4GHz-only); 2/15/204 AUTH_* = bad password.
+        wifi_event_sta_disconnected_t *d = (wifi_event_sta_disconnected_t *)data;
+        ESP_LOGW(TAG, "wifi disconnected (reason %d), retrying...", d ? d->reason : -1);
         esp_wifi_connect();
         xEventGroupClearBits(s_wifi_events, WIFI_CONNECTED_BIT);
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
@@ -213,6 +218,36 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         ESP_LOGI(TAG, "connected, got IP %s", s_ip_str);
         xEventGroupSetBits(s_wifi_events, WIFI_CONNECTED_BIT);
     }
+}
+
+// One-shot diagnostic: log every AP the chip can actually SEE. A reason-201
+// ("no AP found") means the target SSID never appeared in this list — compare
+// it against what a phone sees to tell a typo apart from a network the chip
+// cannot reach (5GHz-only, or a channel outside the configured country range).
+static void wifi_scan_log(void)
+{
+    wifi_scan_config_t sc = { .show_hidden = true };
+    esp_err_t err = esp_wifi_scan_start(&sc, true);   // true = block until done
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "scan failed: %s", esp_err_to_name(err));
+        return;
+    }
+    uint16_t n = 0;
+    esp_wifi_scan_get_ap_num(&n);
+    if (n == 0) {
+        ESP_LOGW(TAG, "scan: NO APs visible at all — antenna/RF problem, not a config problem");
+        return;
+    }
+    if (n > 24) n = 24;
+    wifi_ap_record_t *recs = calloc(n, sizeof(wifi_ap_record_t));
+    if (!recs) return;
+    esp_wifi_scan_get_ap_records(&n, recs);
+    ESP_LOGI(TAG, "scan: %u AP(s) visible to the box:", n);
+    for (int i = 0; i < n; i++) {
+        ESP_LOGI(TAG, "   \"%s\"  ch%-2d  %d dBm", (char *)recs[i].ssid,
+                 recs[i].primary, recs[i].rssi);
+    }
+    free(recs);
 }
 
 static void wifi_init(void)
@@ -225,11 +260,42 @@ static void wifi_init(void)
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event, NULL));
-    wifi_config_t wc = { .sta = { .ssid = WIFI_SSID, .password = WIFI_PASS } };
+
+    // Malaysia allows 2.4GHz channels 1-13, but the ESP-IDF default country
+    // ("01" world-safe, AUTO policy) only SCANS channels 1-11 — so an AP on
+    // ch12/13 is invisible and reports reason 201, which looks exactly like a
+    // wrong SSID. Mesh routers auto-pick their channel and move over time,
+    // which is how a network that used to work stops being found without
+    // anything being retyped.
+    // "MY" is NOT in esp_wifi's country table (see esp_wifi.h: 01/AT/AU/../US),
+    // so world-safe "01" is used with an explicit MANUAL 1-13 range instead.
+    // Soft-fail on purpose: a rejected country code must never abort the boot.
+    wifi_country_t country = {
+        .cc = "01", .schan = 1, .nchan = 13, .policy = WIFI_COUNTRY_POLICY_MANUAL
+    };
+    esp_err_t cerr = esp_wifi_set_country(&country);
+    if (cerr != ESP_OK) {
+        ESP_LOGW(TAG, "set_country failed: %s — scan may be limited to ch1-11",
+                 esp_err_to_name(cerr));
+    }
+
+    wifi_config_t wc = { .sta = {
+        .ssid = WIFI_SSID,
+        .password = WIFI_PASS,
+        // A mesh has several nodes sharing one SSID: scan every channel and
+        // take the strongest, instead of grabbing the first (possibly distant)
+        // node that answers.
+        .scan_method = WIFI_ALL_CHANNEL_SCAN,
+        .sort_method = WIFI_CONNECT_AP_BY_SIGNAL,
+    } };
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
     ESP_ERROR_CHECK(esp_wifi_start());
+
+    wifi_scan_log();   // from this task, not the event loop — blocking is fine here
+
     ESP_LOGI(TAG, "connecting to WiFi \"%s\"...", WIFI_SSID);
+    esp_wifi_connect();
     xEventGroupWaitBits(s_wifi_events, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
 }
 
