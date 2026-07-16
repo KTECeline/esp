@@ -19,11 +19,25 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { loadConfig, ESP_ROOT } from "./config.js";
+import { Bonjour } from "bonjour-service";
+import { loadConfig, loadRawConfig, writeConfig, ESP_ROOT } from "./config.js";
 import { BoxRegistry, asciiOneline, sendCaption, sendAudio, sendDisplay } from "./boxes.js";
 
 const config = loadConfig();
-const boxes = new BoxRegistry(config.boxes);
+// The raw parsed config is kept for round-tripping: box self-registration
+// mutates only its .boxes array and writes the rest back untouched (the
+// derived `config` object drops fields and must never be re-serialized).
+const rawCfg = loadRawConfig();
+let cfgWriteChain = Promise.resolve();
+function persistBoxes() {
+  rawCfg.boxes = boxes.toConfig();
+  // Serialize writes: two boxes registering in the same tick must not
+  // interleave temp-file writes. A promise chain is lock enough here.
+  cfgWriteChain = cfgWriteChain
+    .then(() => writeConfig(rawCfg))
+    .catch((err) => console.warn("(config.json write failed: " + err.message + ")"));
+}
+const boxes = new BoxRegistry(config.boxes, persistBoxes);
 const MCP_SERVER_PATH = path.join(ESP_ROOT, "voice-mcp-server", "dist", "index.js");
 const LOG_PATH = process.env.INTERACTION_LOG || path.join(ESP_ROOT, "mcp-core", "interaction_log.jsonl");
 
@@ -32,12 +46,12 @@ const LOG_PATH = process.env.INTERACTION_LOG || path.join(ESP_ROOT, "mcp-core", 
 // /confirm). One pending turn per box; the box enforces its own shorter tap
 // window (~8s), this longer window just garbage-collects stale turns.
 const PENDING_WINDOW_S = 25;
-const pendingByBox = new Map();   // box.name -> { transcript, expires, stages }
+const pendingByBox = new Map();   // box.id -> { transcript, expires, stages }
 
 // Plain-chat history for the local_llm backend only (the agent keeps its own
 // session state behind the webhook). Capped so a long chat can't grow the
 // prompt without bound.
-const llmHistoryByBox = new Map(); // box.name -> [{role, content}]
+const llmHistoryByBox = new Map(); // box.id -> [{role, content}]
 const HISTORY_MAX = 12;
 
 const nowMs = () => Date.now();
@@ -128,7 +142,7 @@ async function askAgent(box, text) {
   const res = await fetch(config.agent.webhook_url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ session_id: box.name, text }),
+    body: JSON.stringify({ session_id: box.id, text }),
     signal: AbortSignal.timeout(120000)
   });
   if (!res.ok) throw new Error(`agent webhook returned ${res.status}: ${(await res.text()).slice(0, 200)}`);
@@ -138,7 +152,7 @@ async function askAgent(box, text) {
 }
 
 async function askLocalLlm(box, text) {
-  let history = llmHistoryByBox.get(box.name) || [];
+  let history = llmHistoryByBox.get(box.id) || [];
   history.push({ role: "user", content: text });
   if (history.length > HISTORY_MAX) history = history.slice(-HISTORY_MAX);
 
@@ -162,7 +176,7 @@ async function askLocalLlm(box, text) {
   const reply = (data.choices?.[0]?.message?.content || "").trim();
   if (!reply) throw new Error("local_llm returned an empty reply");
   history.push({ role: "assistant", content: reply });
-  llmHistoryByBox.set(box.name, history);
+  llmHistoryByBox.set(box.id, history);
   return { reply, display: null, end_session: false };
 }
 
@@ -215,7 +229,7 @@ async function handleUpload(box, audioBuffer) {
     if (!transcript) {
       // Nothing intelligible — never bother a backend, just ask again.
       await sendCaption(box, "DIDN'T CATCH THAT - SPEAK AGAIN", { who: "TRY AGAIN" });
-      pendingByBox.delete(box.name);
+      pendingByBox.delete(box.id);
       record.outcome = "no_speech";
       return;
     }
@@ -223,7 +237,7 @@ async function handleUpload(box, audioBuffer) {
     // Show what was heard and arm the box's tap-to-confirm window. No backend
     // is called until /confirm arrives.
     await sendCaption(box, transcript, { who: "TAP = SEND", confirm: true });
-    pendingByBox.set(box.name, { transcript, expires: nowMs() + PENDING_WINDOW_S * 1000, stages });
+    pendingByBox.set(box.id, { transcript, expires: nowMs() + PENDING_WINDOW_S * 1000, stages });
     record.outcome = "awaiting_confirm";
     console.log(`[${box.name}] waiting for tap-confirm (window ${PENDING_WINDOW_S}s)...`);
   } catch (err) {
@@ -236,12 +250,12 @@ async function handleUpload(box, audioBuffer) {
 
 // Phase 2: box tap-confirmed -> backend -> caption -> chunked TTS -> display.
 async function handleConfirm(box) {
-  const pending = pendingByBox.get(box.name);
+  const pending = pendingByBox.get(box.id);
   if (!pending || nowMs() > pending.expires) {
     console.log(`[${box.name}] /confirm arrived but nothing pending (or expired)`);
     return { status: 410 };
   }
-  pendingByBox.delete(box.name); // consume it — one confirm per turn
+  pendingByBox.delete(box.id); // consume it — one confirm per turn
   const { transcript, stages } = pending;
   const record = { timestamp: new Date().toISOString(), box: box.name, confirmed_transcript: transcript };
 
@@ -289,7 +303,7 @@ async function handleConfirm(box) {
         await sendDisplay(box, entry);
       }
 
-      if (end_session) llmHistoryByBox.delete(box.name);
+      if (end_session) llmHistoryByBox.delete(box.id);
 
       const totalMs = playbackEnd - confirmAt;
       console.log(`[${box.name}] ${sentences.length} chunks played. first audio at ${firstAudioMs}ms, done at ${totalMs}ms\n`);
@@ -330,12 +344,17 @@ const server = http.createServer(async (req, res) => {
         status: "ok",
         mcpConnected: mcpClient !== null,
         backends: config.priority,
-        boxes: boxes.boxes.map((b) => b.name)
+        boxes: boxes.boxes.map((b) => ({ id: b.id, name: b.name, ip: b.ip }))
       });
     }
 
     if (req.method === "POST" && req.url === "/upload") {
-      const box = boxes.fromRequest(req);
+      const box = boxes.fromId(req);
+      if (!box) {
+        // No silent IP-based guessing: a request without an identity is a bug
+        // to surface (old firmware, or something that isn't a box at all).
+        return json(400, { error: "missing X-Box-Id header — flash current firmware" });
+      }
       const audio = await readBody(req);
       if (audio.length === 0) return json(400, { error: "No audio data received" });
       // Ack the box immediately (matches the old adapter's behavior), then
@@ -348,7 +367,10 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && req.url === "/confirm") {
-      const box = boxes.fromRequest(req);
+      const box = boxes.fromId(req);
+      if (!box) {
+        return json(400, { error: "missing X-Box-Id header — flash current firmware" });
+      }
       await readBody(req);
       const { status } = await handleConfirm(box);
       if (status === 200) {
@@ -359,6 +381,24 @@ const server = http.createServer(async (req, res) => {
         res.end();
       }
       return;
+    }
+
+    // Box self-registration: fired by the firmware right after it gets an IP,
+    // so config.json learns/refreshes the box without manual editing.
+    if (req.method === "POST" && req.url === "/register") {
+      let parsed;
+      try {
+        parsed = JSON.parse((await readBody(req)).toString("utf8"));
+      } catch {
+        return json(400, { error: "invalid JSON" });
+      }
+      const { box_id, name, ip } = parsed;
+      if (typeof box_id !== "string" || !box_id || typeof ip !== "string" || !ip) {
+        return json(400, { error: "box_id and ip are required strings" });
+      }
+      const action = boxes.upsert(box_id, typeof name === "string" && name ? name : null, ip);
+      console.log(`Box registered: ${box_id} ("${name || box_id}") @ ${ip} [${action}]`);
+      return json(200, { ok: true, box_id, name: name || box_id, ip, action });
     }
 
     // Manual session reset between customers / demo runs.
@@ -380,12 +420,31 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+// Advertises this machine as "mcp-core.local" over mDNS so a box's
+// provisioning form never needs a raw LAN IP typed in — the firmware
+// resolves the fixed hostname itself after joining WiFi.
+let bonjour = null;
+function startMdnsAdvertiser() {
+  bonjour = new Bonjour();
+  bonjour.publish({ name: "mcp-core", type: "http", host: "mcp-core.local", port: config.listenPort });
+  console.log("Advertising mcp-core.local via mDNS");
+}
+
 async function main() {
   mcpClient = await connectToMcpServer();
   server.listen(config.listenPort, () => {
     console.log(`mcp-core listening on port ${config.listenPort}`);
     console.log(`Backends (priority order): ${config.priority.join(" -> ")}`);
     console.log(`Boxes: ${boxes.boxes.map((b) => `${b.name}@${b.ip}`).join(", ")}`);
+    startMdnsAdvertiser();
+  });
+}
+
+for (const sig of ["SIGINT", "SIGTERM"]) {
+  process.on(sig, () => {
+    bonjour?.unpublishAll(() => process.exit(0));
+    // Fallback in case unpublishAll's callback never fires (e.g. no network).
+    setTimeout(() => process.exit(0), 1000);
   });
 }
 

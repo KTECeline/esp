@@ -7,3 +7,7 @@ dependencies:
   espressif/esp_codec_dev: '^1.1.0'
   # ILI9341 LCD driver (esp_lcd, NOT LVGL) for the status display.
   espressif/esp_lcd_ili9341: '^1.2.0'
+  # QR encoder (nayuki wrapper) for the WiFi-provisioning screen.
+  espressif/qrcode: '^0.1.0'
+  # Resolves mcp-core.local so the provisioning form never needs a raw LAN IP.
+  espressif/mdns: '^1.2.0'

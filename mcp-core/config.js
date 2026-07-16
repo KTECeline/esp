@@ -3,6 +3,7 @@
 // from here. Startup fails loudly if no usable backend is configured, because
 // a router with nothing to route to is a bug waiting to look like silence.
 import { readFileSync } from "node:fs";
+import { writeFile, rename } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 
@@ -16,7 +17,10 @@ function resolvePath(p) {
   return path.isAbsolute(p) ? p : path.join(ESP_ROOT, p);
 }
 
-export function loadConfig() {
+// The untouched parsed JSON — for callers that need to WRITE the config back
+// (box self-registration). loadConfig() below returns a derived/validated
+// shape that drops fields; round-tripping that would silently lose them.
+export function loadRawConfig() {
   let raw;
   try {
     raw = readFileSync(CONFIG_PATH, "utf8");
@@ -25,20 +29,28 @@ export function loadConfig() {
     console.error("Copy config.example.json to config.json and edit it.");
     process.exit(1);
   }
-
-  let cfg;
   try {
-    cfg = JSON.parse(raw);
+    return JSON.parse(raw);
   } catch (err) {
     console.error(`Config file ${CONFIG_PATH} is not valid JSON: ${err.message}`);
     process.exit(1);
   }
+}
 
+// Atomic write: temp file + rename, so a crash mid-write can never leave a
+// truncated config.json behind.
+export async function writeConfig(rawCfg) {
+  const tmp = CONFIG_PATH + ".tmp";
+  await writeFile(tmp, JSON.stringify(rawCfg, null, 2) + "\n");
+  await rename(tmp, CONFIG_PATH);
+}
+
+export function loadConfig() {
+  const cfg = loadRawConfig();
+
+  // Boxes may register themselves at boot (POST /register with their box_id),
+  // so an empty list is fine now — it just means no box has shown up yet.
   const boxes = Array.isArray(cfg.boxes) ? cfg.boxes.filter((b) => b && b.ip) : [];
-  if (boxes.length === 0) {
-    console.error("Config has no boxes — add at least one { name, ip } entry to \"boxes\".");
-    process.exit(1);
-  }
 
   // A backend earns a slot in the effective priority list only if its required
   // fields are present; misconfigured entries are skipped with a warning so a

@@ -33,3 +33,7 @@ void display_order(const char *title, const order_line_t *lines, int count,
 // word-wrapped below. Text is uppercased for the font; overflow past the screen
 // is dropped. Used to show what was heard / what is being said in realtime.
 void display_caption(const char *speaker, uint16_t bar, const char *text);
+
+// Provisioning QR screen: modules is a size*size byte array (1 = black module),
+// drawn centered on white with "JOIN <ssid>" / "PASS <psk>" text underneath.
+void display_qr(const uint8_t *modules, int size, const char *ssid, const char *psk);

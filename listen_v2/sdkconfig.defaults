@@ -20,3 +20,9 @@ CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# Default 512B header budget is too tight for a modern mobile browser's
+# request headers (User-Agent, Accept-Language, Sec-CH-UA client hints, etc.)
+# hitting the provisioning portal — was rejecting the /save POST with
+# "header fields too long" before the handler ever ran.
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=2048

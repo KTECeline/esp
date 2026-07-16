@@ -1,6 +1,6 @@
 {
   "boxes": [
-    { "name": "box1", "ip": "192.168.68.142" }
+    { "id": "BOX-A1B4", "name": "box1", "ip": "192.168.68.142" }
   ],
   "backends": {
     "priority": ["agent", "local_llm"],

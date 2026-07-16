@@ -285,6 +285,43 @@ void display_caption(const char *speaker, uint16_t bar, const char *text)
     }
 }
 
+// Provisioning QR screen: white background (doubles as the QR quiet zone),
+// black modules, SSID + password in plain text underneath for phones whose
+// camera can't read WiFi QR codes. `modules` is size*size bytes, 1 = black.
+void display_qr(const uint8_t *modules, int size, const char *ssid, const char *psk)
+{
+    if (!s_panel || size <= 0) return;
+    fill_screen(COL_WHITE);
+
+    int scale = 168 / size;                    // target ~170px on the 240px-tall screen
+    if (scale < 2) scale = 2;
+    if (scale > 6) scale = 6;
+    int px = size * scale;
+    int x0 = (LCD_W - px) / 2;
+    int y0 = 8;
+
+    // One band per module row (width px, height scale) through s_band — same
+    // strip-blit pattern as fill_rect. Worst case 174*6 pixels, well under
+    // s_band's LCD_W*16 capacity.
+    for (int my = 0; my < size; my++) {
+        for (int mx = 0; mx < size; mx++) {
+            uint16_t c = modules[my * size + mx] ? COL_BLACK : COL_WHITE;
+            for (int xx = 0; xx < scale; xx++) s_band[mx * scale + xx] = c;
+        }
+        for (int yy = 1; yy < scale; yy++) {
+            memcpy(&s_band[yy * px], s_band, px * sizeof(uint16_t));
+        }
+        esp_lcd_panel_draw_bitmap(s_panel, x0, y0 + my * scale,
+                                  x0 + px, y0 + (my + 1) * scale, s_band);
+    }
+
+    char line[48];
+    snprintf(line, sizeof(line), "JOIN %s", ssid ? ssid : "");
+    draw_text_centered(y0 + px + 8, 2, COL_BLACK, COL_WHITE, line);
+    snprintf(line, sizeof(line), "PASS %s", psk ? psk : "");
+    draw_text_centered(y0 + px + 30, 2, COL_BLACK, COL_WHITE, line);
+}
+
 void display_init(void)
 {
     // Backlight on (full brightness via plain GPIO).

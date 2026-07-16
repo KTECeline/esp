@@ -1,6 +1,12 @@
 // Box registry + push helpers. The core never generates display content — it
 // only delivers what a backend produced, over the firmware's existing HTTP
 // endpoints (/caption, /play, /order). Firmware is unchanged by design.
+//
+// Identity: a box IS its X-Box-Id header (an immutable, MAC-derived id the
+// firmware persists in NVS and sends on every request) — never its source IP.
+// IPs are DHCP leases; treating them as identity is how a registry silently
+// rots. Here `ip` is just "last known address for this id", self-healed on
+// every request the box makes.
 
 // The box font is ASCII-only (renders uppercase); HTTP headers must be latin-1
 // and single-line — strip anything else so captions don't corrupt the request.
@@ -12,25 +18,79 @@ export function asciiOneline(s, limit = 200) {
 }
 
 export class BoxRegistry {
+  // `onChange` fires after any mutation (new box, IP drift, rename) so the
+  // owner can persist the registry back to config.json.
   // Box "ip" may carry an optional :port (useful for mock boxes in tests —
-  // real firmware always listens on 80). Matching is on the host part only.
-  constructor(boxes) {
+  // real firmware always listens on 80).
+  constructor(boxes, onChange = null) {
+    this.onChange = onChange;
     this.boxes = boxes.map((b, i) => ({
-      name: b.name || `box${i + 1}`,
+      // Older config files predate the id field — fall back to name so they
+      // keep working; the first /register or request from the real box will
+      // then pin the true id.
+      id: b.id || b.name || `box${i + 1}`,
+      name: b.name || b.id || `box${i + 1}`,
       ip: b.ip,
       host: b.ip.split(":")[0]
     }));
   }
 
-  // Boxes are identified by the source IP of their /upload request. Unknown
-  // IPs still get service (logged) so a box with a fresh DHCP lease works
-  // before the config catches up.
-  fromRequest(req) {
+  // The shape that goes back into config.json's "boxes" array.
+  toConfig() {
+    return this.boxes.map((b) => ({ id: b.id, name: b.name, ip: b.ip }));
+  }
+
+  byId(id) {
+    return this.boxes.find((b) => b.id === id) || null;
+  }
+
+  // Add or update a box, keyed by its immutable id — a DHCP-renewed IP updates
+  // the existing entry instead of creating a duplicate. Returns "added",
+  // "updated", or "unchanged".
+  upsert(id, name, ip) {
+    const host = ip.split(":")[0];
+    const existing = this.byId(id);
+    if (!existing) {
+      this.boxes.push({ id, name: name || id, ip, host });
+      this.onChange?.();
+      return "added";
+    }
+    let changed = false;
+    // Match on host (not the full ip string) so a mock box registered with an
+    // explicit :port isn't clobbered by a same-host request without one.
+    if (existing.host !== host) {
+      existing.ip = ip;
+      existing.host = host;
+      changed = true;
+    }
+    if (name && existing.name !== name) {
+      existing.name = name;
+      changed = true;
+    }
+    if (changed) this.onChange?.();
+    return changed ? "updated" : "unchanged";
+  }
+
+  // Resolve the box a request came from, via its X-Box-Id header.
+  // Returns null when the header is missing (caller should 400 — a request
+  // with no id is a bug to surface, not something to guess from the IP).
+  // Unknown ids auto-register with a loud warning; known ids self-heal a
+  // drifted IP in passing.
+  fromId(req) {
+    const id = req.headers["x-box-id"];
+    if (!id) return null;
     const ip = (req.socket.remoteAddress || "").replace(/^::ffff:/, "");
-    const known = this.boxes.find((b) => b.host === ip);
-    if (known) return known;
-    console.warn(`Request from unlisted box IP ${ip} — serving it anyway (add it to config.json).`);
-    return { name: ip, ip };
+    const existing = this.byId(id);
+    if (!existing) {
+      console.warn(`Unknown box "${id}" auto-registered from ${ip} — verify this is expected.`);
+      this.upsert(id, id, ip);
+      return this.byId(id);
+    }
+    if (existing.host !== ip) {
+      console.log(`Box "${id}" moved ${existing.ip} -> ${ip} (DHCP drift) — config updated.`);
+      this.upsert(id, null, ip);
+    }
+    return existing;
   }
 }
 

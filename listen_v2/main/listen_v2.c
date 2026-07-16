@@ -32,11 +32,14 @@
 #include "esp_codec_dev.h"
 #include "esp_codec_dev_defaults.h"
 #include "display.h"
+#include "provisioning.h"
+#include "esp_timer.h"
+#include "mdns.h"
 
-// WiFi + PC endpoint config lives in wifi_config.h, which is gitignored so real
-// credentials never get committed. First-time setup:
-//   cp main/wifi_config.example.h main/wifi_config.h   (then edit the copy)
-#include "wifi_config.h"
+// WiFi credentials and the PC endpoint are NO LONGER compiled in (the old
+// wifi_config.h path put a real password in source once — never again). They
+// live in NVS, written by the phone-based provisioning portal. A box with no
+// saved credentials boots straight into provisioning mode (QR on screen).
 
 // Caption-vs-READY race guard: STT on the Mac is fast enough (~0.7s) that the
 // "YOU: ..." caption arrives while the post-upload SENT screen is still up, and
@@ -54,7 +57,16 @@ static volatile TickType_t s_upload_done_tick = 0;
 #define CONFIRM_WINDOW_MS 8000
 static volatile bool s_confirm_pending = false;
 static volatile TickType_t s_confirm_deadline_tick = 0;
-static char s_confirm_url[112];   // derived from POST_URL in app_main
+
+// Provisioned identity + endpoints, loaded from NVS in app_main. All the
+// /confirm, /health and /register URLs are derived from s_post_url so the
+// portal form stays the single place addresses are entered.
+static char s_box_id[33];         // immutable, MAC-derived — X-Box-Id on every request
+static char s_box_name[33];       // human display label from the portal form
+static char s_post_url[81];       // http://<mac>:<port>/upload
+static char s_confirm_url[112];
+static char s_health_url[112];
+static char s_register_url[112];
 
 // ---- BOX-3 wiring ----
 #define I2C_PORT        I2C_NUM_0
@@ -105,7 +117,10 @@ static i2c_master_bus_handle_t s_i2c_bus = NULL;
 static i2s_chan_handle_t s_i2s_tx = NULL;
 static EventGroupHandle_t s_wifi_events;
 #define WIFI_CONNECTED_BIT BIT0
+#define WIFI_GIVEUP_BIT    BIT1   // set after retry budget exhausted — no more auto-reconnects
 static char s_ip_str[16] = "";
+#define WIFI_MAX_RETRIES   5
+static int s_disconn_retries = 0;
 
 // Exposed to display.c so it can probe the touch chip to pick the panel type.
 i2c_master_bus_handle_t bsp_i2c_bus(void) { return s_i2c_bus; }
@@ -202,20 +217,32 @@ static void speaker_init(void)
 static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
-        // Connect is kicked off by wifi_init() instead, so the diagnostic scan
-        // can finish first (scanning and connecting are mutually exclusive).
+        // Connect is kicked off by wifi_connect_sta() instead, so the diagnostic
+        // scan can finish first (scanning and connecting are mutually exclusive).
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         // Reason codes tell wrong-password apart from SSID-not-found:
         //   201 NO_AP_FOUND = SSID invisible (typo, or network is 5GHz-only —
         //       this chip is 2.4GHz-only); 2/15/204 AUTH_* = bad password.
         wifi_event_sta_disconnected_t *d = (wifi_event_sta_disconnected_t *)data;
-        ESP_LOGW(TAG, "wifi disconnected (reason %d), retrying...", d ? d->reason : -1);
-        esp_wifi_connect();
         xEventGroupClearBits(s_wifi_events, WIFI_CONNECTED_BIT);
+        // Bounded retries with light backoff — the old retry-forever loop is
+        // how a box with a bad password sat on "CONNECTING" until reflashed.
+        if (s_disconn_retries < WIFI_MAX_RETRIES) {
+            s_disconn_retries++;
+            ESP_LOGW(TAG, "wifi disconnected (reason %d), retry %d/%d...",
+                     d ? d->reason : -1, s_disconn_retries, WIFI_MAX_RETRIES);
+            vTaskDelay(pdMS_TO_TICKS(300 * s_disconn_retries));
+            esp_wifi_connect();
+        } else {
+            ESP_LOGW(TAG, "wifi disconnected (reason %d) — retry budget spent, giving up",
+                     d ? d->reason : -1);
+            xEventGroupSetBits(s_wifi_events, WIFI_GIVEUP_BIT);
+        }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
         snprintf(s_ip_str, sizeof(s_ip_str), IPSTR, IP2STR(&e->ip_info.ip));
         ESP_LOGI(TAG, "connected, got IP %s", s_ip_str);
+        s_disconn_retries = 0;   // a fresh drop later gets a fresh retry budget
         xEventGroupSetBits(s_wifi_events, WIFI_CONNECTED_BIT);
     }
 }
@@ -250,12 +277,21 @@ static void wifi_scan_log(void)
     free(recs);
 }
 
-static void wifi_init(void)
+// One-time WiFi stack bring-up: netif, event loop, driver, handlers, country.
+// Split from connecting so provisioning mode (SoftAP, no credentials) can use
+// the same initialized stack.
+static void wifi_stack_init(void)
 {
     s_wifi_events = xEventGroupCreate();
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
+    // Also needed for provisioning mode's SoftAP (APSTA): without this netif,
+    // there's no DHCP server on the AP side — a phone can complete the WPA2
+    // handshake and "join" the hotspot, but never gets an IP, so it can never
+    // reach the portal or trigger a captive-portal popup at all. Created once
+    // here (not in provisioning.c, which can re-enter portal_up() repeatedly).
+    esp_netif_create_default_wifi_ap();
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event, NULL));
@@ -278,25 +314,128 @@ static void wifi_init(void)
         ESP_LOGW(TAG, "set_country failed: %s — scan may be limited to ch1-11",
                  esp_err_to_name(cerr));
     }
+}
 
+// Connect to an AP with NVS-provisioned credentials. Returns false instead of
+// blocking forever: the old portMAX_DELAY wait is how a box with a bad network
+// name sat on "CONNECTING" until someone attached a serial cable.
+static bool wifi_connect_sta(const char *ssid, const char *pass)
+{
     wifi_config_t wc = { .sta = {
-        .ssid = WIFI_SSID,
-        .password = WIFI_PASS,
         // A mesh has several nodes sharing one SSID: scan every channel and
         // take the strongest, instead of grabbing the first (possibly distant)
         // node that answers.
         .scan_method = WIFI_ALL_CHANNEL_SCAN,
         .sort_method = WIFI_CONNECT_AP_BY_SIGNAL,
     } };
+    strlcpy((char *)wc.sta.ssid, ssid, sizeof(wc.sta.ssid));
+    strlcpy((char *)wc.sta.password, pass, sizeof(wc.sta.password));
+    s_disconn_retries = 0;
+    xEventGroupClearBits(s_wifi_events, WIFI_CONNECTED_BIT | WIFI_GIVEUP_BIT);
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
     ESP_ERROR_CHECK(esp_wifi_start());
 
     wifi_scan_log();   // from this task, not the event loop — blocking is fine here
 
-    ESP_LOGI(TAG, "connecting to WiFi \"%s\"...", WIFI_SSID);
+    ESP_LOGI(TAG, "connecting to WiFi \"%s\"...", ssid);
     esp_wifi_connect();
-    xEventGroupWaitBits(s_wifi_events, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
+    // 20s covers association + WPA2 handshake + DHCP (1-8s worst case) plus a
+    // few retries — long enough to be reliable, short enough that a stuck box
+    // visibly falls into provisioning mode instead of hanging.
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_events,
+        WIFI_CONNECTED_BIT | WIFI_GIVEUP_BIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(20000));
+    return (bits & WIFI_CONNECTED_BIT) != 0;
+}
+
+// Resolves a "<name>.local" host inside a URL to its numeric IP via mDNS, so
+// the provisioning form's "computer address" field can be a fixed, memorable
+// hostname (mcp-core.local) instead of requiring someone to look up a raw LAN
+// IP in Terminal/network settings. `out` receives the URL with the hostname
+// portion replaced by the resolved IP; on any failure (not a .local host, or
+// resolution times out) `out` is just a copy of `url` unchanged — the
+// subsequent reachability check/backoff already treats "can't reach this URL"
+// as the signal to fall back into provisioning, so no special-casing is
+// needed here for the failure path.
+static void resolve_mdns_host(const char *url, char *out, size_t out_len)
+{
+    strlcpy(out, url, out_len);
+    const char *proto_end = strstr(url, "://");
+    if (!proto_end) return;
+    const char *host_start = proto_end + 3;
+    const char *host_end = host_start;
+    while (*host_end && *host_end != ':' && *host_end != '/') host_end++;
+    size_t host_len = host_end - host_start;
+    if (host_len < 7 || strncmp(host_end - 6, ".local", 6) != 0) return;   // not an mDNS host
+
+    char hostname[64];
+    size_t name_len = host_len - 6;   // strip the ".local" suffix mdns_query_a expects bare
+    if (name_len == 0 || name_len >= sizeof(hostname)) return;
+    memcpy(hostname, host_start, name_len);
+    hostname[name_len] = '\0';
+
+    esp_ip4_addr_t addr;
+    esp_err_t err = mdns_query_a(hostname, 3000, &addr);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "mDNS resolve of \"%s.local\" failed: %s", hostname, esp_err_to_name(err));
+        return;   // out already holds the unresolved url
+    }
+    char ip_str[16];
+    snprintf(ip_str, sizeof(ip_str), IPSTR, IP2STR(&addr));
+    ESP_LOGI(TAG, "mDNS: %s.local -> %s", hostname, ip_str);
+
+    int proto_len = (int)(host_start - url);   // includes "://"
+    snprintf(out, out_len, "%.*s%s%s", proto_len, url, ip_str, host_end);
+}
+
+// After WiFi is up: poll mcp-core's /health before declaring READY. WiFi-OK +
+// server-unreachable is NOT a provisioning problem most of the time — it's
+// "the Mac hasn't started mcp-core yet". So retry patiently (backoff, 5 min)
+// on the connection we already have; only a full window of failures falls
+// back to re-provisioning (that's a genuinely wrong post_url).
+static bool wait_server_reachable(void)
+{
+    int64_t deadline = esp_timer_get_time() + 5LL * 60 * 1000000;
+    int delay_s = 2;
+    bool shown = false;
+    while (esp_timer_get_time() < deadline) {
+        esp_http_client_config_t cfg = { .url = s_health_url, .timeout_ms = 5000 };
+        esp_http_client_handle_t client = esp_http_client_init(&cfg);
+        esp_err_t err = esp_http_client_perform(client);
+        int status = (err == ESP_OK) ? esp_http_client_get_status_code(client) : -1;
+        esp_http_client_cleanup(client);
+        if (status == 200) return true;
+        if (!shown) {
+            display_status("NO SERVER", "RETRYING...", rgb565(180, 120, 0));
+            shown = true;
+        }
+        ESP_LOGW(TAG, "server not reachable at %s (%d) — retrying in %ds",
+                 s_health_url, status, delay_s);
+        vTaskDelay(pdMS_TO_TICKS(delay_s * 1000));
+        if (delay_s < 30) delay_s *= 2;
+    }
+    return false;
+}
+
+// Best-effort boot announcement so mcp-core's config.json learns/refreshes this
+// box's IP without manual editing. Failure is non-fatal: per-request X-Box-Id
+// self-healing covers the same ground on the server side.
+static void register_with_core(void)
+{
+    char body[160];
+    int len = snprintf(body, sizeof(body),
+                       "{\"box_id\":\"%s\",\"name\":\"%s\",\"ip\":\"%s\"}",
+                       s_box_id, s_box_name[0] ? s_box_name : s_box_id, s_ip_str);
+    esp_http_client_config_t cfg = { .url = s_register_url,
+                                     .method = HTTP_METHOD_POST, .timeout_ms = 5000 };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_header(client, "X-Box-Id", s_box_id);
+    esp_http_client_set_post_field(client, body, len);
+    esp_err_t err = esp_http_client_perform(client);
+    int status = (err == ESP_OK) ? esp_http_client_get_status_code(client) : -1;
+    esp_http_client_cleanup(client);
+    ESP_LOGI(TAG, "register -> %s (%d)", s_register_url, status);
 }
 
 // --------------------------------------------------------------------------
@@ -403,9 +542,12 @@ static void record_toggle_and_send(void)
     uint32_t data_bytes = s_record_len;
     uint32_t total_len = 44 + data_bytes;
 
-    esp_http_client_config_t cfg = { .url = POST_URL, .method = HTTP_METHOD_POST, .timeout_ms = 15000 };
+    esp_http_client_config_t cfg = { .url = s_post_url, .method = HTTP_METHOD_POST, .timeout_ms = 15000 };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     esp_http_client_set_header(client, "Content-Type", "audio/wav");
+    // The box declares its own identity — the server must never have to guess
+    // it from a source IP that DHCP can reassign tomorrow.
+    esp_http_client_set_header(client, "X-Box-Id", s_box_id);
 
     int status = -1;
     if (esp_http_client_open(client, total_len) != ESP_OK) {
@@ -602,6 +744,7 @@ static void post_confirm(void)
     esp_http_client_config_t cfg = { .url = s_confirm_url, .method = HTTP_METHOD_POST,
                                      .timeout_ms = 5000 };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    esp_http_client_set_header(client, "X-Box-Id", s_box_id);
     esp_http_client_set_post_field(client, "1", 1);
     esp_err_t err = esp_http_client_perform(client);
     int status = (err == ESP_OK) ? esp_http_client_get_status_code(client) : -1;
@@ -685,17 +828,80 @@ static void start_http_server(void)
 
 void app_main(void)
 {
-    ESP_ERROR_CHECK(nvs_flash_init());
+    // NVS now holds real app state (provisioned credentials), so recover from
+    // a full/upgraded partition instead of aborting the boot.
+    esp_err_t nerr = nvs_flash_init();
+    if (nerr == ESP_ERR_NVS_NO_FREE_PAGES || nerr == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nerr = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(nerr);
+
     i2c_init();
     display_init();
     display_status("STARTING", NULL, COL_BLACK);
     i2s_chan_handle_t rx = i2s_init();
     mic_init(rx);
     speaker_init();
-    display_status("WIFI", "CONNECTING", COL_BLACK);
-    wifi_init();
-    start_http_server();
 
+    // Identity first — box_id exists before the box touches any network, so
+    // even a fresh box's provisioning AP is already named after it.
+    prov_ensure_box_id(s_box_id, sizeof(s_box_id));
+    wifi_stack_init();
+
+    char wifi_ssid[33], wifi_pass[64];
+    if (!prov_load_creds(wifi_ssid, sizeof(wifi_ssid), wifi_pass, sizeof(wifi_pass),
+                         s_post_url, sizeof(s_post_url), s_box_name, sizeof(s_box_name))) {
+        ESP_LOGI(TAG, "no saved WiFi credentials — entering provisioning mode");
+        start_provisioning_mode();   // never returns
+    }
+
+    display_status("WIFI", "CONNECTING", COL_BLACK);
+    if (!wifi_connect_sta(wifi_ssid, wifi_pass)) {
+        // Bad/absent network: only re-provisioning can fix this. The QR screen
+        // replaces the old behavior of retrying forever behind "CONNECTING".
+        ESP_LOGW(TAG, "could not join \"%s\" — entering provisioning mode", wifi_ssid);
+        display_status("WIFI FAILED", "OPENING SETUP", rgb565(180, 0, 0));
+        vTaskDelay(pdMS_TO_TICKS(1500));
+        start_provisioning_mode();   // never returns
+    }
+
+    // mDNS lets the provisioning form use a fixed hostname (mcp-core.local)
+    // instead of a raw LAN IP nobody but a developer knows how to look up.
+    // Resolved once here, in memory only — NVS keeps the hostname, so a
+    // changed Mac IP next boot re-resolves instead of going stale like a
+    // saved IP would. A non-".local" post_url (someone typed a raw IP) passes
+    // through resolve_mdns_host() unchanged, so both forms keep working.
+    if (mdns_init() == ESP_OK) {
+        mdns_hostname_set(s_box_id);   // makes the box itself discoverable too, for free
+    }
+    char resolved_post_url[sizeof(s_post_url)];
+    resolve_mdns_host(s_post_url, resolved_post_url, sizeof(resolved_post_url));
+    strlcpy(s_post_url, resolved_post_url, sizeof(s_post_url));
+
+    // /confirm, /health and /register all live next to /upload on the same
+    // server — derived from post_url (which carries the real host AND port)
+    // so the portal form stays the single place addresses are entered.
+    {
+        const char *slash = strrchr(s_post_url, '/');
+        int base_len = slash ? (int)(slash - s_post_url) : (int)strlen(s_post_url);
+        snprintf(s_confirm_url, sizeof(s_confirm_url), "%.*s/confirm", base_len, s_post_url);
+        snprintf(s_health_url, sizeof(s_health_url), "%.*s/health", base_len, s_post_url);
+        snprintf(s_register_url, sizeof(s_register_url), "%.*s/register", base_len, s_post_url);
+    }
+
+    // WiFi is right but the server isn't answering: NOT a provisioning issue
+    // most of the time (mcp-core simply not started yet), so this retries for
+    // 5 minutes before concluding the post_url itself is wrong.
+    if (!wait_server_reachable()) {
+        ESP_LOGW(TAG, "server never became reachable — entering provisioning mode");
+        display_status("NO SERVER", "OPENING SETUP", rgb565(180, 0, 0));
+        vTaskDelay(pdMS_TO_TICKS(1500));
+        start_provisioning_mode();   // never returns
+    }
+    register_with_core();
+
+    start_http_server();
     display_status("READY", s_ip_str, rgb565(0, 90, 160));   // blue = ready
 
     gpio_config_t btn = {
@@ -703,15 +909,7 @@ void app_main(void)
     };
     gpio_config(&btn);
 
-    // Confirm endpoint lives next to /upload on the same Mac server: derive it
-    // from POST_URL so wifi_config.h stays the single place IPs are edited.
-    {
-        const char *slash = strrchr(POST_URL, '/');
-        int base_len = slash ? (int)(slash - POST_URL) : (int)strlen(POST_URL);
-        snprintf(s_confirm_url, sizeof(s_confirm_url), "%.*s/confirm", base_len, POST_URL);
-    }
-
-    ESP_LOGI(TAG, "ready — TAP BOOT to start, auto-stops on silence, sends to %s", POST_URL);
+    ESP_LOGI(TAG, "ready — TAP BOOT to start, auto-stops on silence, sends to %s", s_post_url);
 
     // Tap-to-toggle: tap BOOT to start, tap again to stop. Each tap is
     // consumed (wait for release) so one physical tap = one state change.
@@ -723,9 +921,29 @@ void app_main(void)
             vTaskDelay(pdMS_TO_TICKS(30));   // debounce the press edge
             if (gpio_get_level(PIN_REC_BTN) != 0) continue;   // bounce, ignore
             // Consume the START tap: wait for a clean release first so it
-            // isn't immediately re-read as the STOP tap.
+            // isn't immediately re-read as the STOP tap. The same wait doubles
+            // as long-press detection: holding BOOT >=5s means "reset WiFi and
+            // re-provision" — the no-computer way to move a box to a new
+            // network. Feedback appears exactly at the threshold so the user
+            // knows the hold registered.
+            TickType_t press_start = xTaskGetTickCount();
+            bool long_press = false;
             int high = 0;
-            while (high < 5) { high = (gpio_get_level(PIN_REC_BTN) != 0) ? high + 1 : 0; vTaskDelay(pdMS_TO_TICKS(10)); }
+            while (high < 5) {
+                high = (gpio_get_level(PIN_REC_BTN) != 0) ? high + 1 : 0;
+                if (!long_press && high == 0 &&
+                    (xTaskGetTickCount() - press_start) >= pdMS_TO_TICKS(5000)) {
+                    long_press = true;
+                    display_status("RESET WIFI", "RELEASE NOW", rgb565(180, 0, 0));
+                }
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+            if (long_press) {
+                prov_erase_creds();   // box_id survives; only network creds go
+                display_status("WIFI RESET", "REBOOTING", rgb565(180, 0, 0));
+                vTaskDelay(pdMS_TO_TICKS(800));
+                esp_restart();
+            }
 
             // If a transcript is on screen awaiting confirmation, this tap
             // means "yes, send it" — not "start a new recording".
