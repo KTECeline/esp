@@ -1,12 +1,11 @@
-// Proof-of-concept only: the BOX-3's TT21100 touch panel is already probed
-// (display.c) to detect the LCD type, but nothing reads actual touches yet.
-// This wires up the driver and logs raw coordinates — no UI behavior change.
+// Proof-of-concept, confirmed working on hardware: probes for either a
+// TT21100 (0x24) or GT911 (0x5D) touch chip — BOX-3 units ship with one or
+// the other depending on hardware revision — and reads real touch data off
+// whichever responds. No UI behavior is wired to it yet.
 #pragma once
 #include <stdbool.h>
 
-// Returns false if the touch chip didn't respond (e.g. this unit's panel
-// variant doesn't have one wired, or the probe in display.c already found
-// nothing at that address).
+// Returns false if no touch chip responds at either known address.
 bool touch_init(void);
 
 // Call periodically (e.g. every ~50ms) from a task or the main loop. Logs

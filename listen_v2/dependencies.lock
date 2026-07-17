@@ -43,6 +43,20 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 1.2.1
+  espressif/esp_lcd_touch_gt911:
+    component_hash: 6029febef66eefd0910d527d7f30292779ccbf22a8dedd2bd69466acf0068a7b
+    dependencies:
+    - name: espressif/esp_lcd_touch
+      registry_url: https://components.espressif.com
+      require: public
+      version: ^1.2.0
+    - name: idf
+      require: private
+      version: '>=5.2'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.2.0~2
   espressif/esp_lcd_touch_tt21100:
     component_hash: 2177cdba2d86d555bd8fa76c842a65d60d0e7df0f68f301e5ef296e5c0863d35
     dependencies:
@@ -82,10 +96,11 @@ direct_dependencies:
 - espressif/esp_codec_dev
 - espressif/esp_lcd_ili9341
 - espressif/esp_lcd_touch
+- espressif/esp_lcd_touch_gt911
 - espressif/esp_lcd_touch_tt21100
 - espressif/mdns
 - espressif/qrcode
 - idf
-manifest_hash: 53f89556ed5ffa03edd5dcdb4e44280e14d5b50f8473d9a9548c683030079d95
+manifest_hash: 170264e0867a0d7f7d70a7b44400a4c155a8dbcd9ec7d9127528d177a373f1c0
 target: esp32s3
 version: 2.0.0
