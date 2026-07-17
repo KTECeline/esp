@@ -284,7 +284,9 @@ async function handleUpload(box, audioBuffer) {
 
     // Show what was heard and arm the box's tap-to-confirm window. No backend
     // is called until /confirm arrives.
-    await sendCaption(box, transcript, { who: "TAP = SEND", confirm: true });
+    // The box draws CANCEL/SEND buttons on any confirm caption, so the bar
+    // just poses the question — it must not say "TAP = SEND" any more.
+    await sendCaption(box, transcript, { who: "CONFIRM?", confirm: true });
     pendingByBox.set(box.id, { transcript, expires: nowMs() + PENDING_WINDOW_S * 1000, stages });
     record.outcome = "awaiting_confirm";
     console.log(`[${box.name}] waiting for tap-confirm (window ${PENDING_WINDOW_S}s)...`);

@@ -5,6 +5,8 @@
 // which touch chip (if any) is actually present. This probes both addresses
 // and initializes whichever one responds.
 #include "touch.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_touch.h"
@@ -81,15 +83,46 @@ bool touch_init(void)
     return true;
 }
 
-void touch_poll_log(void)
+// Panel coordinates already match display coordinates 1:1 — MEASURED on
+// hardware, don't "fix" this without re-measuring. display.c mirrors the LCD
+// (esp_lcd_panel_mirror(panel, true, true)) which suggests touch would need
+// flipping too, but it doesn't: a tap on the bottom-left CANCEL button reports
+// panel(~70,~215), which is already that button's display rect. Flipping sent
+// it to the opposite corner and no button ever responded.
+#define TOUCH_MIRROR_XY 0
+
+// The GT911 in polling mode (no INT pin) reports a "new" point repeatedly for
+// one continuous press — a rising edge alone gave ~25 taps per finger press.
+// A time floor between accepted taps is what actually makes one press = one tap.
+#define TAP_DEBOUNCE_MS 400
+
+static bool s_was_pressed = false;
+static TickType_t s_last_tap_tick = 0;
+
+bool touch_get_tap(int *x, int *y)
 {
-    if (!s_touch) return;
+    if (!s_touch) return false;
     esp_lcd_touch_read_data(s_touch);
 
-    uint16_t x[1], y[1], strength[1];
+    uint16_t tx[1], ty[1], strength[1];
     uint8_t n = 0;
-    bool pressed = esp_lcd_touch_get_coordinates(s_touch, x, y, strength, &n, 1);
-    if (pressed && n > 0) {
-        ESP_LOGI(TAG, "touch at (%u, %u) strength=%u", x[0], y[0], strength[0]);
+    bool pressed = esp_lcd_touch_get_coordinates(s_touch, tx, ty, strength, &n, 1) && n > 0;
+    bool edge = pressed && !s_was_pressed;
+    s_was_pressed = pressed;
+    if (!edge) return false;
+
+    TickType_t now = xTaskGetTickCount();
+    if (s_last_tap_tick && (int32_t)(now - s_last_tap_tick) < pdMS_TO_TICKS(TAP_DEBOUNCE_MS)) {
+        return false;
     }
+    s_last_tap_tick = now;
+
+#if TOUCH_MIRROR_XY
+    int dx = 320 - tx[0], dy = 240 - ty[0];
+#else
+    int dx = tx[0], dy = ty[0];
+#endif
+    ESP_LOGI(TAG, "tap: panel(%u,%u) -> display(%d,%d)", tx[0], ty[0], dx, dy);
+    *x = dx; *y = dy;
+    return true;
 }

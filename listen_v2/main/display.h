@@ -34,6 +34,24 @@ void display_order(const char *title, const order_line_t *lines, int count,
 // is dropped. Used to show what was heard / what is being said in realtime.
 void display_caption(const char *speaker, uint16_t bar, const char *text);
 
+// On-screen buttons. Only the confirm screen has any today.
+typedef enum {
+    BTN_NONE = 0,
+    BTN_CANCEL,
+    BTN_SEND,
+} display_button_t;
+
+// Confirm screen: like display_caption(), but the transcript area is shortened
+// to fit CANCEL (red, left) and SEND (green, right) buttons along the bottom.
+// The BOOT button still confirms — touch is an addition, not a replacement.
+void display_confirm(const char *speaker, uint16_t bar, const char *text);
+
+// Which button contains this point, in DISPLAY coordinates (touch.c converts
+// from panel coordinates). Meaningful only while a display_confirm() screen is
+// up — the caller tracks that. Geometry lives in display.c beside the drawing
+// code so the buttons and their hit boxes can never drift apart.
+display_button_t display_hit_test(int x, int y);
+
 // Provisioning QR screen: modules is a size*size byte array (1 = black module),
 // drawn centered on white with "JOIN <ssid>" / "PASS <psk>" text underneath.
 void display_qr(const uint8_t *modules, int size, const char *ssid, const char *psk);

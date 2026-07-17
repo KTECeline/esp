@@ -55,7 +55,11 @@ static volatile TickType_t s_upload_done_tick = 0;
 // (POSTed to the Mac's /confirm) instead of starting a new recording. No tap
 // -> cancelled, nothing reaches the LLM. Guards against STT mishearings
 // becoming wrong orders.
-#define CONFIRM_WINDOW_MS 8000
+// 8s proved too tight once the screen had buttons: reading the transcript,
+// deciding, and reaching for the screen ate most of it. 15s still sits well
+// inside the Mac's 25s pending-transcript window, and CANCEL is now an
+// explicit button so waiting out the timer is no longer the only way to bail.
+#define CONFIRM_WINDOW_MS 15000
 static volatile bool s_confirm_pending = false;
 static volatile TickType_t s_confirm_deadline_tick = 0;
 
@@ -734,7 +738,9 @@ static esp_err_t caption_handler(httpd_req_t *req)
     }
 
     s_caption_at_tick = xTaskGetTickCount();
-    display_caption(who, bar, text);
+    // The confirm screen carries CANCEL/SEND buttons; a plain caption doesn't.
+    if (s_confirm_pending) display_confirm(who, bar, text);
+    else                   display_caption(who, bar, text);
     httpd_resp_sendstr(req, "ok");
     return ESP_OK;
 }
@@ -973,6 +979,27 @@ void app_main(void)
             while (high < 5) { high = (gpio_get_level(PIN_REC_BTN) != 0) ? high + 1 : 0; vTaskDelay(pdMS_TO_TICKS(10)); }
             continue;
         }
+        // Touch: the confirm screen has CANCEL/SEND buttons. Touch is an
+        // addition to the BOOT-tap path above, not a replacement — either
+        // confirms. Cancelling is box-local: the Mac's pending transcript
+        // simply expires (or is replaced by the next recording), so there's
+        // no cancel round-trip to get wrong.
+        int tx, ty;
+        if (s_confirm_pending && touch_get_tap(&tx, &ty)) {
+            display_button_t btn = display_hit_test(tx, ty);
+            if (btn == BTN_SEND) {
+                s_confirm_pending = false;
+                display_status("SENDING", "TO ASSISTANT", rgb565(0, 90, 160));
+                post_confirm();
+                continue;
+            } else if (btn == BTN_CANCEL) {
+                s_confirm_pending = false;
+                display_status("CANCELLED", "TAP TO RETRY", rgb565(180, 0, 0));
+                ESP_LOGI(TAG, "cancelled by touch — transcript discarded");
+                continue;
+            }
+        }
+
         // Confirm window ran out with no tap: discard the pending transcript.
         if (s_confirm_pending &&
             (int32_t)(xTaskGetTickCount() - s_confirm_deadline_tick) >= 0) {
@@ -981,7 +1008,6 @@ void app_main(void)
             ESP_LOGI(TAG, "confirm window expired — transcript discarded");
         }
         if (++hb >= 500) { hb = 0; ESP_LOGI(TAG, "alive, waiting for REC tap..."); }
-        touch_poll_log();   // proof-of-concept: logs coordinates only, no behavior wired to it yet
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 }

@@ -238,24 +238,18 @@ void display_order(const char *title, const order_line_t *lines, int count,
     if (total) draw_text_right(LCD_W - 12, ty + 11, 3, COL_WHITE, blue, total);
 }
 
-void display_caption(const char *speaker, uint16_t bar, const char *text)
+// Word-wrap `text` into the band from y0 down to y_limit, uppercasing as we go
+// (the 5x7 font has no lowercase glyphs). Overflow past y_limit is dropped.
+static void draw_wrapped(const char *text, int y0, int y_limit)
 {
-    if (!s_panel) return;
-    const int BAR_H = 30;
-
-    fill_screen(COL_BLACK);
-    fill_rect(0, 0, LCD_W, BAR_H, bar);
-    draw_text_left(10, 5, 3, COL_WHITE, bar, speaker ? speaker : "");
-
     if (!text) return;
-
-    // Word-wrap the body at scale 2, uppercasing as we go (no lowercase glyphs).
-    const int SC = 2, ADV = 6 * SC, LH = 20, X0 = 8, Y0 = BAR_H + 12;
-    const int max_cols  = (LCD_W - 2 * X0) / ADV;     // ~25 chars/line
-    const int max_lines = (LCD_H - Y0 - 4) / LH;      // ~9 lines
+    const int SC = 2, ADV = 6 * SC, LH = 20, X0 = 8;
+    const int max_cols  = (LCD_W - 2 * X0) / ADV;      // ~25 chars/line
+    const int max_lines = (y_limit - y0) / LH;
+    if (max_lines <= 0) return;
 
     char line[48];
-    int ll = 0, ly = Y0, used = 0;
+    int ll = 0, ly = y0, used = 0;
     const char *p = text;
     while (*p && used < max_lines) {
         while (*p == ' ') p++;
@@ -283,6 +277,61 @@ void display_caption(const char *speaker, uint16_t bar, const char *text)
         line[ll] = 0;
         draw_text_left(X0, ly, SC, COL_WHITE, COL_BLACK, line);
     }
+}
+
+#define CAP_BAR_H 30
+
+void display_caption(const char *speaker, uint16_t bar, const char *text)
+{
+    if (!s_panel) return;
+    fill_screen(COL_BLACK);
+    fill_rect(0, 0, LCD_W, CAP_BAR_H, bar);
+    draw_text_left(10, 5, 3, COL_WHITE, bar, speaker ? speaker : "");
+    draw_wrapped(text, CAP_BAR_H + 12, LCD_H - 4);
+}
+
+// ---- Confirm screen buttons -----------------------------------------------
+// One definition of the geometry, used by both the renderer and the hit test.
+#define BTN_H         46
+#define BTN_W         140
+#define BTN_Y         (LCD_H - BTN_H - 6)     // 188
+#define BTN_CANCEL_X  8
+#define BTN_SEND_X    (LCD_W - BTN_W - 8)     // 172
+
+static void draw_text_centered_in(int x0, int w, int y, int scale,
+                                  uint16_t fg, uint16_t bg, const char *s)
+{
+    int len = strlen(s);
+    int adv = 6 * scale;
+    int width = len * adv - scale;
+    int x = x0 + (w - width) / 2;
+    if (x < x0) x = x0;
+    for (int i = 0; i < len; i++) draw_char(x + i * adv, y, scale, fg, bg, s[i]);
+}
+
+void display_confirm(const char *speaker, uint16_t bar, const char *text)
+{
+    if (!s_panel) return;
+    fill_screen(COL_BLACK);
+    fill_rect(0, 0, LCD_W, CAP_BAR_H, bar);
+    draw_text_left(10, 5, 3, COL_WHITE, bar, speaker ? speaker : "");
+
+    // Transcript stops above the buttons instead of running to the bottom.
+    draw_wrapped(text, CAP_BAR_H + 12, BTN_Y - 6);
+
+    const uint16_t red = rgb565(180, 0, 0), green = rgb565(0, 150, 0);
+    fill_rect(BTN_CANCEL_X, BTN_Y, BTN_W, BTN_H, red);
+    draw_text_centered_in(BTN_CANCEL_X, BTN_W, BTN_Y + 13, 3, COL_WHITE, red, "CANCEL");
+    fill_rect(BTN_SEND_X, BTN_Y, BTN_W, BTN_H, green);
+    draw_text_centered_in(BTN_SEND_X, BTN_W, BTN_Y + 13, 3, COL_WHITE, green, "SEND");
+}
+
+display_button_t display_hit_test(int x, int y)
+{
+    if (y < BTN_Y || y > BTN_Y + BTN_H) return BTN_NONE;
+    if (x >= BTN_CANCEL_X && x <= BTN_CANCEL_X + BTN_W) return BTN_CANCEL;
+    if (x >= BTN_SEND_X && x <= BTN_SEND_X + BTN_W) return BTN_SEND;
+    return BTN_NONE;
 }
 
 // Provisioning QR screen: white background (doubles as the QR quiet zone),

@@ -8,7 +8,7 @@
 // Returns false if no touch chip responds at either known address.
 bool touch_init(void);
 
-// Call periodically (e.g. every ~50ms) from a task or the main loop. Logs
-// (via ESP_LOGI) each new touch point's coordinates; does nothing when the
-// panel isn't being touched. No-op if touch_init() returned false.
-void touch_poll_log(void);
+// Poll for a tap. Returns true ONCE per press (rising edge — a held finger
+// reports a single tap, not a stream), writing DISPLAY coordinates to x/y.
+// Call every ~20-50ms from the main loop. Always false if touch_init() failed.
+bool touch_get_tap(int *x, int *y);
