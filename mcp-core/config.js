@@ -17,6 +17,41 @@ function resolvePath(p) {
   return path.isAbsolute(p) ? p : path.join(ESP_ROOT, p);
 }
 
+// Explicit `type` wins; otherwise infer from shape so existing configs (which
+// have no type field) keep working with no migration.
+function inferBackendType(cfg) {
+  if (cfg.type) return cfg.type;
+  if (cfg.webhook_url) return "webhook";
+  if (cfg.url && cfg.model) return "openai_chat";
+  return null;
+}
+
+// Secrets belong in the environment, not on disk: `token_env` names a variable
+// to read at startup. A real WiFi password already leaked out of this repo once
+// via a committed file, so a cloud API key sitting in config.json is a risk
+// worth designing away. Plain `token` still works for local backends that need
+// no real secret (Ollama ignores it).
+function resolveToken(name, bc) {
+  if (!bc.token_env) return bc.token ? { token: bc.token } : {};
+  const fromEnv = process.env[bc.token_env];
+  if (!fromEnv) {
+    // Loud, because the alternative is a baffling 401 mid-conversation later.
+    console.warn(`Backend "${name}": token_env "${bc.token_env}" is not set in the environment — ` +
+                 `calls will likely fail with an auth error. Export it, or remove token_env.`);
+    return {};
+  }
+  return { token: fromEnv };
+}
+
+// A hanging backend is indistinguishable from a crash to someone standing at
+// the box, so the old blanket 120s is wrong for anything network-facing.
+// Webhooks keep it (the agent is local and trusted); LLM calls get a voice-
+// appropriate default. Either can be overridden per backend.
+function backendTimeout(bc, type) {
+  if (Number.isFinite(bc.timeout_ms)) return bc.timeout_ms;
+  return type === "webhook" ? 120000 : 10000;
+}
+
 // The untouched parsed JSON — for callers that need to WRITE the config back
 // (box self-registration). loadConfig() below returns a derived/validated
 // shape that drops fields; round-tripping that would silently lose them.
@@ -52,26 +87,48 @@ export function loadConfig() {
   // so an empty list is fine now — it just means no box has shown up yet.
   const boxes = Array.isArray(cfg.boxes) ? cfg.boxes.filter((b) => b && b.ip) : [];
 
-  // A backend earns a slot in the effective priority list only if its required
-  // fields are present; misconfigured entries are skipped with a warning so a
-  // typo degrades to the next backend instead of crashing mid-conversation.
+  // Backends are dispatched by TYPE, not by name. The old code hardcoded an
+  // allowlist of exactly "agent" and "local_llm", so any third backend was
+  // silently dropped here as unknown *and* misrouted to the local LLM's config
+  // by the router — a trap that had to be fixed in two places at once.
+  //
+  // An explicit `type` always wins, so future kinds ("gemini", "ollama") just
+  // work; inference is the fallback so every existing config.json keeps loading
+  // untouched, with no migration.
   const backends = cfg.backends || {};
   const declared = Array.isArray(backends.priority) ? backends.priority : [];
   const priority = [];
+  const resolved = {};
   for (const name of declared) {
-    if (name === "agent") {
-      if (backends.agent && backends.agent.webhook_url) priority.push("agent");
-      else console.warn("Backend \"agent\" listed in priority but has no webhook_url — skipped.");
-    } else if (name === "local_llm") {
-      if (backends.local_llm && backends.local_llm.url && backends.local_llm.model) priority.push("local_llm");
-      else console.warn("Backend \"local_llm\" listed in priority but missing url/model — skipped.");
-    } else {
-      console.warn(`Unknown backend "${name}" in priority — skipped.`);
+    const bc = backends[name];
+    if (!bc) {
+      console.warn(`Backend "${name}" listed in priority but not defined — skipped.`);
+      continue;
     }
+    const type = inferBackendType(bc);
+    if (!type) {
+      console.warn(`Backend "${name}" has no recognizable shape (need webhook_url, or url+model) — skipped.`);
+      continue;
+    }
+    if (type === "webhook" && !bc.webhook_url) {
+      console.warn(`Backend "${name}" is type webhook but has no webhook_url — skipped.`);
+      continue;
+    }
+    if (type === "openai_chat" && !(bc.url && bc.model)) {
+      console.warn(`Backend "${name}" is type openai_chat but missing url/model — skipped.`);
+      continue;
+    }
+    if (type !== "webhook" && type !== "openai_chat") {
+      console.warn(`Backend "${name}" has unsupported type "${type}" — skipped.`);
+      continue;
+    }
+    resolved[name] = { ...bc, type, ...resolveToken(name, bc), timeoutMs: backendTimeout(bc, type) };
+    priority.push(name);
   }
   if (priority.length === 0) {
-    console.error("No usable backend configured. Set backends.agent.webhook_url and/or");
-    console.error("backends.local_llm.{url,model}, and list them in backends.priority.");
+    console.error("No usable backend configured. Define at least one entry under \"backends\"");
+    console.error("with either webhook_url (an agent) or url+model (an OpenAI-compatible LLM),");
+    console.error("and list its name in backends.priority.");
     console.error("Refusing to run: there is nothing to route speech to.");
     process.exit(1);
   }
@@ -80,8 +137,7 @@ export function loadConfig() {
   return {
     boxes,
     priority,
-    agent: backends.agent || {},
-    localLlm: backends.local_llm || {},
+    backends: resolved,
     stt: {
       language: stt.language || "auto",
       promptFile: resolvePath(stt.prompt_file),

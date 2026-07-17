@@ -2,10 +2,27 @@
   "boxes": [
     { "id": "BOX-A1B4", "name": "box1", "ip": "192.168.68.142" }
   ],
+  "_backends_help": [
+    "Backends are tried in `priority` order; the first that answers wins, so a dead",
+    "one degrades to the next instead of going silent. Names are arbitrary — the KIND",
+    "is inferred from the shape (webhook_url => agent webhook; url+model => any",
+    "OpenAI-compatible chat endpoint), or set `type` explicitly to override.",
+    "timeout_ms defaults to 120000 for webhooks and 10000 for LLMs: a hang is",
+    "indistinguishable from a crash to someone standing at the box, so keep cloud",
+    "timeouts short and let it fail over to local.",
+    "NEVER put a real API key here — use token_env to name an environment variable."
+  ],
   "backends": {
-    "priority": ["agent", "local_llm"],
+    "priority": ["agent", "cloud_llm", "local_llm"],
     "agent": {
       "webhook_url": "http://localhost:4000/agent"
+    },
+    "cloud_llm": {
+      "url": "https://api.openai.com/v1/chat/completions",
+      "model": "gpt-4o-mini",
+      "token_env": "OPENAI_API_KEY",
+      "timeout_ms": 8000,
+      "system_prompt": "You are a helpful voice assistant. Keep replies to 1-2 short spoken sentences."
     },
     "local_llm": {
       "url": "http://localhost:11434/v1/chat/completions",

@@ -19,9 +19,11 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { Bonjour } from "bonjour-service";
 import { loadConfig, loadRawConfig, writeConfig, ESP_ROOT } from "./config.js";
 import { BoxRegistry, asciiOneline, sendCaption, sendAudio, sendDisplay } from "./boxes.js";
+import { createMcpServer } from "./mcp-tools.js";
 
 const config = loadConfig();
 // The raw parsed config is kept for round-tripping: box self-registration
@@ -138,56 +140,68 @@ async function ttsForBox(text) {
 // Both backends return the same shape:
 //   { reply: string, display: [{path, body, headers}]|null, end_session: bool }
 
-async function askAgent(box, text) {
-  const res = await fetch(config.agent.webhook_url, {
+// Both take their own config, so any number of backends of the same type can
+// coexist (agent + cloud_llm + local_llm + ...). Nothing is keyed by name.
+
+async function askWebhook(name, bc, box, text) {
+  const res = await fetch(bc.webhook_url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ session_id: box.id, text }),
-    signal: AbortSignal.timeout(120000)
+    signal: AbortSignal.timeout(bc.timeoutMs)
   });
-  if (!res.ok) throw new Error(`agent webhook returned ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  if (!res.ok) throw new Error(`${name} returned ${res.status}: ${(await res.text()).slice(0, 200)}`);
   const data = await res.json();
-  if (!data.reply) throw new Error("agent webhook returned no reply");
+  if (!data.reply) throw new Error(`${name} returned no reply`);
   return { reply: data.reply, display: data.display || null, end_session: !!data.end_session };
 }
 
-async function askLocalLlm(box, text) {
+// Any OpenAI-compatible chat-completions endpoint — Ollama locally, or OpenAI/
+// Groq/OpenRouter/Together/vLLM in the cloud. Same wire format, so one function.
+async function askOpenAiChat(name, bc, box, text) {
+  // History is keyed by box ONLY, never by backend: if the cloud dies mid-chat
+  // and we fall through to local llama, the customer's conversation continues
+  // instead of restarting.
   let history = llmHistoryByBox.get(box.id) || [];
   history.push({ role: "user", content: text });
   if (history.length > HISTORY_MAX) history = history.slice(-HISTORY_MAX);
 
-  const res = await fetch(config.localLlm.url, {
+  const res = await fetch(bc.url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "Authorization": "Bearer " + (config.localLlm.token || "")
+      "Authorization": "Bearer " + (bc.token || "")
     },
     body: JSON.stringify({
-      model: config.localLlm.model,
+      model: bc.model,
       messages: [
-        ...(config.localLlm.system_prompt ? [{ role: "system", content: config.localLlm.system_prompt }] : []),
+        ...(bc.system_prompt ? [{ role: "system", content: bc.system_prompt }] : []),
         ...history
       ]
     }),
-    signal: AbortSignal.timeout(120000)
+    signal: AbortSignal.timeout(bc.timeoutMs)
   });
-  if (!res.ok) throw new Error(`local_llm returned ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  if (!res.ok) throw new Error(`${name} returned ${res.status}: ${(await res.text()).slice(0, 200)}`);
   const data = await res.json();
   const reply = (data.choices?.[0]?.message?.content || "").trim();
-  if (!reply) throw new Error("local_llm returned an empty reply");
+  if (!reply) throw new Error(`${name} returned an empty reply`);
   history.push({ role: "assistant", content: reply });
   llmHistoryByBox.set(box.id, history);
   return { reply, display: null, end_session: false };
 }
 
-// Try backends in config priority order; a failed backend falls through to
-// the next one so a dead webhook degrades to plain chat instead of silence.
+// Try backends in config priority order; a failed backend falls through to the
+// next one so a dead webhook (or an unreachable cloud) degrades to plain local
+// chat instead of silence.
 async function routeText(box, text) {
   let lastErr = null;
   for (const name of config.priority) {
+    const bc = config.backends[name];
     try {
       const t0 = nowMs();
-      const result = name === "agent" ? await askAgent(box, text) : await askLocalLlm(box, text);
+      const result = bc.type === "webhook"
+        ? await askWebhook(name, bc, box, text)
+        : await askOpenAiChat(name, bc, box, text);
       return { ...result, backend: name, llm_ms: nowMs() - t0 };
     } catch (err) {
       console.warn(`Backend "${name}" failed: ${err.message}`);
@@ -202,6 +216,40 @@ async function routeText(box, text) {
 function splitSentences(text) {
   const parts = text.trim().split(/(?<=[.!?])\s+/).map((p) => p.trim()).filter(Boolean);
   return parts.length ? parts : [text.trim()];
+}
+
+// Speak `text` on `box` via the sentence-chunked TTS pipeline: synthesize
+// sentence N+1 while the box is still playing sentence N. MOSS generates
+// ~2.8x faster than realtime, so after the first chunk there are no gaps —
+// and first audio starts after ONE sentence of TTS instead of the whole reply.
+//
+// `sinceMs` anchors firstAudioMs to an earlier moment (e.g. the tap-confirm)
+// so the caller can report true end-to-end latency; defaults to this call's
+// own start. Timestamps are returned rather than written to a shared object,
+// so the caller decides what to log.
+//
+// Shared by the tap-driven flow (handleConfirm) and the esp_speak MCP tool —
+// one implementation, so the two paths can't drift apart.
+async function speakToBox(box, text, { sinceMs } = {}) {
+  const t0 = sinceMs ?? nowMs();
+  const sentences = splitSentences(text);
+  let firstAudioMs = null;
+  let ttsEnd = null;
+  const ttsStart = nowMs();
+  let nextChunk = ttsForBox(sentences[0]);
+  const playbackStart = nowMs();
+  for (let i = 0; i < sentences.length; i++) {
+    const wav = await nextChunk;
+    if (i + 1 < sentences.length) nextChunk = ttsForBox(sentences[i + 1]);
+    if (firstAudioMs === null) {
+      firstAudioMs = nowMs() - t0;
+      // First chunk done = the latency-critical TTS span (later chunks
+      // overlap playback and don't delay anything).
+      ttsEnd = nowMs();
+    }
+    await sendAudio(box, wav, { quiet: true, final: i + 1 === sentences.length });
+  }
+  return { chunks: sentences.length, firstAudioMs, ttsStart, ttsEnd, playbackStart, playbackEnd: nowMs() };
 }
 
 // Phase 1: recording arrives -> STT only -> show transcript, arm tap-confirm.
@@ -273,29 +321,15 @@ async function handleConfirm(box) {
       // is still being synthesized.
       await sendCaption(box, reply, { who: "BOX" });
 
-      // Sentence-chunked TTS pipeline: synthesize sentence N+1 while the box
-      // plays sentence N. MOSS generates ~2.8x faster than realtime, so after
-      // the first chunk there are no gaps — and first audio starts after ONE
-      // sentence of TTS instead of the whole reply.
-      const sentences = splitSentences(reply);
-      let firstAudioMs = null;
-      stages.tts_start = nowMs();
-      let nextChunk = ttsForBox(sentences[0]);
-      const playbackStart = nowMs();
-      for (let i = 0; i < sentences.length; i++) {
-        const wav = await nextChunk;
-        if (i + 1 < sentences.length) nextChunk = ttsForBox(sentences[i + 1]);
-        if (firstAudioMs === null) {
-          firstAudioMs = nowMs() - confirmAt;
-          // First chunk done = the latency-critical TTS span (later chunks
-          // overlap playback and don't delay anything).
-          stages.tts_end = nowMs();
-        }
-        await sendAudio(box, wav, { quiet: true, final: i + 1 === sentences.length });
-      }
-      const playbackEnd = nowMs();
-      stages.playback_start = playbackStart;
-      stages.playback_end = playbackEnd;
+      // Chunked TTS + playback (see speakToBox). firstAudioMs is anchored to
+      // the tap-confirm so it reports what the customer actually waited.
+      const spoken = await speakToBox(box, reply, { sinceMs: confirmAt });
+      const firstAudioMs = spoken.firstAudioMs;
+      const playbackEnd = spoken.playbackEnd;
+      stages.tts_start = spoken.ttsStart;
+      stages.tts_end = spoken.ttsEnd;
+      stages.playback_start = spoken.playbackStart;
+      stages.playback_end = spoken.playbackEnd;
 
       // Backend-supplied display payloads (e.g. the order screen) take over
       // as the resting state. Passthrough only — the core never builds these.
@@ -306,7 +340,7 @@ async function handleConfirm(box) {
       if (end_session) llmHistoryByBox.delete(box.id);
 
       const totalMs = playbackEnd - confirmAt;
-      console.log(`[${box.name}] ${sentences.length} chunks played. first audio at ${firstAudioMs}ms, done at ${totalMs}ms\n`);
+      console.log(`[${box.name}] ${spoken.chunks} chunks played. first audio at ${firstAudioMs}ms, done at ${totalMs}ms\n`);
       record.reply = reply;
       record.backend = backend;
       record.display_entries = (display || []).length;
@@ -339,6 +373,23 @@ const server = http.createServer(async (req, res) => {
   };
 
   try {
+    // MCP tool surface (Streamable HTTP). Must be routed BEFORE any readBody()
+    // — the transport needs the raw, unconsumed request stream.
+    //
+    // A fresh server+transport per request, on purpose: the SDK's example
+    // shares one stateless transport, but mcp-core is a long-running daemon
+    // taking concurrent requests, where a shared transport risks request-id
+    // collisions between clients. Registering three tools costs microseconds,
+    // and all real state (box registry, sessions) lives outside MCP anyway.
+    if (req.url === "/mcp") {
+      const mcp = createMcpServer({ boxes, speakToBox });
+      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+      res.on("close", () => { transport.close(); mcp.close(); });
+      await mcp.connect(transport);
+      await transport.handleRequest(req, res);
+      return;
+    }
+
     if (req.method === "GET" && req.url === "/health") {
       return json(200, {
         status: "ok",
@@ -405,10 +456,14 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && req.url === "/reset") {
       llmHistoryByBox.clear();
       pendingByBox.clear();
-      if (config.priority.includes("agent")) {
+      // Reset every webhook backend, not just one called "agent" — backends are
+      // arbitrarily named now, and only webhooks hold their own session state.
+      for (const name of config.priority) {
+        const bc = config.backends[name];
+        if (bc.type !== "webhook") continue;
         try {
-          await fetch(new URL("/reset", config.agent.webhook_url), { method: "POST" });
-        } catch { /* agent may be down; local state is cleared regardless */ }
+          await fetch(new URL("/reset", bc.webhook_url), { method: "POST" });
+        } catch { /* backend may be down; local state is cleared regardless */ }
       }
       return json(200, { ok: true });
     }

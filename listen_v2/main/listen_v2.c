@@ -35,6 +35,7 @@
 #include "provisioning.h"
 #include "esp_timer.h"
 #include "mdns.h"
+#include "touch.h"
 
 // WiFi credentials and the PC endpoint are NO LONGER compiled in (the old
 // wifi_config.h path put a real password in source once — never again). They
@@ -839,6 +840,9 @@ void app_main(void)
 
     i2c_init();
     display_init();
+    if (!touch_init()) {
+        ESP_LOGW(TAG, "touch controller not found — screen is display-only");
+    }
     display_status("STARTING", NULL, COL_BLACK);
     i2s_chan_handle_t rx = i2s_init();
     mic_init(rx);
@@ -977,6 +981,7 @@ void app_main(void)
             ESP_LOGI(TAG, "confirm window expired — transcript discarded");
         }
         if (++hb >= 500) { hb = 0; ESP_LOGI(TAG, "alive, waiting for REC tap..."); }
+        touch_poll_log();   // proof-of-concept: logs coordinates only, no behavior wired to it yet
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 }

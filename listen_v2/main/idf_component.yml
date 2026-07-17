@@ -11,3 +11,7 @@ dependencies:
   espressif/qrcode: '^0.1.0'
   # Resolves mcp-core.local so the provisioning form never needs a raw LAN IP.
   espressif/mdns: '^1.2.0'
+  # TT21100 touch controller — same chip already probed (display.c) to detect
+  # the panel type. Proof-of-concept only: logs raw coordinates, no UI yet.
+  espressif/esp_lcd_touch: '^1.1.0'
+  espressif/esp_lcd_touch_tt21100: '^1.0.4'
