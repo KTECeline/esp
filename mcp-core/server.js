@@ -136,6 +136,34 @@ async function ttsForBox(text) {
   return await readFile(boxPath);
 }
 
+// ---- Wake / greeting --------------------------------------------------------
+// GREETING_TEXT is synthesized ONCE and cached in memory — a live TTS call on
+// every tap would blow the "1-2s from tap to greeting" latency target for no
+// reason, since it's the same phrase every time. Config-overridable so this
+// stays reusable for non-restaurant projects, per the README's design goal.
+const GREETING_TEXT = config.greetingText || "Hi! How can I help you today?";
+let cachedGreetingWav = null;
+async function getGreetingAudio() {
+  if (!cachedGreetingWav) {
+    console.log(`Pre-caching greeting audio: "${GREETING_TEXT}"`);
+    const t0 = nowMs();
+    cachedGreetingWav = await ttsForBox(GREETING_TEXT);
+    console.log(`Greeting cached (${nowMs() - t0}ms, reused for every wake).`);
+  }
+  return cachedGreetingWav;
+}
+
+// A wake tap: play the (cached) greeting, then — via X-Auto-Listen — the box
+// starts a normal listen turn the moment playback ends. Everything after
+// that (upload, STT, confirm screen, order) is the exact same path a BOOT-
+// triggered recording already uses; this only replaces how a turn STARTS.
+async function handleWake(box) {
+  const t0 = nowMs();
+  const wav = await getGreetingAudio();
+  console.log(`[${box.name}] greeting ready at +${nowMs() - t0}ms, sending to box...`);
+  await sendAudio(box, wav, { replyText: GREETING_TEXT, autoListen: true });
+}
+
 // ---- Backend router --------------------------------------------------------
 // Both backends return the same shape:
 //   { reply: string, display: [{path, body, headers}]|null, end_session: bool }
@@ -419,6 +447,22 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === "POST" && req.url === "/wake") {
+      const box = boxes.fromId(req);
+      if (!box) {
+        return json(400, { error: "missing X-Box-Id header — flash current firmware" });
+      }
+      await readBody(req);
+      // Ack immediately — the box is not waiting on this response for
+      // anything (unlike /confirm), it moves straight into playing the
+      // greeting once the Mac pushes it, which happens async below.
+      res.writeHead(200, { "Content-Length": "2" });
+      res.end("ok");
+      console.log(`\n[${box.name}] wake tap`);
+      handleWake(box).catch((err) => console.warn(`       (wake failed: ${err.message})`));
+      return;
+    }
+
     if (req.method === "POST" && req.url === "/confirm") {
       const box = boxes.fromId(req);
       if (!box) {
@@ -495,6 +539,10 @@ async function main() {
     console.log(`Boxes: ${boxes.boxes.map((b) => `${b.name}@${b.ip}`).join(", ")}`);
     startMdnsAdvertiser();
   });
+  // Pre-warm the greeting cache so the FIRST wake tap of the day is fast too,
+  // not just the second one. Failure here isn't fatal — getGreetingAudio()
+  // will just retry on the first real wake — so don't crash startup over it.
+  getGreetingAudio().catch((err) => console.warn(`(greeting pre-cache failed, will retry on first wake: ${err.message})`));
 }
 
 for (const sig of ["SIGINT", "SIGTERM"]) {

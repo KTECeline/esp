@@ -72,6 +72,7 @@ static char s_post_url[81];       // http://<mac>:<port>/upload
 static char s_confirm_url[112];
 static char s_health_url[112];
 static char s_register_url[112];
+static char s_wake_url[112];
 
 // ---- BOX-3 wiring ----
 #define I2C_PORT        I2C_NUM_0
@@ -89,6 +90,14 @@ static char s_register_url[112];
 // the hardware mic-MUTE, so holding/pressing it silences the mic we record
 // from. BOOT is the only usable physical button for recording.
 #define PIN_REC_BTN     0
+// MUTE (GPIO1) is used as a WAKE trigger, not a record trigger — measured on
+// hardware: holding it drives the mic to exactly zero (a real hardware mute
+// line, confirmed independent of firmware — our code never reads GPIO1 and it
+// still mutes), but a quick tap-then-release restores real mic input almost
+// immediately. So a fast tap is safe: it notifies the Mac, which plays a
+// greeting; the box only starts LISTENING after that tap is already released,
+// well clear of the mute window. Never treat this as a hold-to-talk button.
+#define PIN_MUTE_BTN    1
 
 // ---- Recording params ----
 #define SAMPLE_RATE     16000
@@ -475,7 +484,7 @@ static uint32_t s_record_len = 0;
 // earlier "one chunk per main-loop iteration with a vTaskDelay" structure
 // returned all zeros). The caller has already consumed the START tap; this
 // records until the NEXT tap (a fresh button press) or the max length.
-static void record_toggle_and_send(void)
+static void record_toggle_and_send(const char *rec_line2)
 {
     s_record_buf = heap_caps_malloc(MAX_RECORD_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!s_record_buf) {
@@ -494,7 +503,7 @@ static void record_toggle_and_send(void)
     esp_codec_dev_set_in_gain(s_mic, MIC_GAIN_DB);
     ESP_LOGI(TAG, ">>> recording (auto-stops after %dms silence, or tap REC, max %ds) <<<",
             VAD_SILENCE_HOLD_MS, MAX_RECORD_SECONDS);
-    display_status("REC", "SPEAK, PAUSE TO SEND", rgb565(200, 0, 0));
+    display_status("REC", rec_line2, rgb565(200, 0, 0));
 
     const uint32_t chunk = 1024;
     uint8_t tmp[1024];
@@ -580,6 +589,37 @@ static void record_toggle_and_send(void)
     vTaskDelay(pdMS_TO_TICKS(1200));
 }
 
+typedef struct {
+    const char *rec_line2;
+    SemaphoreHandle_t done;
+} auto_listen_args_t;
+
+static void auto_listen_task(void *arg)
+{
+    auto_listen_args_t *a = (auto_listen_args_t *)arg;
+    record_toggle_and_send(a->rec_line2);
+    xSemaphoreGive(a->done);
+    vTaskDelete(NULL);
+}
+
+// record_toggle_and_send() runs fine on the ~3.5KB main-task stack when
+// called directly (the normal BOOT-tap path) — but calling it INLINE from
+// inside play_handler overflows the httpd worker's 8KB stack anyway: it's
+// httpd's own internal frames + play_handler's locals + the recording call
+// chain (I2S/codec + a NESTED esp_http_client POST for /upload) all stacked
+// on top of each other. Confirmed on hardware (reproduced twice, identical
+// crash both times). Fix: run it in a fresh dedicated task instead — the
+// same pattern this file already uses for playback_task, for the same
+// reason. Blocks the caller via semaphore so play_handler's behavior
+// (respond, then act) is otherwise unchanged.
+static void run_auto_listen(const char *rec_line2)
+{
+    auto_listen_args_t args = { .rec_line2 = rec_line2, .done = xSemaphoreCreateBinary() };
+    xTaskCreate(auto_listen_task, "auto_listen", 8192, &args, 5, NULL);
+    xSemaphoreTake(args.done, portMAX_DELAY);
+    vSemaphoreDelete(args.done);
+}
+
 // --------------------------------------------------------------------------
 // TALK: PC POSTs a WAV to http://<box-ip>/play -> box plays it on the speaker.
 // The WAV's own header sets the sample rate/channels, so any 16-bit PCM WAV works.
@@ -654,6 +694,9 @@ static esp_err_t play_handler(httpd_req_t *req)
     hdr[0] = 0;
     bool final = (httpd_req_get_hdr_value_str(req, "X-Final", hdr, sizeof(hdr)) == ESP_OK)
                  && hdr[0] == '1';
+    hdr[0] = 0;
+    bool auto_listen = (httpd_req_get_hdr_value_str(req, "X-Auto-Listen", hdr, sizeof(hdr)) == ESP_OK)
+                       && hdr[0] == '1';
     if (had_caption) {
         display_caption("BOX", rgb565(0, 150, 0), reply_txt);
     } else if (!quiet) {
@@ -697,6 +740,19 @@ static esp_err_t play_handler(httpd_req_t *req)
     TickType_t playback_end_tick = xTaskGetTickCount();
     httpd_resp_sendstr(req, "played");
     if (quiet && !final) return ESP_OK;
+
+    if (auto_listen) {
+        // Greeting just finished — go straight into a listen turn, no button
+        // needed. Same recording+upload path BOOT uses, so everything
+        // downstream (STT, confirm screen, order) is completely unchanged.
+        // Runs in its own task — see run_auto_listen()'s comment for why.
+        run_auto_listen("LISTENING...");
+        if ((int32_t)(s_caption_at_tick - s_upload_done_tick) <= 0) {
+            display_status("READY", s_ip_str, rgb565(0, 90, 160));
+        }
+        return ESP_OK;
+    }
+
     if (had_caption || final) vTaskDelay(pdMS_TO_TICKS(3500));
     if ((int32_t)(s_caption_at_tick - playback_end_tick) <= 0) {
         display_status("READY", s_ip_str, rgb565(0, 90, 160));
@@ -743,6 +799,31 @@ static esp_err_t caption_handler(httpd_req_t *req)
     else                   display_caption(who, bar, text);
     httpd_resp_sendstr(req, "ok");
     return ESP_OK;
+}
+
+// A quick MUTE tap: notify the Mac. The greeting audio, the LISTENING screen,
+// and the auto-recording that follows all arrive back via a single /play POST
+// with X-Auto-Listen (see play_handler) — the box doesn't need a second code
+// path for "play something then start listening", it reuses the one that
+// already exists for spoken replies.
+static void trigger_wake(void)
+{
+    display_status("...", NULL, rgb565(0, 90, 160));
+    esp_http_client_config_t cfg = { .url = s_wake_url, .method = HTTP_METHOD_POST,
+                                     .timeout_ms = 5000 };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    esp_http_client_set_header(client, "X-Box-Id", s_box_id);
+    esp_http_client_set_post_field(client, "1", 1);
+    esp_err_t err = esp_http_client_perform(client);
+    int status = (err == ESP_OK) ? esp_http_client_get_status_code(client) : -1;
+    esp_http_client_cleanup(client);
+    ESP_LOGI(TAG, "wake -> %s (%d)", s_wake_url, status);
+    if (status != 200) {
+        display_status("NO PC", "TRY AGAIN", rgb565(180, 0, 0));
+        vTaskDelay(pdMS_TO_TICKS(1200));
+        display_status("READY", s_ip_str, rgb565(0, 90, 160));
+    }
+    // else: greeting + LISTENING + auto-recording arrive via /play, above.
 }
 
 // Tell the Mac the customer tap-confirmed the transcript on screen.
@@ -898,6 +979,7 @@ void app_main(void)
         snprintf(s_confirm_url, sizeof(s_confirm_url), "%.*s/confirm", base_len, s_post_url);
         snprintf(s_health_url, sizeof(s_health_url), "%.*s/health", base_len, s_post_url);
         snprintf(s_register_url, sizeof(s_register_url), "%.*s/register", base_len, s_post_url);
+        snprintf(s_wake_url, sizeof(s_wake_url), "%.*s/wake", base_len, s_post_url);
     }
 
     // WiFi is right but the server isn't answering: NOT a provisioning issue
@@ -918,8 +1000,12 @@ void app_main(void)
         .pin_bit_mask = 1ULL << PIN_REC_BTN, .mode = GPIO_MODE_INPUT, .pull_up_en = GPIO_PULLUP_ENABLE,
     };
     gpio_config(&btn);
+    gpio_config_t mute_btn = {
+        .pin_bit_mask = 1ULL << PIN_MUTE_BTN, .mode = GPIO_MODE_INPUT, .pull_up_en = GPIO_PULLUP_ENABLE,
+    };
+    gpio_config(&mute_btn);
 
-    ESP_LOGI(TAG, "ready — TAP BOOT to start, auto-stops on silence, sends to %s", s_post_url);
+    ESP_LOGI(TAG, "ready — TAP BOOT to start, or TAP MUTE for greet+auto-listen, sends to %s", s_post_url);
 
     // Tap-to-toggle: tap BOOT to start, tap again to stop. Each tap is
     // consumed (wait for release) so one physical tap = one state change.
@@ -966,7 +1052,7 @@ void app_main(void)
             }
             s_confirm_pending = false;
 
-            record_toggle_and_send();   // records until the next tap
+            record_toggle_and_send("SPEAK, PAUSE TO SEND");   // records until the next tap
             // Don't wipe a caption that arrived while SENT was showing — the
             // reply flow (BOX caption -> linger -> READY) owns the screen now.
             if ((int32_t)(s_caption_at_tick - s_upload_done_tick) <= 0) {
@@ -977,6 +1063,17 @@ void app_main(void)
             // Consume the STOP tap's release too.
             high = 0;
             while (high < 5) { high = (gpio_get_level(PIN_REC_BTN) != 0) ? high + 1 : 0; vTaskDelay(pdMS_TO_TICKS(10)); }
+            continue;
+        }
+        // MUTE quick-tap = wake trigger (greeting, then auto-listen). Waiting
+        // for release here is free — nothing audio-related happens until
+        // trigger_wake() is called, well after the mute window has passed.
+        if (gpio_get_level(PIN_MUTE_BTN) == 0) {
+            vTaskDelay(pdMS_TO_TICKS(30));   // debounce the press edge
+            if (gpio_get_level(PIN_MUTE_BTN) != 0) continue;   // bounce, ignore
+            int high = 0;
+            while (high < 5) { high = (gpio_get_level(PIN_MUTE_BTN) != 0) ? high + 1 : 0; vTaskDelay(pdMS_TO_TICKS(10)); }
+            trigger_wake();
             continue;
         }
         // Touch: the confirm screen has CANCEL/SEND buttons. Touch is an

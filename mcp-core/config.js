@@ -144,6 +144,9 @@ export function loadConfig() {
       model: resolvePath(stt.model)
     },
     listenPort: cfg.listen_port || 8000,
+    // Spoken once, cached, and replayed on every wake tap — see server.js's
+    // getGreetingAudio(). null lets the caller apply its own default text.
+    greetingText: cfg.greeting_text || null,
     configPath: CONFIG_PATH
   };
 }

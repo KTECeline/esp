@@ -116,11 +116,17 @@ export async function sendCaption(box, text, { who = "YOU", confirm = false } = 
   }
 }
 
-export async function sendAudio(box, wavBuffer, { quiet = false, final = false } = {}) {
+export async function sendAudio(box, wavBuffer, { quiet = false, final = false, replyText = null, autoListen = false } = {}) {
   const headers = { "Content-Type": "audio/wav" };
   if (quiet) headers["X-Quiet"] = "1"; // sentence chunk: don't touch the display
   if (final) headers["X-Final"] = "1"; // last chunk: linger caption, then READY
-  return await postToBox(box, "/play", wavBuffer, headers);
+  if (replyText) headers["X-Reply-Text"] = asciiOneline(replyText); // shows + lingers a caption
+  // Tells the firmware to start a listen turn (record+upload, no button
+  // needed) the instant this audio finishes playing — used for the wake/
+  // greeting flow. A long timeout: the box doesn't respond to this POST
+  // until the ENTIRE listen+upload round trip completes on its end.
+  if (autoListen) headers["X-Auto-Listen"] = "1";
+  return await postToBox(box, "/play", wavBuffer, headers, autoListen ? 120000 : 60000);
 }
 
 // Verbatim passthrough of a backend-supplied display entry:
