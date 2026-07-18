@@ -1,8 +1,20 @@
 // listen_v2 (wireless) — ESP32-S3-BOX-3 mic recorder that POSTs a WAV to the PC
-// over WiFi. Tap BOOT (GPIO0 — the front button is a hardware mic-MUTE, don't
-// use it) to start recording; it auto-stops after VAD_SILENCE_HOLD_MS of
-// silence following detected speech, or tap BOOT again to stop early, or hits
-// MAX_RECORD_SECONDS as an absolute safety cap.
+// over WiFi.
+//
+// Buttons — one each, no overlap:
+//   MUTE (GPIO1, top)  — quick TAP starts a turn: greeting plays, then the box
+//                        auto-listens. NEVER hold this one — it's a genuine
+//                        hardware mic mute while held (confirmed on real
+//                        hardware, independent of firmware), it just recovers
+//                        almost instantly once released, which a quick tap
+//                        relies on.
+//   BOOT (GPIO0, side) — confirms a transcript on screen (or hold 5s to wipe
+//                        WiFi creds and re-provision). Does NOT start a
+//                        recording — that used to be BOOT's job too, which
+//                        was two different-feeling ways to start a turn and
+//                        confusing in practice, so it was removed.
+// Recording itself auto-stops after VAD_SILENCE_HOLD_MS of silence following
+// detected speech, or hits MAX_RECORD_SECONDS as an absolute safety cap.
 //
 // Mic path fixes (see notes): new I2C master driver (not legacy), DUPLEX I2S so
 // the ES7210 gets a stable MCLK, I2S Std Philips mono 16-bit. Console on
@@ -1005,7 +1017,8 @@ void app_main(void)
     };
     gpio_config(&mute_btn);
 
-    ESP_LOGI(TAG, "ready — TAP BOOT to start, or TAP MUTE for greet+auto-listen, sends to %s", s_post_url);
+    ESP_LOGI(TAG, "ready — TAP MUTE (top button) to talk. BOOT: confirm a pending transcript, "
+                 "or hold 5s to reset WiFi. Sends to %s", s_post_url);
 
     // Tap-to-toggle: tap BOOT to start, tap again to stop. Each tap is
     // consumed (wait for release) so one physical tap = one state change.
@@ -1052,17 +1065,14 @@ void app_main(void)
             }
             s_confirm_pending = false;
 
-            record_toggle_and_send("SPEAK, PAUSE TO SEND");   // records until the next tap
-            // Don't wipe a caption that arrived while SENT was showing — the
-            // reply flow (BOX caption -> linger -> READY) owns the screen now.
-            if ((int32_t)(s_caption_at_tick - s_upload_done_tick) <= 0) {
-                display_status("READY", s_ip_str, rgb565(0, 90, 160));
-            }
-            ESP_LOGI(TAG, "done — tap BOOT again for another take.");
-
-            // Consume the STOP tap's release too.
-            high = 0;
-            while (high < 5) { high = (gpio_get_level(PIN_REC_BTN) != 0) ? high + 1 : 0; vTaskDelay(pdMS_TO_TICKS(10)); }
+            // BOOT no longer starts a recording — MUTE (greet + auto-listen)
+            // is the single way to start a turn now, so there's exactly one
+            // button to explain instead of two different-feeling flows. A
+            // stray BOOT tap redirects instead of silently doing something
+            // different, so it doesn't look like the box ignored the press.
+            display_status("USE TOP", "BUTTON TO TALK", rgb565(0, 90, 160));
+            vTaskDelay(pdMS_TO_TICKS(1200));
+            display_status("READY", s_ip_str, rgb565(0, 90, 160));
             continue;
         }
         // MUTE quick-tap = wake trigger (greeting, then auto-listen). Waiting
