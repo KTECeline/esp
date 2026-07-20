@@ -1,22 +1,21 @@
 // listen_v2 (wireless) — ESP32-S3-BOX-3 mic recorder that POSTs a WAV to the PC
 // over WiFi.
 //
-// Buttons — TOP = "yes/proceed", SIDE = "no/redo". Consistent roles:
-//   MUTE (GPIO1, top)  — the "yes" button. TAP when idle starts a turn
-//                        (greeting plays, then auto-listen); TAP while a
-//                        transcript is on screen SENDS it to the assistant.
-//                        NEVER hold this one — it's a genuine hardware mic
-//                        mute while held (confirmed on real hardware,
-//                        independent of firmware); a quick tap is safe
-//                        because the mic recovers almost instantly on release.
-//   BOOT (GPIO0, side) — the "no" button. TAP while a transcript is on screen
-//                        CLEARS the wrong text and listens again; HOLD 5s
-//                        wipes WiFi creds and re-provisions. Does not start a
-//                        turn (that's the top button's job) — an idle tap just
-//                        points the customer at the top button.
-// On-screen touch SEND/CANCEL buttons mirror top/side exactly. Recording
-// auto-stops after VAD_SILENCE_HOLD_MS of silence following detected speech,
-// or hits MAX_RECORD_SECONDS as an absolute safety cap.
+// Controls:
+//   TOUCH SCREEN       — the primary control. TAP the idle screen to start a
+//                        turn (greeting, then auto-listen). On the confirm
+//                        screen, on-screen SEND / CANCEL buttons send the
+//                        transcript to the assistant or clear it and re-listen.
+//   BOOT (GPIO0, side) — physical backup. TAP = start a turn (idle) or clear+
+//                        re-listen (transcript showing). HOLD 5s = wipe WiFi
+//                        creds and re-provision.
+//   MUTE (GPIO1, top)  — NOT a firmware trigger. It's the hardware mic-mute:
+//                        measured on real hardware it's a TOGGLE that flips the
+//                        actual mic on/off each press, so it can't reliably
+//                        start a listen turn (muted the mic every other press).
+//                        Left as the privacy mute it physically is.
+// Recording auto-stops after VAD_SILENCE_HOLD_MS of silence following detected
+// speech, or hits MAX_RECORD_SECONDS as an absolute safety cap.
 //
 // Mic path fixes (see notes): new I2C master driver (not legacy), DUPLEX I2S so
 // the ES7210 gets a stable MCLK, I2S Std Philips mono 16-bit. Console on
@@ -152,6 +151,12 @@ static int s_disconn_retries = 0;
 
 // Exposed to display.c so it can probe the touch chip to pick the panel type.
 i2c_master_bus_handle_t bsp_i2c_bus(void) { return s_i2c_bus; }
+
+// Customer-facing idle screen. Touch anywhere (or tap BOOT) starts a turn.
+static void show_ready(void)
+{
+    display_status("TAP TO", "ORDER", rgb565(0, 90, 160));
+}
 
 // --------------------------------------------------------------------------
 // Hardware init (I2C + duplex I2S + ES7210)
@@ -505,7 +510,7 @@ static void record_toggle_and_send(const char *rec_line2)
         ESP_LOGE(TAG, "recording buffer alloc FAILED (%u bytes)", (unsigned)MAX_RECORD_BYTES);
         display_status("MEM", "ERROR", rgb565(180, 0, 0));
         vTaskDelay(pdMS_TO_TICKS(1200));
-        display_status("READY", s_ip_str, rgb565(0, 90, 160));
+        show_ready();
         return;
     }
     s_record_len = 0;
@@ -647,7 +652,7 @@ static void clear_and_relisten(void)
     ESP_LOGI(TAG, "transcript rejected — listening again");
     record_toggle_and_send("LISTENING...");
     if ((int32_t)(s_caption_at_tick - s_upload_done_tick) <= 0) {
-        display_status("READY", s_ip_str, rgb565(0, 90, 160));
+        show_ready();
     }
 }
 
@@ -779,14 +784,14 @@ static esp_err_t play_handler(httpd_req_t *req)
         // Runs in its own task — see run_auto_listen()'s comment for why.
         run_auto_listen("LISTENING...");
         if ((int32_t)(s_caption_at_tick - s_upload_done_tick) <= 0) {
-            display_status("READY", s_ip_str, rgb565(0, 90, 160));
+            show_ready();
         }
         return ESP_OK;
     }
 
     if (had_caption || final) vTaskDelay(pdMS_TO_TICKS(3500));
     if ((int32_t)(s_caption_at_tick - playback_end_tick) <= 0) {
-        display_status("READY", s_ip_str, rgb565(0, 90, 160));
+        show_ready();
     }
     return ESP_OK;
 }
@@ -852,7 +857,7 @@ static void trigger_wake(void)
     if (status != 200) {
         display_status("NO PC", "TRY AGAIN", rgb565(180, 0, 0));
         vTaskDelay(pdMS_TO_TICKS(1200));
-        display_status("READY", s_ip_str, rgb565(0, 90, 160));
+        show_ready();
     }
     // else: greeting + LISTENING + auto-recording arrive via /play, above.
 }
@@ -1025,29 +1030,34 @@ void app_main(void)
     register_with_core();
 
     start_http_server();
-    display_status("READY", s_ip_str, rgb565(0, 90, 160));   // blue = ready
+    show_ready();   // blue = ready
 
     gpio_config_t btn = {
         .pin_bit_mask = 1ULL << PIN_REC_BTN, .mode = GPIO_MODE_INPUT, .pull_up_en = GPIO_PULLUP_ENABLE,
     };
     gpio_config(&btn);
-    gpio_config_t mute_btn = {
-        .pin_bit_mask = 1ULL << PIN_MUTE_BTN, .mode = GPIO_MODE_INPUT, .pull_up_en = GPIO_PULLUP_ENABLE,
-    };
-    gpio_config(&mute_btn);
+    // GPIO1 (top mute button) intentionally not configured/read — see the
+    // note in the main loop; it's the hardware mic-mute, not a usable trigger.
 
-    ESP_LOGI(TAG, "ready — TOP (mute) = talk / send. SIDE (boot) = clear+redo when a "
-                 "transcript shows, hold 5s = reset WiFi. Sends to %s", s_post_url);
+    ESP_LOGI(TAG, "ready — TAP SCREEN (or BOOT) to order. BOOT hold 5s = reset WiFi. "
+                 "Top button = mic mute only. Sends to %s", s_post_url);
 
     // Tap-to-toggle: tap BOOT to start, tap again to stop. Each tap is
     // consumed (wait for release) so one physical tap = one state change.
     // The whole recording happens inside record_toggle_and_send() as one
     // tight read loop, which is what keeps the mic DMA fed and non-silent.
+    // NOTE: GPIO1 (the top "mute" button) is deliberately NOT read as a
+    // trigger. Measured on hardware it's a TOGGLE that also flips the actual
+    // hardware mic-mute on every press — so using it to start a turn muted the
+    // mic every other press. It stays what it physically is: a privacy mute.
     int hb = 0;
     while (1) {
         if (gpio_get_level(PIN_REC_BTN) == 0) {
-            vTaskDelay(pdMS_TO_TICKS(30));   // debounce the press edge
-            if (gpio_get_level(PIN_REC_BTN) != 0) continue;   // bounce, ignore
+            vTaskDelay(pdMS_TO_TICKS(8));    // settle contact bounce only —
+            // do NOT reject here if already released: a fast tap is real, and
+            // the old "still held after 30ms?" gate is what made presses need
+            // a second try. The press is committed once we're past this point;
+            // the loop below just waits for a clean release + times the hold.
             // Consume the START tap: wait for a clean release first so it
             // isn't immediately re-read as the STOP tap. The same wait doubles
             // as long-press detection: holding BOOT >=5s means "reset WiFi and
@@ -1073,46 +1083,29 @@ void app_main(void)
                 esp_restart();
             }
 
-            // SIDE button = "no / redo". While a transcript is on screen this
-            // clears the wrong text and listens again (the TOP button is the
-            // "yes / send" half). Idle, it just points at the top button.
+            // SIDE (boot) tap: while a transcript shows, clear the wrong text
+            // and listen again; idle, start a fresh turn (physical backup for
+            // the touch-screen trigger below).
             if (s_confirm_pending &&
                 (int32_t)(s_confirm_deadline_tick - xTaskGetTickCount()) > 0) {
                 clear_and_relisten();
                 continue;
             }
             s_confirm_pending = false;
-            display_status("USE TOP", "BUTTON TO TALK", rgb565(0, 90, 160));
-            vTaskDelay(pdMS_TO_TICKS(1200));
-            display_status("READY", s_ip_str, rgb565(0, 90, 160));
-            continue;
-        }
-        // TOP (MUTE) button = "yes / proceed". While a transcript is on
-        // screen it SENDS it to the assistant; idle it starts a fresh turn
-        // (greeting, then auto-listen). Waiting for release is free — nothing
-        // audio-related happens until trigger_wake(), well past the moment the
-        // mute contact matters.
-        if (gpio_get_level(PIN_MUTE_BTN) == 0) {
-            vTaskDelay(pdMS_TO_TICKS(30));   // debounce the press edge
-            if (gpio_get_level(PIN_MUTE_BTN) != 0) continue;   // bounce, ignore
-            int high = 0;
-            while (high < 5) { high = (gpio_get_level(PIN_MUTE_BTN) != 0) ? high + 1 : 0; vTaskDelay(pdMS_TO_TICKS(10)); }
-            if (s_confirm_pending &&
-                (int32_t)(s_confirm_deadline_tick - xTaskGetTickCount()) > 0) {
-                s_confirm_pending = false;
-                display_status("SENDING", "TO ASSISTANT", rgb565(0, 90, 160));
-                post_confirm();   // reply flow (BOX caption -> order) takes over
-                continue;
-            }
-            s_confirm_pending = false;
             trigger_wake();
             continue;
         }
-        // Touch: the confirm screen's on-screen SEND/CANCEL buttons mirror the
-        // two physical buttons exactly — SEND == top, CANCEL == side — so it
-        // doesn't matter which the customer reaches for.
+        // Touch is the PRIMARY trigger: a tap anywhere on the idle screen
+        // starts a turn; on the confirm screen the SEND/CANCEL buttons send or
+        // clear. (The top/mute button is NOT a trigger — it's the hardware
+        // mic-mute and toggles the mic on/off, so it can't reliably start a
+        // listen turn; that's why the customer uses the screen or BOOT.)
         int tx, ty;
-        if (s_confirm_pending && touch_get_tap(&tx, &ty)) {
+        if (touch_get_tap(&tx, &ty)) {
+            if (!s_confirm_pending) {
+                trigger_wake();
+                continue;
+            }
             display_button_t btn = display_hit_test(tx, ty);
             if (btn == BTN_SEND) {
                 s_confirm_pending = false;
@@ -1131,10 +1124,11 @@ void app_main(void)
         if (s_confirm_pending &&
             (int32_t)(xTaskGetTickCount() - s_confirm_deadline_tick) >= 0) {
             s_confirm_pending = false;
-            display_status("TIMED OUT", "TOP TO TALK", rgb565(180, 0, 0));
+            display_status("TIMED OUT", "TAP TO ORDER", rgb565(180, 0, 0));
             ESP_LOGI(TAG, "confirm window expired — transcript discarded");
         }
-        if (++hb >= 500) { hb = 0; ESP_LOGI(TAG, "alive, waiting for REC tap..."); }
-        vTaskDelay(pdMS_TO_TICKS(20));
+        if (++hb >= 1000) { hb = 0; ESP_LOGI(TAG, "alive, waiting for a button..."); }
+        vTaskDelay(pdMS_TO_TICKS(10));   // finer polling = less chance a quick
+                                         // tap lands entirely between two reads
     }
 }
