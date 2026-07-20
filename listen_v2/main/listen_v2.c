@@ -122,12 +122,14 @@ static char s_wake_url[112];
 #define MAX_RECORD_SECONDS 30   // PSRAM buffer (8MB free) — plenty of headroom now
 
 // --- Voice-activity auto-stop tuning ---
-// VAD_SILENCE_PEAK: below this int16 peak, a chunk counts as "quiet". Tuned
-// for a quiet room with MIC_GAIN_DB=30 — a noisy restaurant environment will
-// likely need this raised (and/or the mic gain lowered) so background chatter
-// doesn't count as speech. Re-tune using the per-chunk peak values already
-// logged during recording.
-#define VAD_SILENCE_PEAK      400
+// VAD_SILENCE_PEAK: below this int16 peak, a chunk counts as "quiet". Raised
+// from 400 to 1500 after MEASURING the real ambient noise floor on-site
+// (median ~646, p90 ~1360, occasional spikes to ~3800 with MIC_GAIN_DB=30) —
+// at 400 background noise never dropped below the threshold, so it never
+// auto-stopped. At 1500 most ambient counts as quiet. In genuinely loud rooms
+// the noise still overlaps speech and auto-stop can lag; the tap-to-stop
+// override in the record loop is the reliable manual backup there.
+#define VAD_SILENCE_PEAK      1500
 // How many consecutive quiet chunks (~32ms each) after real speech before we
 // consider the user done talking and auto-stop.
 #define VAD_SILENCE_HOLD_MS   1200
@@ -560,12 +562,19 @@ static void record_toggle_and_send(const char *rec_line2)
                 break;
             }
         }
-        // Manual tap still works as an immediate override: ~2 consecutive
-        // LOW reads (~64ms) is a real press, not a contact bounce.
+        // Manual stop via BOOT tap: ~2 consecutive LOW reads (~64ms) is a real
+        // press, not contact bounce.
         if (gpio_get_level(PIN_REC_BTN) == 0) {
             if (++pressed_streak >= 2) { ESP_LOGI(TAG, "manual stop (tap)"); break; }
         } else {
             pressed_streak = 0;
+        }
+        // Manual stop via SCREEN tap — the reliable "I'm done" in noisy rooms
+        // where VAD lags. Polled every ~4 chunks (~128ms) so the touch I2C
+        // read doesn't slow the tight mic loop and starve the DMA.
+        if (call_ctr % 4 == 0) {
+            int _tx, _ty;
+            if (touch_get_tap(&_tx, &_ty)) { ESP_LOGI(TAG, "manual stop (touch)"); break; }
         }
     }
 
@@ -650,7 +659,20 @@ static void clear_and_relisten(void)
 {
     s_confirm_pending = false;
     ESP_LOGI(TAG, "transcript rejected — listening again");
-    record_toggle_and_send("LISTENING...");
+    record_toggle_and_send("TAP WHEN DONE");
+    if ((int32_t)(s_caption_at_tick - s_upload_done_tick) <= 0) {
+        show_ready();
+    }
+}
+
+// Start a turn immediately — record until silence, upload, transcript comes
+// back as a confirm caption. NO greeting: tapping to order goes straight to
+// listening (a greeting-on-approach can come later from a presence sensor).
+// Runs on the main-task stack (called from the main loop, not an httpd
+// handler), so record_toggle_and_send() needs no trampoline task.
+static void start_listening(void)
+{
+    record_toggle_and_send("TAP WHEN DONE");
     if ((int32_t)(s_caption_at_tick - s_upload_done_tick) <= 0) {
         show_ready();
     }
@@ -837,12 +859,13 @@ static esp_err_t caption_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-// A quick MUTE tap: notify the Mac. The greeting audio, the LISTENING screen,
-// and the auto-recording that follows all arrive back via a single /play POST
-// with X-Auto-Listen (see play_handler) — the box doesn't need a second code
-// path for "play something then start listening", it reuses the one that
-// already exists for spoken replies.
-static void trigger_wake(void)
+// Notify the Mac to play a greeting, then auto-listen (greeting audio +
+// LISTENING screen + recording all come back via one /play POST with
+// X-Auto-Listen; see play_handler). Currently UNUSED — tapping to order goes
+// straight to start_listening() with no greeting. Kept, with the /wake
+// endpoint and greeting cache in mcp-core, as ready-made infrastructure for a
+// future "greet on approach" flow driven by the sensor-dock presence radar.
+static void __attribute__((unused)) trigger_wake(void)
 {
     display_status("...", NULL, rgb565(0, 90, 160));
     esp_http_client_config_t cfg = { .url = s_wake_url, .method = HTTP_METHOD_POST,
@@ -1092,7 +1115,7 @@ void app_main(void)
                 continue;
             }
             s_confirm_pending = false;
-            trigger_wake();
+            start_listening();
             continue;
         }
         // Touch is the PRIMARY trigger: a tap anywhere on the idle screen
@@ -1103,7 +1126,7 @@ void app_main(void)
         int tx, ty;
         if (touch_get_tap(&tx, &ty)) {
             if (!s_confirm_pending) {
-                trigger_wake();
+                start_listening();   // record straight away, no greeting
                 continue;
             }
             display_button_t btn = display_hit_test(tx, ty);
