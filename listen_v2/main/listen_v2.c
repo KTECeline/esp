@@ -49,6 +49,7 @@
 #include "esp_timer.h"
 #include "mdns.h"
 #include "touch.h"
+#include "sensor.h"
 
 // WiFi credentials and the PC endpoint are NO LONGER compiled in (the old
 // wifi_config.h path put a real password in source once — never again). They
@@ -73,6 +74,10 @@ static volatile TickType_t s_upload_done_tick = 0;
 // inside the Mac's 25s pending-transcript window, and CANCEL is now an
 // explicit button so waiting out the timer is no longer the only way to bail.
 #define CONFIRM_WINDOW_MS 15000
+// After greeting someone, don't greet again for this long — the radar drops
+// and re-fires as a person shifts around, which would otherwise re-greet the
+// same customer mid-order.
+#define GREET_COOLDOWN_MS 20000
 static volatile bool s_confirm_pending = false;
 static volatile TickType_t s_confirm_deadline_tick = 0;
 
@@ -859,15 +864,12 @@ static esp_err_t caption_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-// Notify the Mac to play a greeting, then auto-listen (greeting audio +
-// LISTENING screen + recording all come back via one /play POST with
-// X-Auto-Listen; see play_handler). Currently UNUSED — tapping to order goes
-// straight to start_listening() with no greeting. Kept, with the /wake
-// endpoint and greeting cache in mcp-core, as ready-made infrastructure for a
-// future "greet on approach" flow driven by the sensor-dock presence radar.
-static void __attribute__((unused)) trigger_wake(void)
+// Greet on approach: ask the Mac to speak its (pre-cached) greeting. Fired by
+// the presence radar when someone walks up. Greeting ONLY — it does not start
+// listening, because the customer orders by tapping the screen, which records
+// immediately. The audio arrives back as a normal /play POST.
+static void trigger_wake(void)
 {
-    display_status("...", NULL, rgb565(0, 90, 160));
     esp_http_client_config_t cfg = { .url = s_wake_url, .method = HTTP_METHOD_POST,
                                      .timeout_ms = 5000 };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
@@ -876,13 +878,10 @@ static void __attribute__((unused)) trigger_wake(void)
     esp_err_t err = esp_http_client_perform(client);
     int status = (err == ESP_OK) ? esp_http_client_get_status_code(client) : -1;
     esp_http_client_cleanup(client);
-    ESP_LOGI(TAG, "wake -> %s (%d)", s_wake_url, status);
-    if (status != 200) {
-        display_status("NO PC", "TRY AGAIN", rgb565(180, 0, 0));
-        vTaskDelay(pdMS_TO_TICKS(1200));
-        show_ready();
-    }
-    // else: greeting + LISTENING + auto-recording arrive via /play, above.
+    ESP_LOGI(TAG, "greet -> %s (%d)", s_wake_url, status);
+    // The greeting audio arrives as a /play POST. The screen keeps showing
+    // "TAP TO ORDER" throughout — a failed greeting shouldn't scare a customer
+    // with an error, they can still just tap and order.
 }
 
 // Tell the Mac the customer tap-confirmed the transcript on screen.
@@ -989,6 +988,7 @@ void app_main(void)
     if (!touch_init()) {
         ESP_LOGW(TAG, "touch controller not found — screen is display-only");
     }
+    sensor_init();    // sensor-dock presence radar (greet on approach)
     display_status("STARTING", NULL, COL_BLACK);
     i2s_chan_handle_t rx = i2s_init();
     mic_init(rx);
@@ -1073,6 +1073,10 @@ void app_main(void)
     // trigger. Measured on hardware it's a TOGGLE that also flips the actual
     // hardware mic-mute on every press — so using it to start a turn muted the
     // mic every other press. It stays what it physically is: a privacy mute.
+    // Greet-on-approach state (see the presence check at the end of the loop).
+    bool present_last = sensor_presence();
+    TickType_t greet_ready_tick = xTaskGetTickCount();
+
     int hb = 0;
     while (1) {
         if (gpio_get_level(PIN_REC_BTN) == 0) {
@@ -1150,6 +1154,20 @@ void app_main(void)
             display_status("TIMED OUT", "TAP TO ORDER", rgb565(180, 0, 0));
             ESP_LOGI(TAG, "confirm window expired — transcript discarded");
         }
+        // Greet on approach: when the presence radar goes from clear to
+        // occupied, say hello once. The cooldown stops one customer standing
+        // there from being greeted over and over (the radar drops and re-fires
+        // as they shift around). Skipped while a transcript is pending so a
+        // greeting can't talk over the confirm step.
+        bool present_now = sensor_presence();
+        if (present_now && !present_last && !s_confirm_pending &&
+            (int32_t)(xTaskGetTickCount() - greet_ready_tick) >= 0) {
+            greet_ready_tick = xTaskGetTickCount() + pdMS_TO_TICKS(GREET_COOLDOWN_MS);
+            ESP_LOGI(TAG, "presence detected — greeting");
+            trigger_wake();
+        }
+        present_last = present_now;
+
         if (++hb >= 1000) { hb = 0; ESP_LOGI(TAG, "alive, waiting for a button..."); }
         vTaskDelay(pdMS_TO_TICKS(10));   // finer polling = less chance a quick
                                          // tap lands entirely between two reads

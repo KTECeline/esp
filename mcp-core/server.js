@@ -153,15 +153,15 @@ async function getGreetingAudio() {
   return cachedGreetingWav;
 }
 
-// A wake tap: play the (cached) greeting, then — via X-Auto-Listen — the box
-// starts a normal listen turn the moment playback ends. Everything after
-// that (upload, STT, confirm screen, order) is the exact same path a BOOT-
-// triggered recording already uses; this only replaces how a turn STARTS.
+// Greet on approach: the box's presence radar saw someone walk up, so speak
+// the (pre-cached) greeting. Greeting ONLY — deliberately no autoListen: the
+// customer orders by tapping the screen, which records immediately. Starting a
+// recording here instead would capture the room while they're still deciding.
 async function handleWake(box) {
   const t0 = nowMs();
   const wav = await getGreetingAudio();
   console.log(`[${box.name}] greeting ready at +${nowMs() - t0}ms, sending to box...`);
-  await sendAudio(box, wav, { replyText: GREETING_TEXT, autoListen: true });
+  await sendAudio(box, wav, { replyText: GREETING_TEXT });
 }
 
 // ---- Backend router --------------------------------------------------------
@@ -458,8 +458,8 @@ const server = http.createServer(async (req, res) => {
       // greeting once the Mac pushes it, which happens async below.
       res.writeHead(200, { "Content-Length": "2" });
       res.end("ok");
-      console.log(`\n[${box.name}] wake tap`);
-      handleWake(box).catch((err) => console.warn(`       (wake failed: ${err.message})`));
+      console.log(`\n[${box.name}] presence detected — greeting`);
+      handleWake(box).catch((err) => console.warn(`       (greeting failed: ${err.message})`));
       return;
     }
 
