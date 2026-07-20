@@ -1,20 +1,22 @@
 // listen_v2 (wireless) — ESP32-S3-BOX-3 mic recorder that POSTs a WAV to the PC
 // over WiFi.
 //
-// Buttons — one each, no overlap:
-//   MUTE (GPIO1, top)  — quick TAP starts a turn: greeting plays, then the box
-//                        auto-listens. NEVER hold this one — it's a genuine
-//                        hardware mic mute while held (confirmed on real
-//                        hardware, independent of firmware), it just recovers
-//                        almost instantly once released, which a quick tap
-//                        relies on.
-//   BOOT (GPIO0, side) — confirms a transcript on screen (or hold 5s to wipe
-//                        WiFi creds and re-provision). Does NOT start a
-//                        recording — that used to be BOOT's job too, which
-//                        was two different-feeling ways to start a turn and
-//                        confusing in practice, so it was removed.
-// Recording itself auto-stops after VAD_SILENCE_HOLD_MS of silence following
-// detected speech, or hits MAX_RECORD_SECONDS as an absolute safety cap.
+// Buttons — TOP = "yes/proceed", SIDE = "no/redo". Consistent roles:
+//   MUTE (GPIO1, top)  — the "yes" button. TAP when idle starts a turn
+//                        (greeting plays, then auto-listen); TAP while a
+//                        transcript is on screen SENDS it to the assistant.
+//                        NEVER hold this one — it's a genuine hardware mic
+//                        mute while held (confirmed on real hardware,
+//                        independent of firmware); a quick tap is safe
+//                        because the mic recovers almost instantly on release.
+//   BOOT (GPIO0, side) — the "no" button. TAP while a transcript is on screen
+//                        CLEARS the wrong text and listens again; HOLD 5s
+//                        wipes WiFi creds and re-provisions. Does not start a
+//                        turn (that's the top button's job) — an idle tap just
+//                        points the customer at the top button.
+// On-screen touch SEND/CANCEL buttons mirror top/side exactly. Recording
+// auto-stops after VAD_SILENCE_HOLD_MS of silence following detected speech,
+// or hits MAX_RECORD_SECONDS as an absolute safety cap.
 //
 // Mic path fixes (see notes): new I2C master driver (not legacy), DUPLEX I2S so
 // the ES7210 gets a stable MCLK, I2S Std Philips mono 16-bit. Console on
@@ -632,6 +634,23 @@ static void run_auto_listen(const char *rec_line2)
     vSemaphoreDelete(args.done);
 }
 
+// The "no / redo" action, shared by the SIDE button and the touch CANCEL
+// button: throw away the wrong transcript and listen again immediately (no
+// greeting — the customer is already mid-conversation). Called only from the
+// main loop, so record_toggle_and_send() runs directly on the main task's
+// stack (the httpd-handler stack-overflow trap doesn't apply here). The Mac's
+// stale pending transcript needs no explicit cancel — the fresh recording's
+// upload simply replaces it server-side.
+static void clear_and_relisten(void)
+{
+    s_confirm_pending = false;
+    ESP_LOGI(TAG, "transcript rejected — listening again");
+    record_toggle_and_send("LISTENING...");
+    if ((int32_t)(s_caption_at_tick - s_upload_done_tick) <= 0) {
+        display_status("READY", s_ip_str, rgb565(0, 90, 160));
+    }
+}
+
 // --------------------------------------------------------------------------
 // TALK: PC POSTs a WAV to http://<box-ip>/play -> box plays it on the speaker.
 // The WAV's own header sets the sample rate/channels, so any 16-bit PCM WAV works.
@@ -1017,8 +1036,8 @@ void app_main(void)
     };
     gpio_config(&mute_btn);
 
-    ESP_LOGI(TAG, "ready — TAP MUTE (top button) to talk. BOOT: confirm a pending transcript, "
-                 "or hold 5s to reset WiFi. Sends to %s", s_post_url);
+    ESP_LOGI(TAG, "ready — TOP (mute) = talk / send. SIDE (boot) = clear+redo when a "
+                 "transcript shows, hold 5s = reset WiFi. Sends to %s", s_post_url);
 
     // Tap-to-toggle: tap BOOT to start, tap again to stop. Each tap is
     // consumed (wait for release) so one physical tap = one state change.
@@ -1054,8 +1073,30 @@ void app_main(void)
                 esp_restart();
             }
 
-            // If a transcript is on screen awaiting confirmation, this tap
-            // means "yes, send it" — not "start a new recording".
+            // SIDE button = "no / redo". While a transcript is on screen this
+            // clears the wrong text and listens again (the TOP button is the
+            // "yes / send" half). Idle, it just points at the top button.
+            if (s_confirm_pending &&
+                (int32_t)(s_confirm_deadline_tick - xTaskGetTickCount()) > 0) {
+                clear_and_relisten();
+                continue;
+            }
+            s_confirm_pending = false;
+            display_status("USE TOP", "BUTTON TO TALK", rgb565(0, 90, 160));
+            vTaskDelay(pdMS_TO_TICKS(1200));
+            display_status("READY", s_ip_str, rgb565(0, 90, 160));
+            continue;
+        }
+        // TOP (MUTE) button = "yes / proceed". While a transcript is on
+        // screen it SENDS it to the assistant; idle it starts a fresh turn
+        // (greeting, then auto-listen). Waiting for release is free — nothing
+        // audio-related happens until trigger_wake(), well past the moment the
+        // mute contact matters.
+        if (gpio_get_level(PIN_MUTE_BTN) == 0) {
+            vTaskDelay(pdMS_TO_TICKS(30));   // debounce the press edge
+            if (gpio_get_level(PIN_MUTE_BTN) != 0) continue;   // bounce, ignore
+            int high = 0;
+            while (high < 5) { high = (gpio_get_level(PIN_MUTE_BTN) != 0) ? high + 1 : 0; vTaskDelay(pdMS_TO_TICKS(10)); }
             if (s_confirm_pending &&
                 (int32_t)(s_confirm_deadline_tick - xTaskGetTickCount()) > 0) {
                 s_confirm_pending = false;
@@ -1064,33 +1105,12 @@ void app_main(void)
                 continue;
             }
             s_confirm_pending = false;
-
-            // BOOT no longer starts a recording — MUTE (greet + auto-listen)
-            // is the single way to start a turn now, so there's exactly one
-            // button to explain instead of two different-feeling flows. A
-            // stray BOOT tap redirects instead of silently doing something
-            // different, so it doesn't look like the box ignored the press.
-            display_status("USE TOP", "BUTTON TO TALK", rgb565(0, 90, 160));
-            vTaskDelay(pdMS_TO_TICKS(1200));
-            display_status("READY", s_ip_str, rgb565(0, 90, 160));
-            continue;
-        }
-        // MUTE quick-tap = wake trigger (greeting, then auto-listen). Waiting
-        // for release here is free — nothing audio-related happens until
-        // trigger_wake() is called, well after the mute window has passed.
-        if (gpio_get_level(PIN_MUTE_BTN) == 0) {
-            vTaskDelay(pdMS_TO_TICKS(30));   // debounce the press edge
-            if (gpio_get_level(PIN_MUTE_BTN) != 0) continue;   // bounce, ignore
-            int high = 0;
-            while (high < 5) { high = (gpio_get_level(PIN_MUTE_BTN) != 0) ? high + 1 : 0; vTaskDelay(pdMS_TO_TICKS(10)); }
             trigger_wake();
             continue;
         }
-        // Touch: the confirm screen has CANCEL/SEND buttons. Touch is an
-        // addition to the BOOT-tap path above, not a replacement — either
-        // confirms. Cancelling is box-local: the Mac's pending transcript
-        // simply expires (or is replaced by the next recording), so there's
-        // no cancel round-trip to get wrong.
+        // Touch: the confirm screen's on-screen SEND/CANCEL buttons mirror the
+        // two physical buttons exactly — SEND == top, CANCEL == side — so it
+        // doesn't matter which the customer reaches for.
         int tx, ty;
         if (s_confirm_pending && touch_get_tap(&tx, &ty)) {
             display_button_t btn = display_hit_test(tx, ty);
@@ -1100,18 +1120,18 @@ void app_main(void)
                 post_confirm();
                 continue;
             } else if (btn == BTN_CANCEL) {
-                s_confirm_pending = false;
-                display_status("CANCELLED", "TAP TO RETRY", rgb565(180, 0, 0));
-                ESP_LOGI(TAG, "cancelled by touch — transcript discarded");
+                clear_and_relisten();
                 continue;
             }
         }
 
-        // Confirm window ran out with no tap: discard the pending transcript.
+        // Confirm window ran out with no press: discard the pending transcript
+        // (customer likely walked off or went quiet — don't auto re-listen,
+        // that would just record silence).
         if (s_confirm_pending &&
             (int32_t)(xTaskGetTickCount() - s_confirm_deadline_tick) >= 0) {
             s_confirm_pending = false;
-            display_status("CANCELLED", "TAP TO RETRY", rgb565(180, 0, 0));
+            display_status("TIMED OUT", "TOP TO TALK", rgb565(180, 0, 0));
             ESP_LOGI(TAG, "confirm window expired — transcript discarded");
         }
         if (++hb >= 500) { hb = 0; ESP_LOGI(TAG, "alive, waiting for REC tap..."); }

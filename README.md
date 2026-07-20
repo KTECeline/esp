@@ -1,7 +1,8 @@
 # BOX-3 voice assistant
 
 Fully local voice pipeline for the ESP32-S3-BOX-3. No cloud, no API keys.
-./start_voice_assistant.sh 192.168.1.8
+~/esp/start_voice_assistant.sh 
+~/esp/check_health.sh
 
 cd ~/esp/listen_v2 && source idfenv.sh 
 idf.py build     
