@@ -37,5 +37,7 @@
     "model": "whisper.cpp/models/ggml-small.bin"
   },
   "listen_port": 8000,
-  "greeting_text": "Hi! How can I help you today?"
+  "greeting_text": "Hi! How can I help you today?",
+  "_mcp_token_help": "Optional. Set mcp_token_env to the name of an env var holding a bearer token, and /mcp will require 'Authorization: Bearer <token>'. Leave unset for LAN-only use — off by default.",
+  "mcp_token_env": ""
 }

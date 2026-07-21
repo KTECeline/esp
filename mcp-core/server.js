@@ -412,6 +412,13 @@ const server = http.createServer(async (req, res) => {
     // collisions between clients. Registering three tools costs microseconds,
     // and all real state (box registry, sessions) lives outside MCP anyway.
     if (req.url === "/mcp") {
+      // Optional bearer-token gate. Off by default (a trusted LAN doesn't
+      // need it), but a one-line config turn-on for anyone exposing this
+      // past their own network — the /mcp surface combines device discovery
+      // with speaker/display control, which shouldn't be open to strangers.
+      if (config.mcpToken && req.headers.authorization !== `Bearer ${config.mcpToken}`) {
+        return json(401, { error: "unauthorized — missing or wrong Bearer token" });
+      }
       const mcp = createMcpServer({ boxes, speakToBox });
       const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
       res.on("close", () => { transport.close(); mcp.close(); });

@@ -147,6 +147,18 @@ export function loadConfig() {
     // Spoken once, cached, and replayed on every wake tap — see server.js's
     // getGreetingAudio(). null lets the caller apply its own default text.
     greetingText: cfg.greeting_text || null,
+    // Gates /mcp when set — see server.js. Same env-var-only rule as backend
+    // tokens: a real credential already leaked out of this repo once via a
+    // committed file, so this is never read from config.json directly.
+    mcpToken: (() => {
+      if (!cfg.mcp_token_env) return null;
+      const v = process.env[cfg.mcp_token_env];
+      if (!v) {
+        console.warn(`mcp_token_env "${cfg.mcp_token_env}" is not set in the environment — ` +
+                     `/mcp will run WITHOUT auth. Export it, or remove mcp_token_env.`);
+      }
+      return v || null;
+    })(),
     configPath: CONFIG_PATH
   };
 }

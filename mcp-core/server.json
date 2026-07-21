@@ -1,0 +1,23 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.KTECeline/mcp-core",
+  "description": "Config-driven MCP server that turns a fleet of ESP32-S3-BOX devices into voice-controllable tools (speak, display, list) — and gives each box a voice by routing its mic/speaker through STT, a pluggable agent/LLM backend, and TTS.",
+  "version": "1.0.0",
+  "repository": {
+    "url": "https://github.com/KTECeline/esp",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "mcp-core",
+      "version": "1.0.0",
+      "runtimeHint": "node",
+      "transport": {
+        "type": "streamable-http",
+        "url": "http://localhost:8000/mcp"
+      }
+    }
+  ]
+}
