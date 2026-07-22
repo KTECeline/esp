@@ -8,6 +8,19 @@
 // rots. Here `ip` is just "last known address for this id", self-healed on
 // every request the box makes.
 
+import { networkInterfaces } from "node:os";
+
+// The mcp-core host's own addresses. A real box is NEVER at one of these, so a
+// request that appears to come "from" the host (loopback, or the Mac's own LAN
+// IP — e.g. a test harness or proxy POSTing with a box's id from this machine)
+// must NOT overwrite the box's real IP. Without this guard, such a request
+// silently repointed the box at the host and broke every push to it — and
+// persisted the bad IP to config.json.
+const OWN_IPS = new Set(["127.0.0.1", "::1", "localhost"]);
+for (const list of Object.values(networkInterfaces())) {
+  for (const ni of list || []) OWN_IPS.add(ni.address.replace(/^::ffff:/, ""));
+}
+
 // The box font is ASCII-only (renders uppercase); HTTP headers must be latin-1
 // and single-line — strip anything else so captions don't corrupt the request.
 export function asciiOneline(s, limit = 200) {
@@ -86,9 +99,12 @@ export class BoxRegistry {
       this.upsert(id, id, ip);
       return this.byId(id);
     }
-    if (existing.host !== ip) {
+    if (existing.host !== ip && !OWN_IPS.has(ip)) {
       console.log(`Box "${id}" moved ${existing.ip} -> ${ip} (DHCP drift) — config updated.`);
       this.upsert(id, null, ip);
+    } else if (existing.host !== ip) {
+      console.warn(`Ignoring "${id}" IP change to ${ip}: that's this host's own address, ` +
+                   `not a real box (test harness or proxy?). Keeping ${existing.ip}.`);
     }
     return existing;
   }

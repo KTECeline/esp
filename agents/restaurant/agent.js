@@ -58,6 +58,30 @@ function resetSession(id, reason) {
   console.log(`Session ${id} reset (${reason})`);
 }
 
+// Does the customer's own words name any menu item? Used to reject phantom
+// orders: a 3B model will happily "extract" an order from "yes confirm" on a
+// fresh session (observed: invented 1 nasi lemak + 1 roti canai). No menu word
+// in the text AND no order yet => there is no order, whatever the LLM claims.
+function textMentionsMenu(text) {
+  const t = (text || "").toLowerCase();
+  for (const item of MENU.items) {
+    if (t.includes(item.name)) return true;
+    for (const a of item.aliases) if (t.includes(a)) return true;
+  }
+  return false;
+}
+
+// Is this an explicit "finalize my order" — a pure yes/confirm with no new
+// items? Confirmation is decided HERE in code, not by the LLM's status field:
+// the model confirmed prematurely on "that's all" and reset the order mid-
+// conversation. "done"/"that's all" is deliberately NOT confirmation — it
+// should trigger a read-back, and the customer's following yes finalizes.
+function isConfirmation(text) {
+  const t = (text || "").toLowerCase();
+  const yes = /\b(confirm|confirmed|yes|yeah|yep|correct|betul|sure|proceed|checkout|check out)\b/.test(t);
+  return yes && !textMentionsMenu(text);
+}
+
 // Map an LLM item name onto the menu (exact, alias, or substring match).
 function resolveMenuItem(name) {
   const n = (name || "").toLowerCase().trim();
@@ -126,6 +150,12 @@ async function askLlm(session, text) {
     body: JSON.stringify({
       model: LLM_MODEL,
       response_format: { type: "json_object" },
+      // Low temperature: this is structured order EXTRACTION, not creative
+      // writing. At Ollama's default (~0.8) the 3B model dropped an item from
+      // "two nasi lemak and one teh tarik" ~1 in 5 times; near-0 makes it
+      // extract the same items every time. A little reply variety is a fair
+      // trade for not mis-charging customers.
+      temperature: 0,
       messages: [{ role: "system", content: SYSTEM_PROMPT }, ...session.history]
     })
   });
@@ -137,23 +167,47 @@ async function askLlm(session, text) {
   const raw = data.choices?.[0]?.message?.content || "";
   session.history.push({ role: "assistant", content: raw });
 
-  let reply = raw, order = null;
+  let reply = raw, llmOrder = null;
   try {
     const parsed = JSON.parse(raw);
     // Never fall back to the raw JSON once parsing succeeded — an empty
     // reply field would otherwise be SPOKEN as literal JSON on the box.
     reply = parsed.reply || "Sorry boss, say again?";
-    order = priceOrder(parsed.order);
+    llmOrder = priceOrder(parsed.order);
   } catch {
     // Shouldn't happen with response_format, but degrade to plain chat if so.
   }
-  if (order) session.lastOrder = order;
-  const effective = order || session.lastOrder;
+
+  // Order + confirmation state are decided HERE, not trusted from the 3B model
+  // (which confirmed too early and invented items — see the helper comments).
+  const priorOrder = session.lastOrder;
+  const priorHasItems = !!priorOrder && priorOrder.items.length > 0;
+  let order, confirmed = false;
+
+  if (isConfirmation(text) && priorHasItems) {
+    // Explicit yes on an existing order: finalize the order we ALREADY have.
+    // Do not adopt a fresh LLM extraction on a "yes" turn — that's exactly
+    // when it corrupted the order.
+    order = { ...priorOrder, status: "confirmed" };
+    confirmed = true;
+  } else {
+    // Normal ordering turn. Drop a phantom order: brand-new items built from a
+    // message that names nothing on the menu is a hallucination.
+    if (llmOrder && !priorHasItems && !textMentionsMenu(text)) llmOrder = null;
+    if (llmOrder) {
+      llmOrder.status = "open";        // confirmation only happens in the branch above
+      session.lastOrder = llmOrder;
+      order = llmOrder;
+    } else {
+      order = priorOrder || null;      // keep showing the existing order, if any
+    }
+  }
+
   // The LLM is told to write {TOTAL} instead of doing arithmetic (it once
   // spoke "RM17.00" for a RM13.50 order). Substitute the real computed total.
-  const totalStr = effective ? MENU.currency + effective.total.toFixed(2) : "";
+  const totalStr = order ? MENU.currency + order.total.toFixed(2) : "";
   reply = reply.split("{TOTAL}").join(totalStr).replace(/\s{2,}/g, " ").trim();
-  return { reply, order: effective };
+  return { reply, order, confirmed };
 }
 
 async function readBody(req) {
@@ -181,15 +235,14 @@ const server = http.createServer(async (req, res) => {
 
       const session = getSession(sessionId);
       const t0 = Date.now();
-      const { reply, order } = await askLlm(session, text);
+      const { reply, order, confirmed } = await askLlm(session, text);
       console.log(`[${sessionId}] "${text}" -> "${reply}" [${Date.now() - t0}ms]`);
       if (order) console.log(`[${sessionId}] order:`, JSON.stringify(order));
 
-      const confirmed = !!order && order.status === "confirmed";
       const display = order && order.items.length ? [orderDisplay(order)] : null;
       // A confirmed order ends the session: the next customer starts fresh.
       if (confirmed) resetSession(sessionId, "order confirmed");
-      return json(200, { reply, display, end_session: confirmed });
+      return json(200, { reply, display, end_session: !!confirmed });
     }
 
     if (req.method === "POST" && req.url === "/reset") {
