@@ -433,6 +433,35 @@ static void resolve_mdns_host(const char *url, char *out, size_t out_len)
 // "the Mac hasn't started mcp-core yet". So retry patiently (backoff, 5 min)
 // on the connection we already have; only a full window of failures falls
 // back to re-provisioning (that's a genuinely wrong post_url).
+// Sleep in short slices while watching for a 5s BOOT hold. Returns true if the
+// hold completed — the caller should wipe creds and reboot.
+//
+// This exists because the escape hatch used to be dead exactly when it was
+// needed: the button was only configured and polled in the main loop, which is
+// reached AFTER wait_server_reachable() succeeds. A box that couldn't find its
+// server (Mac moved networks, stale post_url) sat in the retry loop ignoring
+// the button entirely, with no way to re-provision short of waiting out the
+// full 5-minute timeout.
+static bool sleep_watching_for_wifi_reset(int seconds)
+{
+    const TickType_t slice = pdMS_TO_TICKS(50);
+    TickType_t held = 0;
+    for (int elapsed = 0; elapsed < seconds * 20; elapsed++) {
+        if (gpio_get_level(PIN_REC_BTN) == 0) {
+            held += slice;
+            if (held >= pdMS_TO_TICKS(5000)) {
+                display_status("RESET WIFI", "RELEASE NOW", rgb565(180, 0, 0));
+                while (gpio_get_level(PIN_REC_BTN) == 0) vTaskDelay(pdMS_TO_TICKS(20));
+                return true;
+            }
+        } else {
+            held = 0;
+        }
+        vTaskDelay(slice);
+    }
+    return false;
+}
+
 static bool wait_server_reachable(void)
 {
     int64_t deadline = esp_timer_get_time() + 5LL * 60 * 1000000;
@@ -446,12 +475,17 @@ static bool wait_server_reachable(void)
         esp_http_client_cleanup(client);
         if (status == 200) return true;
         if (!shown) {
-            display_status("NO SERVER", "RETRYING...", rgb565(180, 120, 0));
+            display_status("NO SERVER", "HOLD BOOT 5S", rgb565(180, 120, 0));
             shown = true;
         }
-        ESP_LOGW(TAG, "server not reachable at %s (%d) — retrying in %ds",
-                 s_health_url, status, delay_s);
-        vTaskDelay(pdMS_TO_TICKS(delay_s * 1000));
+        ESP_LOGW(TAG, "server not reachable at %s (%d) — retrying in %ds "
+                      "(hold BOOT 5s to re-provision)", s_health_url, status, delay_s);
+        if (sleep_watching_for_wifi_reset(delay_s)) {
+            prov_erase_creds();
+            display_status("WIFI RESET", "REBOOTING", rgb565(180, 0, 0));
+            vTaskDelay(pdMS_TO_TICKS(800));
+            esp_restart();
+        }
         if (delay_s < 30) delay_s *= 2;
     }
     return false;
@@ -989,6 +1023,13 @@ void app_main(void)
         ESP_LOGW(TAG, "touch controller not found — screen is display-only");
     }
     sensor_init();    // sensor-dock presence radar (greet on approach)
+    // Button up FIRST, before anything that can block: the 5s hold-to-
+    // re-provision is the escape hatch for "box can't find its server", so it
+    // has to be alive during the pre-READY phases, not just in the main loop.
+    gpio_config_t btn = {
+        .pin_bit_mask = 1ULL << PIN_REC_BTN, .mode = GPIO_MODE_INPUT, .pull_up_en = GPIO_PULLUP_ENABLE,
+    };
+    gpio_config(&btn);
     display_status("STARTING", NULL, COL_BLACK);
     i2s_chan_handle_t rx = i2s_init();
     mic_init(rx);
@@ -1054,11 +1095,6 @@ void app_main(void)
 
     start_http_server();
     show_ready();   // blue = ready
-
-    gpio_config_t btn = {
-        .pin_bit_mask = 1ULL << PIN_REC_BTN, .mode = GPIO_MODE_INPUT, .pull_up_en = GPIO_PULLUP_ENABLE,
-    };
-    gpio_config(&btn);
     // GPIO1 (top mute button) intentionally not configured/read — see the
     // note in the main loop; it's the hardware mic-mute, not a usable trigger.
 
