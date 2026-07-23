@@ -506,6 +506,35 @@ const server = http.createServer(async (req, res) => {
     }
 
     // Manual session reset between customers / demo runs.
+    // One customer walked away — the box's presence radar noticed and is
+    // telling us to forget them. Scoped to THAT box (unlike /reset, which
+    // wipes the whole fleet), so one kiosk clearing does not disturb another.
+    if (req.method === "POST" && req.url === "/session-end") {
+      const box = boxes.fromId(req);
+      if (!box) {
+        return json(400, { error: "missing X-Box-Id header — flash current firmware" });
+      }
+      await readBody(req);
+      llmHistoryByBox.delete(box.id);
+      pendingByBox.delete(box.id);
+      // Webhook backends keep their own per-session state, keyed by the same
+      // box id we pass as session_id. Ask them to drop just this one.
+      for (const name of config.priority) {
+        const bc = config.backends[name];
+        if (bc.type !== "webhook") continue;
+        try {
+          await fetch(new URL("/reset", bc.webhook_url), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ session_id: box.id }),
+            signal: AbortSignal.timeout(3000)
+          });
+        } catch { /* backend may be down; local state is cleared regardless */ }
+      }
+      console.log(`[${box.name}] session ended (customer left) — conversation reset`);
+      return json(200, { ok: true });
+    }
+
     if (req.method === "POST" && req.url === "/reset") {
       llmHistoryByBox.clear();
       pendingByBox.clear();

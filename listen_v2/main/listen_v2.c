@@ -74,12 +74,38 @@ static volatile TickType_t s_upload_done_tick = 0;
 // inside the Mac's 25s pending-transcript window, and CANCEL is now an
 // explicit button so waiting out the timer is no longer the only way to bail.
 #define CONFIRM_WINDOW_MS 15000
-// After greeting someone, don't greet again for this long — the radar drops
-// and re-fires as a person shifts around, which would otherwise re-greet the
-// same customer mid-order.
-#define GREET_COOLDOWN_MS 20000
 static volatile bool s_confirm_pending = false;
 static volatile TickType_t s_confirm_deadline_tick = 0;
+
+// ---- Session lifecycle -----------------------------------------------------
+// A "session" is one customer. It starts when the presence radar first sees
+// someone (greet ONCE) or when they simply start ordering by touch/BOOT (no
+// greeting — they're already talking to us). It ends when the radar has seen
+// nobody for SESSION_ABSENT_MS, which resets the conversation server-side so
+// the next customer is greeted fresh and never inherits the previous order.
+//
+// This replaces a bare 20s greet cooldown, which only approximated a session:
+// it re-greeted a customer who lingered past the timer, and never reset the
+// conversation when one walked away.
+//
+// How long with NO sign of the customer before we call the session over.
+//
+// MEASURED: this radar reports motion, not static presence — someone standing
+// still reads as "absent" for 10s+ at a time. At 12s that ended sessions while
+// the customer was still standing there, and their next small movement started
+// a fresh session and re-greeted them (4 greetings in 70s). So the timer is
+// longer AND, more importantly, it is fed by interaction as well as radar:
+// a customer who is tapping, talking or confirming is obviously present.
+#define SESSION_ABSENT_MS 30000
+static volatile bool s_session_active = false;
+// Last moment we had ANY evidence of the customer — radar presence or a
+// deliberate interaction. Sessions end relative to this, not to radar alone.
+static volatile TickType_t s_last_seen_tick = 0;
+static inline void note_activity(void) { s_last_seen_tick = xTaskGetTickCount(); }
+// Only let "absent" end a session once the radar has actually reported presence
+// at least once. A box with no sensor dock reads permanently absent, and must
+// not have touch-started sessions killed out from under it.
+static volatile bool s_radar_seen = false;
 
 // Provisioned identity + endpoints, loaded from NVS in app_main. All the
 // /confirm, /health and /register URLs are derived from s_post_url so the
@@ -91,6 +117,7 @@ static char s_confirm_url[112];
 static char s_health_url[112];
 static char s_register_url[112];
 static char s_wake_url[112];
+static char s_session_end_url[112];
 
 // ---- BOX-3 wiring ----
 #define I2C_PORT        I2C_NUM_0
@@ -713,6 +740,11 @@ static void clear_and_relisten(void)
 // handler), so record_toggle_and_send() needs no trampoline task.
 static void start_listening(void)
 {
+    // Ordering by touch/BOOT starts a session too — without a greeting, since
+    // they're already talking to us. This is also what keeps a box with NO
+    // sensor dock working: sessions still begin, they just never auto-end.
+    s_session_active = true;
+    note_activity();
     record_toggle_and_send("TAP WHEN DONE");
     if ((int32_t)(s_caption_at_tick - s_upload_done_tick) <= 0) {
         show_ready();
@@ -920,6 +952,24 @@ static void trigger_wake(void)
     // with an error, they can still just tap and order.
 }
 
+// The customer left: tell the server to drop this box's conversation and any
+// half-finished order, so the next person starts clean instead of inheriting
+// someone else's session. Best-effort — if the server is unreachable the box
+// still resets its own state, and the server's own pending-transcript window
+// expires on its own shortly after.
+static void end_session_on_server(void)
+{
+    esp_http_client_config_t cfg = { .url = s_session_end_url, .method = HTTP_METHOD_POST,
+                                     .timeout_ms = 5000 };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    esp_http_client_set_header(client, "X-Box-Id", s_box_id);
+    esp_http_client_set_post_field(client, "1", 1);
+    esp_err_t err = esp_http_client_perform(client);
+    int status = (err == ESP_OK) ? esp_http_client_get_status_code(client) : -1;
+    esp_http_client_cleanup(client);
+    ESP_LOGI(TAG, "session-end -> %s (%d)", s_session_end_url, status);
+}
+
 // Tell the Mac the customer tap-confirmed the transcript on screen.
 static void post_confirm(void)
 {
@@ -1000,6 +1050,7 @@ static void derive_server_urls(void)
     snprintf(s_health_url, sizeof(s_health_url), "%.*s/health", base_len, s_post_url);
     snprintf(s_register_url, sizeof(s_register_url), "%.*s/register", base_len, s_post_url);
     snprintf(s_wake_url, sizeof(s_wake_url), "%.*s/wake", base_len, s_post_url);
+    snprintf(s_session_end_url, sizeof(s_session_end_url), "%.*s/session-end", base_len, s_post_url);
 }
 
 // Repoint this box at a different server, live, over the network:
@@ -1160,12 +1211,12 @@ void app_main(void)
     // hardware mic-mute on every press — so using it to start a turn muted the
     // mic every other press. It stays what it physically is: a privacy mute.
     // Greet-on-approach state (see the presence check at the end of the loop).
-    bool present_last = sensor_presence();
-    TickType_t greet_ready_tick = xTaskGetTickCount();
+    note_activity();   // seed the session timer at boot
 
     int hb = 0;
     while (1) {
         if (gpio_get_level(PIN_REC_BTN) == 0) {
+            note_activity();   // someone is definitely here, whatever radar says
             vTaskDelay(pdMS_TO_TICKS(8));    // settle contact bounce only —
             // do NOT reject here if already released: a fast tap is real, and
             // the old "still held after 30ms?" gate is what made presses need
@@ -1215,6 +1266,7 @@ void app_main(void)
         // listen turn; that's why the customer uses the screen or BOOT.)
         int tx, ty;
         if (touch_get_tap(&tx, &ty)) {
+            note_activity();   // someone is definitely here, whatever radar says
             if (!s_confirm_pending) {
                 start_listening();   // record straight away, no greeting
                 continue;
@@ -1240,19 +1292,32 @@ void app_main(void)
             display_status("TIMED OUT", "TAP TO ORDER", rgb565(180, 0, 0));
             ESP_LOGI(TAG, "confirm window expired — transcript discarded");
         }
-        // Greet on approach: when the presence radar goes from clear to
-        // occupied, say hello once. The cooldown stops one customer standing
-        // there from being greeted over and over (the radar drops and re-fires
-        // as they shift around). Skipped while a transcript is pending so a
-        // greeting can't talk over the confirm step.
+        // ---- Session lifecycle (one session = one customer) ----------------
+        // Present + no session  -> start one, greet ONCE.
+        // Present + session     -> nothing; the greeting never repeats.
+        // Absent for a while    -> end the session, reset the conversation, so
+        //                          the next customer is greeted and starts a
+        //                          clean order.
         bool present_now = sensor_presence();
-        if (present_now && !present_last && !s_confirm_pending &&
-            (int32_t)(xTaskGetTickCount() - greet_ready_tick) >= 0) {
-            greet_ready_tick = xTaskGetTickCount() + pdMS_TO_TICKS(GREET_COOLDOWN_MS);
-            ESP_LOGI(TAG, "presence detected — greeting");
-            trigger_wake();
+        if (present_now) {
+            s_radar_seen = true;
+            note_activity();               // radar sees them: session stays alive
+            // Not while a transcript is on screen: a greeting must never talk
+            // over the confirm step.
+            if (!s_session_active && !s_confirm_pending) {
+                s_session_active = true;
+                ESP_LOGI(TAG, "session start (presence) — greeting once");
+                trigger_wake();
+            }
+        } else if (s_session_active && s_radar_seen && !s_confirm_pending &&
+                   (int32_t)(xTaskGetTickCount() - s_last_seen_tick) >=
+                       pdMS_TO_TICKS(SESSION_ABSENT_MS)) {
+            // No radar presence AND no interaction for the whole window.
+            s_session_active = false;
+            ESP_LOGI(TAG, "session end (customer left) — resetting conversation");
+            end_session_on_server();
+            show_ready();
         }
-        present_last = present_now;
 
         if (++hb >= 1000) { hb = 0; ESP_LOGI(TAG, "alive, waiting for a button..."); }
         vTaskDelay(pdMS_TO_TICKS(10));   // finer polling = less chance a quick

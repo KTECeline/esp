@@ -245,9 +245,21 @@ const server = http.createServer(async (req, res) => {
       return json(200, { reply, display, end_session: !!confirmed });
     }
 
+    // Reset one session, or all of them. mcp-core sends {"session_id": "..."}
+    // when a single customer leaves (their box's presence radar saw them go);
+    // an empty body still means "wipe everything", so manual `curl -X POST
+    // .../reset` keeps working as before.
     if (req.method === "POST" && req.url === "/reset") {
-      sessions.clear();
-      console.log("All sessions reset (manual /reset)");
+      let sessionId = null;
+      try {
+        sessionId = JSON.parse((await readBody(req)) || "{}").session_id || null;
+      } catch { /* not JSON — treat as a global reset */ }
+      if (sessionId) {
+        resetSession(sessionId, "customer left");
+      } else {
+        sessions.clear();
+        console.log("All sessions reset (manual /reset)");
+      }
       return json(200, { ok: true });
     }
 
