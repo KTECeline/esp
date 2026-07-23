@@ -14,7 +14,7 @@
 // listen_v2/assistant_via_bridge.py (one service instead of two hops).
 import http from "node:http";
 import { writeFile, readFile, mkdtemp, appendFile } from "node:fs/promises";
-import { tmpdir, homedir } from "node:os";
+import { tmpdir, homedir, networkInterfaces } from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -531,11 +531,62 @@ const server = http.createServer(async (req, res) => {
 // Advertises this machine as "mcp-core.local" over mDNS so a box's
 // provisioning form never needs a raw LAN IP typed in — the firmware
 // resolves the fixed hostname itself after joining WiFi.
+// This machine's primary LAN IPv4 — the address a box on the same WiFi should
+// be sending its recordings to.
+function lanIp() {
+  for (const list of Object.values(networkInterfaces())) {
+    for (const ni of list || []) {
+      if (ni.family === "IPv4" && !ni.internal) return ni.address;
+    }
+  }
+  return null;
+}
+
+// Tell every known box where we actually are, right now.
+//
+// A box stores its server address on-device. When this machine moves networks
+// or gets a new DHCP lease, that stored address goes stale and the box sits on
+// "NO SERVER" forever — and mDNS (mcp-core.local), which exists precisely to
+// avoid hardcoded IPs, is silently blocked on plenty of managed/campus WiFi.
+// So we push instead of hoping to be discovered: plain unicast to the box's
+// own HTTP server, which the firmware now brings up BEFORE it waits for us,
+// exactly so it can still be reached while it's lost. Best-effort and quiet —
+// a box that's offline, on old firmware, or on another network just fails.
+async function adoptKnownBoxes(reason) {
+  const ip = lanIp();
+  if (!ip) return;
+  const url = `http://${ip}:${config.listenPort}/upload`;
+  for (const b of boxes.boxes) {
+    try {
+      const res = await fetch(`http://${b.ip}/server`, {
+        method: "POST", body: url, signal: AbortSignal.timeout(3000)
+      });
+      if (res.ok) console.log(`Pointed ${b.name} @ ${b.ip} at ${url} (${reason})`);
+    } catch { /* offline / old firmware / different subnet — nothing to do */ }
+  }
+}
+
 let bonjour = null;
 function startMdnsAdvertiser() {
-  bonjour = new Bonjour();
-  bonjour.publish({ name: "mcp-core", type: "http", host: "mcp-core.local", port: config.listenPort });
-  console.log("Advertising mcp-core.local via mDNS");
+  // Some networks (seen on a campus/managed WiFi) block or drop multicast for
+  // wireless clients. bonjour-service's underlying dgram socket then emits an
+  // 'error' that, unhandled, crashes the ENTIRE process (took down STT/LLM/
+  // TTS routing too, not just mDNS) — observed live: `EADDRNOTAVAIL
+  // 224.0.0.251:5353`. mDNS is a convenience (lets a box use "mcp-core.local"
+  // instead of a raw IP); it must never be able to take the whole server down.
+  // process.env.MDNS_DISABLE=1 skips it outright for networks known to block it.
+  if (process.env.MDNS_DISABLE === "1") {
+    console.log("mDNS advertising disabled (MDNS_DISABLE=1) — use a raw IP in the box's provisioning form.");
+    return;
+  }
+  try {
+    bonjour = new Bonjour();
+    bonjour.publish({ name: "mcp-core", type: "http", host: "mcp-core.local", port: config.listenPort });
+    console.log("Advertising mcp-core.local via mDNS");
+  } catch (err) {
+    console.warn(`mDNS advertising failed to start (${err.message}) — continuing without it. ` +
+                 "Boxes must use a raw IP in their provisioning form.");
+  }
 }
 
 async function main() {
@@ -545,6 +596,13 @@ async function main() {
     console.log(`Backends (priority order): ${config.priority.join(" -> ")}`);
     console.log(`Boxes: ${boxes.boxes.map((b) => `${b.name}@${b.ip}`).join(", ")}`);
     startMdnsAdvertiser();
+    // Immediately, then on a slow timer: a box that booted before us, or that
+    // is pointed at a stale address after this machine changed networks, gets
+    // corrected without anyone typing an IP or re-provisioning. 60s is well
+    // inside the firmware's own retry backoff, so a lost box recovers on its
+    // own within about a minute of mcp-core being up.
+    adoptKnownBoxes("startup");
+    setInterval(() => adoptKnownBoxes("periodic"), 60000);
   });
   // Pre-warm the greeting cache so the FIRST wake tap of the day is fast too,
   // not just the second one. Failure here isn't fatal — getGreetingAudio()

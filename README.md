@@ -7,6 +7,7 @@ Fully local voice pipeline for the ESP32-S3-BOX-3. No cloud, no API keys.
 cd ~/esp/listen_v2 && source idfenv.sh 
 idf.py build     
 
+cd ~/esp/listen_v2 && source idfenv.sh && idf.py flash
 
 ## Architecture
 
@@ -31,6 +32,31 @@ fleet), and it **routes** outbound to whichever brain answers first.
                     v
         ESP box(es) --WiFi--  mic / speaker / screen
 ```
+
+                         ┌─────────────────────────────────────────┐
+                         │           YOUR MAC (mcp-core host)        │
+                         │                                           │
+  ESP32-S3-BOX-3 ──WiFi──▶  mcp-core (:8000)                         │
+  (mic/speaker/screen/     │    ├─ box registry (X-Box-Id → IP)      │
+   touch/presence radar)   │    ├─ STT/TTS via voice-mcp-server      │
+                         │    │     (MCP over stdio → whisper.cpp    │
+                         │    │      + MOSS-TTS-Nano)                 │
+                         │    ├─ backend router (priority list):     │
+                         │    │     1. agent webhook (:4000)         │
+                         │    │     2. local_llm (Ollama, fallback)  │
+                         │    └─ /mcp — mcp-core itself IS an MCP    │
+                         │          server (esp_speak/esp_display/   │
+                         │          esp_list_boxes, any MCP client)  │
+                         │                                           │
+                         │  restaurant agent (:4000)                 │
+                         │    ├─ menu.json (source of truth)         │
+                         │    ├─ LLM order extraction (temp=0)       │
+                         │    └─ code-decided confirm (not LLM)      │
+                         │                                           │
+                         │  Ollama (:11434) — llama3.2:3b            │
+                         │  MOSS-TTS (:8080) — local TTS              │
+                         └─────────────────────────────────────────┘
+
 
 - **mcp-core/** — thin, dumb router. Speech↔text, route text to a backend, push
   audio + display payloads to boxes, and expose the fleet as MCP tools. Zero

@@ -20,6 +20,9 @@ bool prov_load_creds(char *ssid, size_t ssid_len, char *pass, size_t pass_len,
                      char *post_url, size_t url_len, char *box_name, size_t name_len);
 esp_err_t prov_save_creds(const char *ssid, const char *pass,
                           const char *post_url, const char *box_name);
+// Updates ONLY post_url, leaving WiFi credentials intact — used by POST /server
+// so a box can be repointed at a moved server without re-provisioning.
+esp_err_t prov_save_post_url(const char *post_url);
 // Clears ssid/pass/post_url/box_name. box_id and ap_psk are NOT touched.
 void prov_erase_creds(void);
 

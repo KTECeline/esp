@@ -121,6 +121,20 @@ esp_err_t prov_save_creds(const char *ssid, const char *pass,
     return err;
 }
 
+// Update ONLY the server address, keeping WiFi credentials. Lets a box that is
+// on WiFi but can't find its server be repointed over the network (POST /server)
+// instead of needing a full re-provision through the QR portal — the common
+// case when the server's machine moves networks or changes IP.
+esp_err_t prov_save_post_url(const char *post_url)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    if ((err = nvs_set_str(h, "post_url", post_url)) == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    return err;
+}
+
 void prov_erase_creds(void)
 {
     nvs_handle_t h;

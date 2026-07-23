@@ -475,7 +475,9 @@ static bool wait_server_reachable(void)
         esp_http_client_cleanup(client);
         if (status == 200) return true;
         if (!shown) {
-            display_status("NO SERVER", "HOLD BOOT 5S", rgb565(180, 120, 0));
+            // Show the box's OWN ip: it's reachable now (the HTTP server is up
+            // before this wait), so this is the address to POST /server to.
+            display_status("NO SERVER", s_ip_str, rgb565(180, 120, 0));
             shown = true;
         }
         ESP_LOGW(TAG, "server not reachable at %s (%d) — retrying in %ds "
@@ -986,6 +988,56 @@ static esp_err_t order_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+// /confirm, /health, /register and /wake all live next to /upload on the same
+// server, so they're derived from post_url (which carries the real host AND
+// port). Re-run whenever post_url changes so a repointed box updates every URL
+// at once instead of leaving stale ones behind.
+static void derive_server_urls(void)
+{
+    const char *slash = strrchr(s_post_url, '/');
+    int base_len = slash ? (int)(slash - s_post_url) : (int)strlen(s_post_url);
+    snprintf(s_confirm_url, sizeof(s_confirm_url), "%.*s/confirm", base_len, s_post_url);
+    snprintf(s_health_url, sizeof(s_health_url), "%.*s/health", base_len, s_post_url);
+    snprintf(s_register_url, sizeof(s_register_url), "%.*s/register", base_len, s_post_url);
+    snprintf(s_wake_url, sizeof(s_wake_url), "%.*s/wake", base_len, s_post_url);
+}
+
+// Repoint this box at a different server, live, over the network:
+//   curl -X POST http://<box-ip>/server --data "http://10.0.0.5:8000/upload"
+// Persisted to NVS, so it survives reboots. This is the answer to "the server
+// machine moved / changed IP and mDNS is blocked here" — previously that meant
+// a full QR re-provision; now it's one request and the retry loop picks it up
+// on its next pass (or immediately, if it's already waiting).
+static esp_err_t server_handler(httpd_req_t *req)
+{
+    char url[sizeof(s_post_url)];
+    int len = req->content_len;
+    if (len <= 0 || len >= (int)sizeof(url)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body must be the new post_url");
+        return ESP_FAIL;
+    }
+    int got = 0;
+    while (got < len) {
+        int r = httpd_req_recv(req, url + got, len - got);
+        if (r <= 0) { httpd_resp_send_500(req); return ESP_FAIL; }
+        got += r;
+    }
+    url[got] = 0;
+    while (got > 0 && (url[got - 1] == '\n' || url[got - 1] == '\r' || url[got - 1] == ' ')) url[--got] = 0;
+
+    if (strncmp(url, "http://", 7) != 0 && strncmp(url, "https://", 8) != 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "must start with http://");
+        return ESP_FAIL;
+    }
+
+    strlcpy(s_post_url, url, sizeof(s_post_url));
+    derive_server_urls();
+    prov_save_post_url(s_post_url);
+    ESP_LOGI(TAG, "server address updated to %s", s_post_url);
+    httpd_resp_sendstr(req, "ok");
+    return ESP_OK;
+}
+
 static void start_http_server(void)
 {
     httpd_handle_t server = NULL;
@@ -1000,6 +1052,8 @@ static void start_http_server(void)
         httpd_register_uri_handler(server, &caption);
         httpd_uri_t order = { .uri = "/order", .method = HTTP_POST, .handler = order_handler };
         httpd_register_uri_handler(server, &order);
+        httpd_uri_t srv = { .uri = "/server", .method = HTTP_POST, .handler = server_handler };
+        httpd_register_uri_handler(server, &srv);
         ESP_LOGI(TAG, "TALK server up: POST a WAV to http://%s/play", s_ip_str);
     } else {
         ESP_LOGE(TAG, "failed to start HTTP server");
@@ -1070,17 +1124,14 @@ void app_main(void)
     resolve_mdns_host(s_post_url, resolved_post_url, sizeof(resolved_post_url));
     strlcpy(s_post_url, resolved_post_url, sizeof(s_post_url));
 
-    // /confirm, /health and /register all live next to /upload on the same
-    // server — derived from post_url (which carries the real host AND port)
-    // so the portal form stays the single place addresses are entered.
-    {
-        const char *slash = strrchr(s_post_url, '/');
-        int base_len = slash ? (int)(slash - s_post_url) : (int)strlen(s_post_url);
-        snprintf(s_confirm_url, sizeof(s_confirm_url), "%.*s/confirm", base_len, s_post_url);
-        snprintf(s_health_url, sizeof(s_health_url), "%.*s/health", base_len, s_post_url);
-        snprintf(s_register_url, sizeof(s_register_url), "%.*s/register", base_len, s_post_url);
-        snprintf(s_wake_url, sizeof(s_wake_url), "%.*s/wake", base_len, s_post_url);
-    }
+    derive_server_urls();
+
+    // HTTP server comes up BEFORE the reachability wait, on purpose. If the
+    // box can't find its server (mDNS blocked, server machine moved to a new
+    // IP), it used to sit here unreachable — the one moment you most need to
+    // talk to it. Now it is always addressable on the LAN, so `POST /server`
+    // can repoint it live with no QR, no re-provision, no button.
+    start_http_server();
 
     // WiFi is right but the server isn't answering: NOT a provisioning issue
     // most of the time (mcp-core simply not started yet), so this retries for
@@ -1093,7 +1144,6 @@ void app_main(void)
     }
     register_with_core();
 
-    start_http_server();
     show_ready();   // blue = ready
     // GPIO1 (top mute button) intentionally not configured/read — see the
     // note in the main loop; it's the hardware mic-mute, not a usable trigger.
