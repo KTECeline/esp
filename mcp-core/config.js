@@ -179,6 +179,10 @@ export function loadConfig() {
     // ws://<lanIp>:<port>/ws, which only helps boxes on this LAN. Point it at
     // a public relay (Tailscale Funnel) to reach boxes on any network.
     wsUrl: cfg.ws_url || null,
+    // Where the box's help QR points (tap RST twice). Empty = boxes keep the
+    // fallback compiled into firmware. Set this to the guide's public URL —
+    // a link that demands a login is worse than no QR at all.
+    helpUrl: cfg.help_url || null,
     configPath: CONFIG_PATH
   };
 }

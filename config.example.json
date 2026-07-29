@@ -56,5 +56,8 @@
   "fleet_token_env": "",
 
   "_lan_ip_help": "Optional override for the address boxes are told to reach this machine on. Auto-detected normally (tailnet/CGNAT 100.64.0.0/10 addresses are always skipped, since boxes can't route to them). Set only if the auto-pick is wrong on a multi-interface machine.",
-  "lan_ip": ""
+  "lan_ip": "",
+
+  "_help_url_help": "Where the box's on-screen help QR points when someone taps RST twice. Pushed to every box on adoption, so rehosting the guide never means reflashing. Must be reachable WITHOUT a login — whoever scans it is already stuck, and a sign-in wall is worse than no QR. Empty = boxes use the fallback compiled into firmware.",
+  "help_url": ""
 }

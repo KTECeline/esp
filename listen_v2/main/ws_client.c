@@ -55,6 +55,42 @@ static char  s_body[WS_BODY_MAX];
 static int   s_body_len;
 static uint32_t s_body_expected;   // bytes of body still to come (play only)
 
+// play_after() must NOT run on the websocket event task.
+//
+// For a greeting it calls run_auto_listen(), which blocks until the customer's
+// whole turn is done — up to MAX_RECORD_SECONDS of recording plus upload and
+// STT. This task is the ONLY one servicing the socket, so blocking it here
+// stops pongs AND stops every incoming push from being read. The server then
+// sees a missed heartbeat, terminates the channel, and the mid-clip drop trips
+// play_abort() — audible as chopped-up speech, with pushes timing out and
+// falling back to LAN behind it.
+//
+// The HTTP path never hit this because httpd gives each request its own task.
+// On the socket there is only one, so the long work is handed off here instead.
+static volatile bool s_after_busy = false;
+
+static void play_after_task(void *arg)
+{
+    play_after(&s_play);
+    s_after_busy = false;
+    vTaskDelete(NULL);
+}
+
+// Non-blocking: the ack has already gone out by the time this is called, so
+// nothing on the server is waiting for it.
+static void play_after_async(void)
+{
+    if (s_after_busy) {   // previous turn still running — don't stack them
+        ESP_LOGW(TAG, "play_after still busy — skipping post-playback policy");
+        return;
+    }
+    s_after_busy = true;
+    if (xTaskCreate(play_after_task, "play_after", 4096, NULL, 5, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "could not spawn play_after task");
+        s_after_busy = false;
+    }
+}
+
 static void ws_ack(const char *id, int status)
 {
     if (!s_client || !id[0]) return;
@@ -120,7 +156,7 @@ static void begin_instruction(const char *body, int body_len, uint32_t total_bod
         if (s_body_expected == 0) {
             play_finish_audio(&s_play);
             ws_ack(s_req_id, 200);
-            play_after(&s_play);
+            play_after_async();
             s_state = WS_IDLE;
         }
         return;
@@ -228,7 +264,7 @@ static void on_data(const esp_websocket_event_data_t *d)
                 if (s_body_expected == 0) {
                     play_finish_audio(&s_play);
                     ws_ack(s_req_id, 200);
-                    play_after(&s_play);
+                    play_after_async();
                     s_state = WS_IDLE;
                 }
             } else if (s_state == WS_TEXT_BODY) {
@@ -253,7 +289,7 @@ static void on_data(const esp_websocket_event_data_t *d)
         if (s_body_expected == 0) {
             play_finish_audio(&s_play);
             ws_ack(s_req_id, 200);           // ack before the caption linger
-            play_after(&s_play);
+            play_after_async();
             s_state = WS_IDLE;
         }
         return;

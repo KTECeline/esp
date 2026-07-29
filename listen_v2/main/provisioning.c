@@ -166,6 +166,75 @@ esp_err_t prov_save_ws_url(const char *url)
     return err;
 }
 
+// Where the on-screen help QR points. Stored (not compiled in) so the guide can
+// move hosts without reflashing a fleet — the server pushes it alongside
+// post_url, exactly like ws_url.
+bool prov_load_help_url(char *out, size_t out_len)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) { out[0] = '\0'; return false; }
+    bool have = nvs_get_str_ok(h, "help_url", out, out_len);
+    nvs_close(h);
+    return have;
+}
+
+esp_err_t prov_save_help_url(const char *url)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    if ((err = nvs_set_str(h, "help_url", url)) == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    return err;
+}
+
+// ---- Double-reset detection -------------------------------------------------
+// "Tap RST twice" is the recovery gesture, so it has to survive the way RST
+// actually resets this chip. The usual trick — a flag in RTC memory — is NOT
+// reliable here: RST pulls the enable pin low, which resets the RTC domain too,
+// so the flag can be gone at exactly the moment it matters. NVS survives every
+// reset type, at the cost of two small writes per boot (wear-levelled, and this
+// runs once per boot, not in a loop).
+#define DBL_RESET_WINDOW_MS 4000
+
+static void dbl_reset_clear_task(void *arg)
+{
+    vTaskDelay(pdMS_TO_TICKS(DBL_RESET_WINDOW_MS));
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, "dblrst", 0);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    vTaskDelete(NULL);
+}
+
+bool prov_double_reset(void)
+{
+    nvs_handle_t h;
+    uint8_t armed = 0;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return false;
+    nvs_get_u8(h, "dblrst", &armed);   // key absent on a fresh box -> stays 0
+
+    if (armed) {
+        // Second boot inside the window: consume the flag so a THIRD reset
+        // starts over rather than re-triggering.
+        nvs_set_u8(h, "dblrst", 0);
+        nvs_commit(h);
+        nvs_close(h);
+        ESP_LOGI(TAG, "double reset detected — showing help screen");
+        return true;
+    }
+
+    nvs_set_u8(h, "dblrst", 1);
+    nvs_commit(h);
+    nvs_close(h);
+    // Disarm shortly after boot, so an ordinary single reset doesn't leave the
+    // box primed to show help on its next unrelated restart.
+    xTaskCreate(dbl_reset_clear_task, "dblrst", 2560, NULL, 3, NULL);
+    return false;
+}
+
 bool prov_load_fleet_token(char *out, size_t out_len)
 {
     nvs_handle_t h;
@@ -393,6 +462,38 @@ static void qr_display_cb(esp_qrcode_handle_t qrcode)
         }
     }
     display_qr(modules, size, s_ap_ssid, s_ap_psk);
+}
+
+// Same renderer, arbitrary captions — used by the help screen, which encodes a
+// URL rather than WiFi credentials.
+static const char *s_qr_l1 = "";
+static const char *s_qr_l2 = "";
+
+static void qr_url_display_cb(esp_qrcode_handle_t qrcode)
+{
+    int size = esp_qrcode_get_size(qrcode);
+    static uint8_t modules[41 * 41];
+    if (size > 41) { ESP_LOGW(TAG, "help QR too large to render (%d)", size); return; }
+    for (int y = 0; y < size; y++) {
+        for (int x = 0; x < size; x++) {
+            modules[y * size + x] = esp_qrcode_get_module(qrcode, x, y) ? 1 : 0;
+        }
+    }
+    display_qr(modules, size, s_qr_l1, s_qr_l2);
+}
+
+bool prov_show_url_qr(const char *url, const char *line1, const char *line2)
+{
+    if (!url || !url[0]) return false;
+    s_qr_l1 = line1 ? line1 : "";
+    s_qr_l2 = line2 ? line2 : "";
+    esp_qrcode_config_t cfg = ESP_QRCODE_CONFIG_DEFAULT();
+    cfg.display_func = qr_url_display_cb;
+    if (esp_qrcode_generate(&cfg, url) != ESP_OK) {
+        ESP_LOGW(TAG, "could not encode help URL as QR");
+        return false;
+    }
+    return true;
 }
 
 static void show_qr_screen(void)

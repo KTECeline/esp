@@ -403,6 +403,52 @@ static void wifi_scan_log(void)
     free(recs);
 }
 
+// Fallback target for the help QR, used until a server pushes a real one (see
+// prov_save_help_url). Kept here rather than in config so a box that has NEVER
+// reached a server — the case where someone most needs the guide — still shows
+// something scannable.
+//
+// NOTE: replace this with the guide's public URL once it's hosted. A link that
+// demands a login is worse than no QR, because the person scanning it has
+// already been told it would help.
+#define DEFAULT_HELP_URL "https://claude.ai/code/artifact/3bde646b-0200-4437-9a17-b180b3a215bf"
+
+#define HELP_SCREEN_MAX_MS 60000
+
+// "Tap RST twice" -> put the setup guide on screen as a QR. Dismissed by a tap
+// or by the timeout, then boot continues exactly as it would have; nothing here
+// changes state, so triggering it by accident costs a few seconds and nothing
+// else.
+static void show_help_qr_if_double_reset(void)
+{
+    if (!prov_double_reset()) return;
+
+    char url[256];
+    if (!prov_load_help_url(url, sizeof(url)) || url[0] == '\0') {
+        strlcpy(url, DEFAULT_HELP_URL, sizeof(url));
+    }
+
+    if (!prov_show_url_qr(url, "SCAN FOR HELP", "SETUP GUIDE")) {
+        // Encoding failed (empty or over-long URL) — say so plainly instead of
+        // leaving whatever was on screen and looking like a freeze.
+        display_status("NO HELP LINK", "SET HELP URL", rgb565(180, 120, 0));
+        vTaskDelay(pdMS_TO_TICKS(4000));
+        return;
+    }
+    ESP_LOGI(TAG, "help QR on screen (%s) — tap to dismiss", url);
+
+    TickType_t start = xTaskGetTickCount();
+    int x, y;
+    while ((xTaskGetTickCount() - start) < pdMS_TO_TICKS(HELP_SCREEN_MAX_MS)) {
+        if (touch_get_tap(&x, &y)) break;
+        // BOOT is pulled up, so LOW = pressed. Reading it directly keeps this
+        // working on a box whose touch panel wasn't detected.
+        if (gpio_get_level(PIN_REC_BTN) == 0) break;
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    ESP_LOGI(TAG, "help screen dismissed — continuing boot");
+}
+
 // One-time WiFi stack bring-up: netif, event loop, driver, handlers, country.
 // Split from connecting so provisioning mode (SoftAP, no credentials) can use
 // the same initialized stack.
@@ -1294,6 +1340,21 @@ static esp_err_t server_handler(httpd_req_t *req)
         }
     }
 
+    // Same idea for the help QR's target: pushed, not compiled in, so the guide
+    // can be rehosted across a whole fleet without touching firmware. Only
+    // written when it actually changed — this runs every 60s per box.
+    {
+        char help[256] = "";
+        if (httpd_req_get_hdr_value_str(req, "X-Help-Url", help, sizeof(help)) == ESP_OK && help[0]) {
+            char cur[256] = "";
+            prov_load_help_url(cur, sizeof(cur));
+            if (strcmp(help, cur) != 0) {
+                prov_save_help_url(help);
+                ESP_LOGI(TAG, "help URL set to %s", help);
+            }
+        }
+    }
+
     // Trust-on-first-use adoption: an un-adopted box takes the token from the
     // first server that reaches it (on your own LAN, during bring-up) and
     // starts enforcing immediately afterwards. Only ever assigned when empty —
@@ -1421,6 +1482,11 @@ void app_main(void)
         .pin_bit_mask = 1ULL << PIN_REC_BTN, .mode = GPIO_MODE_INPUT, .pull_up_en = GPIO_PULLUP_ENABLE,
     };
     gpio_config(&btn);
+    // Tap RST twice = "I need help". Runs here because the screen, touch and
+    // BOOT are all up (so it can be dismissed) but nothing that can block has
+    // started yet — meaning the gesture still works on a box that never gets as
+    // far as WiFi, which is exactly when someone needs the guide.
+    show_help_qr_if_double_reset();
     display_status("STARTING", NULL, COL_BLACK);
     i2s_chan_handle_t rx = i2s_init();
     mic_init(rx);

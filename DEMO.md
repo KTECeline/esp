@@ -30,6 +30,7 @@ The same core drives non-restaurant products by swapping one webhook URL.
 | Touch | Primary trigger. Tap the screen to order. |
 | Presence radar | A single GPIO. Starts a session when someone approaches, clears it when they leave. |
 | BOOT button | Short press = order. **Hold 5s = wipe WiFi credentials + fleet token.** |
+| RST button | **Tap twice = show the setup-guide QR.** Single tap is just a reboot. |
 | Top button | **Hardware mic mute.** Firmware cannot override it — it physically cuts the mic. Not usable as a trigger. |
 
 ### What it's connected to
@@ -77,6 +78,8 @@ self-healed on every request.
   if the new image can't get online. No USB cable.
 - **MCP tool surface** — any MCP client can drive the fleet:
   `esp_list_boxes`, `esp_speak`, `esp_display`, `esp_set_occupied`.
+- **Help on the box** — tap **RST twice** and the screen shows a QR to the setup
+  guide. Works before WiFi, so it's there when it's needed most.
 - **Remote access** — Tailscale gives the Mac a fixed address from anywhere.
 - **Two-token security** — `ESP_FLEET_TOKEN` (hardware ↔ server), `ESP_MCP_TOKEN`
   (MCP clients). Separate on purpose; leaking one must not grant the other.
@@ -324,6 +327,37 @@ Verified on hardware — see `ROADMAP.md` item 8.
 
 ---
 
+## Part 4b — The help QR on the box
+
+Tap the **RST** button **twice**, about a second apart. The screen shows a QR
+code pointing at the setup guide — scan it with a phone. Tap the screen (or press
+BOOT) to dismiss, or leave it and it clears itself after 60 seconds, then boots
+normally. It changes no state, so an accidental double-tap costs a few seconds
+and nothing else.
+
+Why RST rather than a softer trigger: it works on a box that is **wedged or has
+never reached WiFi**, which is exactly when someone needs the guide. A single tap
+is an ordinary reboot — only a second tap inside ~4 seconds counts.
+
+**Where the QR points is configurable**, and this matters more than it looks:
+
+```json
+"help_url": "https://your-guide-url"
+```
+
+Set it in `config.json` and every box picks it up within 60s through the normal
+adopt push — **no reflashing**, even across a whole fleet. Leave it empty and
+boxes fall back to the URL compiled into firmware.
+
+> ⚠️ **The URL must work without a login.** Whoever scans that code is already
+> stuck; a sign-in wall is worse than no QR at all. Host the guide somewhere
+> public (GitHub Pages, Vercel, Netlify — it's a single self-contained HTML file,
+> so it's a drag-and-drop deploy) rather than behind anything account-gated.
+
+> ℹ️ **Implementation note, if you ever port this.** The double-tap flag lives in
+> NVS, not RTC memory. RST pulls the chip-enable pin low, which resets the RTC
+> domain — an RTC-backed flag would be wiped at exactly the moment it's needed.
+
 ## Part 5 — Troubleshooting
 
 | Symptom | Cause / fix |
@@ -338,6 +372,8 @@ Verified on hardware — see `ROADMAP.md` item 8.
 | Weird glitch/buzz from the speaker | A clip was cut off mid-stream, leaving the codec open. Fixed in current firmware; if it happens on older firmware, reboot the box. |
 | Mic seems dead | Someone pressed the **top button** — it's a hardware mute. Press again. |
 | Everything green but no reply | Cold models on first request. Do one warm-up interaction. |
+| Staff on site don't know what to do | Tap **RST twice** — the box shows a QR to the setup guide. See Part 4b. |
+| Help QR scans but the page won't open | `help_url` points somewhere that needs a login, or isn't public. Must be reachable without an account. |
 
 **Logs:** `/tmp/mcp-core.log` (routing + per-stage timing), `/tmp/restaurant-agent.log`,
 `/tmp/moss-tts.log`, `/tmp/ollama.log`. Box's own log: `idf.py -p <port> monitor`.
@@ -352,3 +388,4 @@ Verified on hardware — see `ROADMAP.md` item 8.
 - [ ] One throwaway interaction to warm the models
 - [ ] If demoing remotely: `tailscale up`, then check the LAN-address log line is `192.168.x.x`
 - [ ] Top button not muted
+- [ ] `help_url` set to a public, login-free address (tap RST twice to check the QR resolves)

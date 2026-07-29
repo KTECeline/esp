@@ -172,8 +172,23 @@ export function startWsHub(httpServer, { path = "/ws" } = {}) {
     ws.isAlive = true;
     console.log(`Box "${boxId}" opened a reverse channel from ${from} (pushes can now reach it anywhere)`);
 
-    ws.on("pong", () => { ws.isAlive = true; });
-    ws.on("message", (data, isBinary) => { if (!isBinary) handleAck(data.toString()); });
+    // Liveness = ANY traffic from the box, not just a pong to our own ping.
+    //
+    // A pong-only check assumes our ping reaches the box and its pong comes
+    // back. Through a proxy that doesn't relay WebSocket control frames
+    // (MEASURED with Tailscale Funnel) that round trip silently never
+    // completes, so a perfectly healthy box looks dead: we terminate its
+    // channel, it doesn't even notice for a while, and pushes fall back to LAN
+    // or time out. The firmware sends its own ping every 20s (ws_client.c), so
+    // counting inbound pings and acks as proof-of-life keeps a working box
+    // alive while still reaping a genuinely dead socket.
+    const alive = () => { ws.isAlive = true; };
+    ws.on("pong", alive);
+    ws.on("ping", alive);
+    ws.on("message", (data, isBinary) => {
+      alive();
+      if (!isBinary) handleAck(data.toString());
+    });
     ws.on("close", () => {
       if (sockets.get(boxId) === ws) sockets.delete(boxId);
       console.log(`Box "${boxId}" reverse channel closed`);

@@ -1,0 +1,775 @@
+<title>Voice Box — Setup Guide</title>
+
+<style>
+  :root{
+    --paper:#F7F8F7; --raised:#FFFFFF; --ink:#16211E; --muted:#5C6B66;
+    --rule:#DDE3E0; --rule-strong:#C4CEC9;
+    --signal:#0F7A52; --signal-soft:#E4F1EA;
+    --warn:#A8621B; --warn-soft:#FBF0E2;
+    --code-bg:#121A17; --code-ink:#DFE8E3; --code-rule:#2A3833;
+    --shadow:0 1px 2px rgba(22,33,30,.06), 0 6px 18px rgba(22,33,30,.05);
+    --serif:Georgia,"Iowan Old Style","Times New Roman",serif;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --paper:#101512; --raised:#171E1B; --ink:#E8EDEA; --muted:#95A49E;
+      --rule:#26302C; --rule-strong:#36443E;
+      --signal:#4FBF8B; --signal-soft:#152A21;
+      --warn:#D9954A; --warn-soft:#2A2015;
+      --code-bg:#0A0F0D; --code-ink:#DFE8E3; --code-rule:#232E29;
+      --shadow:0 1px 2px rgba(0,0,0,.4), 0 6px 18px rgba(0,0,0,.3);
+    }
+  }
+  :root[data-theme="dark"]{
+    --paper:#101512; --raised:#171E1B; --ink:#E8EDEA; --muted:#95A49E;
+    --rule:#26302C; --rule-strong:#36443E;
+    --signal:#4FBF8B; --signal-soft:#152A21;
+    --warn:#D9954A; --warn-soft:#2A2015;
+    --code-bg:#0A0F0D; --code-ink:#DFE8E3; --code-rule:#232E29;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 6px 18px rgba(0,0,0,.3);
+  }
+  :root[data-theme="light"]{
+    --paper:#F7F8F7; --raised:#FFFFFF; --ink:#16211E; --muted:#5C6B66;
+    --rule:#DDE3E0; --rule-strong:#C4CEC9;
+    --signal:#0F7A52; --signal-soft:#E4F1EA;
+    --warn:#A8621B; --warn-soft:#FBF0E2;
+    --code-bg:#121A17; --code-ink:#DFE8E3; --code-rule:#2A3833;
+    --shadow:0 1px 2px rgba(22,33,30,.06), 0 6px 18px rgba(22,33,30,.05);
+  }
+
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--paper); color:var(--ink);
+    font-family:var(--sans); font-size:17px; line-height:1.65;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:46rem; margin:0 auto; padding:0 1.25rem 6rem}
+
+  /* ---- masthead ---- */
+  header.top{border-bottom:1px solid var(--rule); margin-bottom:2.5rem}
+  .top-inner{max-width:46rem; margin:0 auto; padding:3.5rem 1.25rem 2.25rem}
+  .eyebrow{
+    font-family:var(--mono); font-size:.72rem; letter-spacing:.14em;
+    text-transform:uppercase; color:var(--signal); margin:0 0 1rem;
+  }
+  h1{
+    font-family:var(--serif); font-weight:400; font-size:clamp(2.1rem,6vw,3.1rem);
+    line-height:1.12; margin:0 0 .85rem; text-wrap:balance; letter-spacing:-.01em;
+  }
+  .standfirst{font-size:1.1rem; color:var(--muted); margin:0; max-width:34rem; text-wrap:pretty}
+
+  /* ---- progress ---- */
+  .progress-bar{
+    position:sticky; top:0; z-index:20; background:var(--paper);
+    border-bottom:1px solid var(--rule); padding:.6rem 1.25rem;
+    display:flex; align-items:center; gap:.85rem;
+    font-size:.82rem; color:var(--muted);
+  }
+  .progress-bar .track{
+    flex:1; height:5px; background:var(--rule); border-radius:99px; overflow:hidden;
+  }
+  .progress-bar .fill{
+    height:100%; width:0%; background:var(--signal); border-radius:99px;
+    transition:width .35s ease;
+  }
+  .progress-bar b{color:var(--ink); font-variant-numeric:tabular-nums; font-weight:600}
+
+  h2{
+    font-family:var(--serif); font-weight:400; font-size:1.75rem; line-height:1.2;
+    margin:3.5rem 0 .6rem; text-wrap:balance; letter-spacing:-.005em;
+  }
+  h3{font-size:1.02rem; font-weight:650; margin:2rem 0 .4rem; letter-spacing:-.005em}
+  p{margin:0 0 1rem; text-wrap:pretty}
+  a{color:var(--signal); text-underline-offset:3px; text-decoration-thickness:1px}
+  a:focus-visible,button:focus-visible,input:focus-visible{
+    outline:2px solid var(--signal); outline-offset:3px; border-radius:3px;
+  }
+  strong{font-weight:650}
+
+  /* ---- path chooser ---- */
+  .paths{display:grid; gap:1rem; margin:1.5rem 0 1rem}
+  @media(min-width:36rem){.paths{grid-template-columns:1fr 1fr}}
+  .path{
+    background:var(--raised); border:1px solid var(--rule); border-radius:10px;
+    padding:1.35rem; box-shadow:var(--shadow); display:flex; flex-direction:column;
+  }
+  .path.recommended{border-color:var(--signal)}
+  .path .tag{
+    font-family:var(--mono); font-size:.68rem; letter-spacing:.12em; text-transform:uppercase;
+    color:var(--muted); margin-bottom:.5rem;
+  }
+  .path.recommended .tag{color:var(--signal); font-weight:600}
+  .path h3{margin:0 0 .4rem; font-size:1.12rem}
+  .path p{font-size:.94rem; color:var(--muted); margin:0 0 .9rem}
+  .path .who{
+    margin-top:auto; padding-top:.85rem; border-top:1px solid var(--rule);
+    font-size:.86rem; color:var(--muted);
+  }
+
+  /* ---- callouts ---- */
+  .note{
+    border-left:3px solid var(--rule-strong); background:var(--raised);
+    padding:.9rem 1.1rem; margin:1.25rem 0; border-radius:0 8px 8px 0; font-size:.95rem;
+  }
+  .note.warn{border-left-color:var(--warn); background:var(--warn-soft)}
+  .note.good{border-left-color:var(--signal); background:var(--signal-soft)}
+  .note p:last-child{margin-bottom:0}
+  .note .label{
+    display:block; font-family:var(--mono); font-size:.7rem; letter-spacing:.12em;
+    text-transform:uppercase; margin-bottom:.4rem; color:var(--muted);
+  }
+  .note.warn .label{color:var(--warn)}
+  .note.good .label{color:var(--signal)}
+
+  /* ---- steps ---- */
+  .step{
+    display:grid; grid-template-columns:auto 1fr; gap:0 1rem;
+    padding:1.5rem 0; border-top:1px solid var(--rule);
+  }
+  .step:first-of-type{border-top:none}
+  .step-check{
+    grid-row:1/3; padding-top:.15rem;
+  }
+  .step-check input{
+    width:1.35rem; height:1.35rem; accent-color:var(--signal); cursor:pointer; margin:0;
+  }
+  .step-head{margin:0 0 .5rem; font-size:1.12rem; font-weight:650; letter-spacing:-.005em}
+  .step-head .num{
+    font-family:var(--mono); font-size:.82rem; color:var(--muted);
+    margin-right:.55rem; font-weight:400;
+  }
+  .step-body>*:last-child{margin-bottom:0}
+  .step.done .step-head{color:var(--muted); text-decoration:line-through; text-decoration-color:var(--rule-strong)}
+
+  /* ---- code ---- */
+  .cmd{
+    position:relative; background:var(--code-bg); border:1px solid var(--code-rule);
+    border-radius:8px; margin:.85rem 0; overflow:hidden;
+  }
+  .cmd-head{
+    display:flex; justify-content:space-between; align-items:center; gap:.75rem;
+    padding:.45rem .5rem .45rem .85rem; border-bottom:1px solid var(--code-rule);
+    font-family:var(--mono); font-size:.68rem; letter-spacing:.1em; text-transform:uppercase;
+    color:#8FA39B;
+  }
+  .cmd pre{
+    margin:0; padding:.85rem; overflow-x:auto; font-family:var(--mono);
+    font-size:.85rem; line-height:1.6; color:var(--code-ink);
+  }
+  .copy{
+    font:inherit; font-family:var(--sans); font-size:.72rem; letter-spacing:.04em;
+    text-transform:none; background:transparent; color:#8FA39B;
+    border:1px solid var(--code-rule); border-radius:5px; padding:.25rem .6rem;
+    cursor:pointer; white-space:nowrap;
+  }
+  .copy:hover{color:var(--code-ink); border-color:#4A5C55}
+  .copy.copied{color:#4FBF8B; border-color:#2E6B51}
+
+  code.inline{
+    font-family:var(--mono); font-size:.86em; background:var(--raised);
+    border:1px solid var(--rule); border-radius:4px; padding:.1em .35em;
+  }
+
+  /* ---- OS switch ---- */
+  .os-switch{
+    display:flex; gap:.4rem; align-items:center; flex-wrap:wrap;
+    margin:1.25rem 0; padding:.75rem .9rem; background:var(--raised);
+    border:1px solid var(--rule); border-radius:8px; font-size:.88rem;
+  }
+  .os-switch .lbl{color:var(--muted); margin-right:.25rem}
+  .os-btn{
+    font:inherit; font-size:.86rem; background:transparent; color:var(--muted);
+    border:1px solid var(--rule); border-radius:6px; padding:.3rem .75rem; cursor:pointer;
+  }
+  .os-btn[aria-pressed="true"]{
+    background:var(--signal); border-color:var(--signal); color:#fff; font-weight:600;
+  }
+  :root[data-theme="dark"] .os-btn[aria-pressed="true"],
+  .os-btn[aria-pressed="true"]{color:#fff}
+  @media (prefers-color-scheme:dark){.os-btn[aria-pressed="true"]{color:#06120D}}
+  :root[data-theme="dark"] .os-btn[aria-pressed="true"]{color:#06120D}
+  :root[data-theme="light"] .os-btn[aria-pressed="true"]{color:#fff}
+  .os-note{font-size:.86rem; color:var(--muted); width:100%; margin:.35rem 0 0}
+
+  [data-os]{display:none}
+  [data-os].active{display:block}
+
+  /* ---- misc ---- */
+  ul.plain{margin:0 0 1rem; padding-left:1.15rem}
+  ul.plain li{margin-bottom:.35rem}
+  .checklist{list-style:none; padding:0; margin:1rem 0}
+  .checklist li{
+    padding:.5rem 0 .5rem 1.6rem; border-bottom:1px solid var(--rule);
+    position:relative; font-size:.95rem;
+  }
+  .checklist li:before{
+    content:"✓"; position:absolute; left:0; color:var(--signal); font-weight:700;
+  }
+  table{width:100%; border-collapse:collapse; margin:1rem 0; font-size:.92rem}
+  .table-scroll{overflow-x:auto; margin:1rem 0}
+  th,td{text-align:left; padding:.6rem .7rem; border-bottom:1px solid var(--rule); vertical-align:top}
+  th{font-size:.72rem; letter-spacing:.1em; text-transform:uppercase; color:var(--muted); font-weight:600}
+  footer{margin-top:4rem; padding-top:1.5rem; border-top:1px solid var(--rule); font-size:.86rem; color:var(--muted)}
+
+  @media (prefers-reduced-motion:reduce){
+    *{transition:none!important; animation:none!important}
+  }
+</style>
+
+<div class="progress-bar">
+  <span>Setup progress</span>
+  <span class="track"><span class="fill" id="fill"></span></span>
+  <span><b id="pcount">0</b> / <b id="ptotal">0</b></span>
+</div>
+
+<header class="top">
+  <div class="top-inner">
+    <p class="eyebrow">Voice Box · Setup</p>
+    <h1>Getting your voice box running</h1>
+    <p class="standfirst">
+      The box takes a customer's order out loud. This guide gets it talking — from
+      an unopened box to a working setup. No prior technical experience assumed.
+    </p>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <h2>First: which setup do you need?</h2>
+  <p>
+    The box needs a "brain" — a computer that listens to what the customer said and
+    decides what to say back. The only real question is <strong>whose computer runs
+    it</strong>. That changes everything else, so pick this first.
+  </p>
+
+  <div class="paths">
+    <div class="path recommended">
+      <span class="tag">Recommended</span>
+      <h3>Someone else runs the brain</h3>
+      <p>
+        You plug in the box and put it on your WiFi. That's the whole job — about
+        five minutes, done from your phone.
+      </p>
+      <span class="who">Right for almost everyone. Skip to <a href="#connect">Connecting the box</a>.</span>
+    </div>
+    <div class="path">
+      <span class="tag">Advanced</span>
+      <h3>You run the brain yourself</h3>
+      <p>
+        Everything runs on your own computer, and nothing leaves your premises.
+        Needs software installed and a few typed commands.
+      </p>
+      <span class="who">Choose this only if you need it. See <a href="#selfhost">Running it yourself</a>.</span>
+    </div>
+  </div>
+
+  <div class="note good">
+    <span class="label">Worth knowing</span>
+    <p>
+      Both options keep customer audio private — speech is turned into text on a
+      computer you or your provider controls, never sent to an outside company.
+      The difference is only <em>which</em> computer.
+    </p>
+  </div>
+
+  <h2 id="connect">Connecting the box to WiFi</h2>
+  <p>
+    Do this whichever option you picked. You'll need the WiFi password and a phone.
+  </p>
+
+  <div class="step" data-step>
+    <span class="step-check"><input type="checkbox" aria-label="Mark step complete"></span>
+    <h3 class="step-head"><span class="num">01</span>Plug the box in and wait</h3>
+    <div class="step-body">
+      <p>
+        Use the USB-C cable. Give it about ten seconds. If it already knows your
+        WiFi it will show its own address on screen — a number like
+        <code class="inline">192.168.1.42</code> — and you're already finished.
+      </p>
+      <p>If instead it shows a square QR pattern, it's asking to be set up. Continue.</p>
+    </div>
+  </div>
+
+  <div class="step" data-step>
+    <span class="step-check"><input type="checkbox" aria-label="Mark step complete"></span>
+    <h3 class="step-head"><span class="num">02</span>Scan the code on the screen</h3>
+    <div class="step-body">
+      <p>
+        Point your phone camera at the QR code on the box. Your phone will offer to
+        join a network named after the box, something like
+        <code class="inline">BOX-C3B4</code>. Tap to join.
+      </p>
+      <div class="note">
+        <span class="label">If the camera doesn't offer it</span>
+        <p>
+          Open your phone's WiFi settings and join that network by hand. The
+          8-character password is printed on the box's screen underneath the code.
+        </p>
+      </div>
+    </div>
+  </div>
+
+  <div class="step" data-step>
+    <span class="step-check"><input type="checkbox" aria-label="Mark step complete"></span>
+    <h3 class="step-head"><span class="num">03</span>Fill in the short form</h3>
+    <div class="step-body">
+      <p>
+        A setup page opens by itself once you've joined. If it doesn't, open your
+        browser and go to <code class="inline">192.168.4.1</code>.
+      </p>
+      <p>Three things to fill in:</p>
+      <div class="table-scroll">
+        <table>
+          <tr><th>Field</th><th>What to put</th></tr>
+          <tr><td><strong>WiFi network</strong></td><td>Pick yours from the list. It only shows 2.4GHz networks — see the note below.</td></tr>
+          <tr><td><strong>WiFi password</strong></td><td>Your normal WiFi password.</td></tr>
+          <tr><td><strong>Computer address</strong></td><td>The address of the brain. Your provider gives you this, or find it yourself in <a href="#findaddress">step 8</a>.</td></tr>
+        </table>
+      </div>
+      <p>Press save. The box restarts and joins your WiFi.</p>
+      <div class="note warn">
+        <span class="label">Common snag — 5GHz WiFi</span>
+        <p>
+          The box can only use <strong>2.4GHz</strong> WiFi. Most home and shop
+          routers broadcast both and it just works. But if your network is missing
+          from the list, that's almost always why — the network is 5GHz-only.
+        </p>
+        <p>
+          Using an iPhone hotspot? Turn on <strong>Maximise Compatibility</strong> in
+          the hotspot settings, or the box cannot see it at all.
+        </p>
+      </div>
+    </div>
+  </div>
+
+  <div class="step" data-step>
+    <span class="step-check"><input type="checkbox" aria-label="Mark step complete"></span>
+    <h3 class="step-head"><span class="num">04</span>Check it worked</h3>
+    <div class="step-body">
+      <p>
+        Walk up to the box. It should greet you out loud, once. Say something —
+        it should answer.
+      </p>
+      <p>
+        If it shows <strong>NO SERVER</strong>, the box is on WiFi but can't find the
+        brain. The address in step 3 is wrong, or the brain isn't running. See
+        <a href="#trouble">When something's wrong</a>.
+      </p>
+    </div>
+  </div>
+
+  <h2 id="selfhost">Running the brain yourself</h2>
+  <p>
+    Only needed if you chose the advanced option. Everything below happens on the
+    computer that will run the brain — not on the box.
+  </p>
+
+  <div class="note warn">
+    <span class="label">Read this before you start</span>
+    <p>
+      Two of these steps are genuinely difficult — the speech engines in step 7 need
+      software compiled from source and a 465MB download. They are not
+      click-and-install.
+    </p>
+    <p>
+      The helper scripts also assume a <strong>Mac</strong>. On Windows they won't run
+      as written. If that's you, ask your provider for a prepared copy rather than
+      working through this list — this is the honest recommendation, not a
+      formality.
+    </p>
+  </div>
+
+  <div class="os-switch">
+    <span class="lbl">Showing instructions for</span>
+    <button class="os-btn" data-set-os="mac" aria-pressed="false">Mac</button>
+    <button class="os-btn" data-set-os="win" aria-pressed="false">Windows</button>
+    <button class="os-btn" data-set-os="linux" aria-pressed="false">Linux</button>
+    <p class="os-note" id="osnote">Detected automatically — change it if that's wrong.</p>
+  </div>
+
+  <h3>Where do I type these commands?</h3>
+  <div data-os="mac">
+    <p>
+      In an app called <strong>Terminal</strong>. Press <code class="inline">⌘ Space</code>,
+      type "terminal", press Enter. A window with a text prompt opens. Paste a command,
+      press Enter, wait for it to finish before the next one.
+    </p>
+  </div>
+  <div data-os="win">
+    <p>
+      In an app called <strong>PowerShell</strong>. Press the Start button, type
+      "powershell", press Enter. Paste a command, press Enter, wait for it to finish.
+    </p>
+    <div class="note warn">
+      <span class="label">Heads up</span>
+      <p>
+        The start-up scripts in step 9 are written for Mac and will not run here as
+        written. You can install the pieces, but starting them up needs a developer's
+        help.
+      </p>
+    </div>
+  </div>
+  <div data-os="linux">
+    <p>
+      In your terminal emulator — usually <code class="inline">Ctrl+Alt+T</code>.
+      Paste a command, press Enter, wait for it to finish.
+    </p>
+  </div>
+
+  <div class="step" data-step>
+    <span class="step-check"><input type="checkbox" aria-label="Mark step complete"></span>
+    <h3 class="step-head"><span class="num">05</span>Install Node.js</h3>
+    <div class="step-body">
+      <p>
+        This is the engine the brain runs on. Download the <strong>LTS</strong> version
+        from <a href="https://nodejs.org" target="_blank" rel="noopener">nodejs.org</a>
+        and run the installer, accepting the defaults.
+      </p>
+      <p>To confirm it worked, run this. It should print a version number:</p>
+      <div class="cmd">
+        <div class="cmd-head"><span>Check Node.js</span><button class="copy">Copy</button></div>
+        <pre>node --version</pre>
+      </div>
+      <div class="note">
+        <span class="label">What good looks like</span>
+        <p>
+          Something like <code class="inline">v22.11.0</code>. If you get
+          "command not found", the install didn't finish — close the terminal, open a
+          new one, and check again before reinstalling.
+        </p>
+      </div>
+    </div>
+  </div>
+
+  <div class="step" data-step>
+    <span class="step-check"><input type="checkbox" aria-label="Mark step complete"></span>
+    <h3 class="step-head"><span class="num">06</span>Get the project files</h3>
+    <div class="step-body">
+      <p>
+        Your provider sends you these, usually as a download link or a shared folder.
+        Put them in your home folder so the path is
+        <code class="inline">~/esp</code> — the commands below assume that exact
+        location.
+      </p>
+      <p>Then install the parts it depends on:</p>
+      <div class="cmd">
+        <div class="cmd-head"><span>Install dependencies</span><button class="copy">Copy</button></div>
+        <pre>cd ~/esp/mcp-core &amp;&amp; npm install
+cd ~/esp/voice-mcp-server &amp;&amp; npm install &amp;&amp; npm run build</pre>
+      </div>
+      <p>Expect a few minutes and a lot of scrolling text. Warnings are normal; errors in red are not.</p>
+    </div>
+  </div>
+
+  <div class="step" data-step>
+    <span class="step-check"><input type="checkbox" aria-label="Mark step complete"></span>
+    <h3 class="step-head"><span class="num">07</span>Install the speech engines</h3>
+    <div class="step-body">
+      <p>
+        Two separate pieces: one turns speech into text, the other turns text back into
+        speech. <strong>This is the hard step.</strong>
+      </p>
+      <ul class="plain">
+        <li><strong>whisper.cpp</strong> — hearing. Must be compiled on your machine, then a language model downloaded (<code class="inline">ggml-small.bin</code>, about 465MB).</li>
+        <li><strong>MOSS-TTS-Nano</strong> — speaking. Runs in a Python environment of its own.</li>
+      </ul>
+      <div class="note warn">
+        <span class="label">Be realistic here</span>
+        <p>
+          Neither ships with the project and neither has a simple installer. If you're
+          not comfortable compiling software, this is the point to ask your provider
+          for a prepared copy with both already in place. That is a normal request,
+          not a failure.
+        </p>
+      </div>
+    </div>
+  </div>
+
+  <div class="step" data-step>
+    <span class="step-check"><input type="checkbox" aria-label="Mark step complete"></span>
+    <h3 class="step-head"><span class="num">08</span>Set up your settings file</h3>
+    <div class="step-body">
+      <p>Start from the supplied example:</p>
+      <div class="cmd">
+        <div class="cmd-head"><span>Create your settings file</span><button class="copy">Copy</button></div>
+        <pre>cp ~/esp/config.example.json ~/esp/config.json</pre>
+      </div>
+      <p>
+        Next, two passwords. One lets the box and the brain trust each other; the other
+        controls who may send commands. Without the first, anyone on your WiFi could
+        redirect the box's microphone — so this is not optional.
+      </p>
+      <div class="cmd">
+        <div class="cmd-head"><span>Generate two secrets</span><button class="copy">Copy</button></div>
+        <pre>printf 'export ESP_FLEET_TOKEN=%s\nexport ESP_MCP_TOKEN=%s\n' \
+  "$(openssl rand -hex 24)" "$(openssl rand -hex 24)" &gt; ~/esp/.env
+chmod 600 ~/esp/.env</pre>
+      </div>
+      <p>
+        That writes both into a hidden file the brain reads at start-up. You never need
+        to look at them. Don't paste them into email or chat.
+      </p>
+      <p id="findaddress">
+        Finally, find this computer's address on your network — this is the
+        <strong>Computer address</strong> the box asked for back in step 3:
+      </p>
+      <div data-os="mac">
+        <div class="cmd">
+          <div class="cmd-head"><span>Find your address</span><button class="copy">Copy</button></div>
+          <pre>ipconfig getifaddr en0</pre>
+        </div>
+      </div>
+      <div data-os="win">
+        <div class="cmd">
+          <div class="cmd-head"><span>Find your address</span><button class="copy">Copy</button></div>
+          <pre>ipconfig</pre>
+        </div>
+        <p>Look for "IPv4 Address" under your active adapter.</p>
+      </div>
+      <div data-os="linux">
+        <div class="cmd">
+          <div class="cmd-head"><span>Find your address</span><button class="copy">Copy</button></div>
+          <pre>hostname -I | awk '{print $1}'</pre>
+        </div>
+      </div>
+      <div class="note">
+        <span class="label">Putting it together</span>
+        <p>
+          If that prints <code class="inline">192.168.1.50</code>, the Computer address
+          to type into the box is
+          <code class="inline">http://192.168.1.50:8000/upload</code>
+        </p>
+      </div>
+    </div>
+  </div>
+
+  <div class="step" data-step>
+    <span class="step-check"><input type="checkbox" aria-label="Mark step complete"></span>
+    <h3 class="step-head"><span class="num">09</span>Start it up</h3>
+    <div class="step-body">
+      <div data-os="mac">
+        <div class="cmd">
+          <div class="cmd-head"><span>Start everything</span><button class="copy">Copy</button></div>
+          <pre>cd ~/esp &amp;&amp; ./start_voice_assistant.sh</pre>
+        </div>
+        <p>Then check each piece came up:</p>
+        <div class="cmd">
+          <div class="cmd-head"><span>Health check</span><button class="copy">Copy</button></div>
+          <pre>cd ~/esp &amp;&amp; ./check_health.sh</pre>
+        </div>
+        <p>
+          You want five green <strong>OK</strong> lines. Any red <strong>DOWN</strong>
+          line names the piece that didn't start — that's your starting point, not a
+          mystery.
+        </p>
+      </div>
+      <div data-os="win">
+        <div class="note warn">
+          <span class="label">Not available on Windows</span>
+          <p>
+            These start-up scripts are Mac-only. Each piece can be started by hand, but
+            that needs a developer. This is the point where a prepared setup saves real time.
+          </p>
+        </div>
+      </div>
+      <div data-os="linux">
+        <div class="cmd">
+          <div class="cmd-head"><span>Start everything</span><button class="copy">Copy</button></div>
+          <pre>cd ~/esp &amp;&amp; ./start_voice_assistant.sh</pre>
+        </div>
+        <p>
+          The script uses a Mac command to find your network address, so it may need a
+          small edit on Linux. Everything else works the same.
+        </p>
+      </div>
+      <div class="note good">
+        <span class="label">Run this before every service</span>
+        <p>
+          The health check is the fastest way to know you're ready. Run it before a busy
+          period — it takes two seconds and turns "why isn't it talking" into a specific
+          answer.
+        </p>
+      </div>
+    </div>
+  </div>
+
+  <h2>Using it away from the shop</h2>
+  <p>
+    Optional. This lets you reach the brain from somewhere else — checking on it from
+    home, for instance.
+  </p>
+  <p>
+    Install <a href="https://tailscale.com/download" target="_blank" rel="noopener">Tailscale</a>
+    on the computer running the brain and sign in with Google or Microsoft. It creates
+    a private link between your own devices. No terminal needed, and no change to your
+    router.
+  </p>
+  <div class="note warn">
+    <span class="label">What this does and doesn't do</span>
+    <p>
+      This lets <strong>you</strong> reach the brain from elsewhere. It does
+      <strong>not</strong> let the box work from a different building — the box still
+      needs to be on the same WiFi as the brain.
+    </p>
+    <p>
+      Running boxes across separate locations is still being built. It partly works but
+      drops audio under real use, so it isn't ready to rely on.
+    </p>
+  </div>
+
+  <h2 id="trouble">When something's wrong</h2>
+  <div class="table-scroll">
+    <table>
+      <tr><th>What you see</th><th>What it means</th></tr>
+      <tr>
+        <td>Screen says <strong>NO SERVER</strong></td>
+        <td>Box is on WiFi but can't reach the brain. Check the brain is running, and that the Computer address matches step 8. The address changes if your router reassigns it.</td>
+      </tr>
+      <tr>
+        <td>Your network isn't in the list</td>
+        <td>Almost always a 5GHz-only network. The box needs 2.4GHz.</td>
+      </tr>
+      <tr>
+        <td>It answers, but has no idea about your menu</td>
+        <td>The brain is running but your menu service isn't being reached, so it fell back to a generic assistant. Check that piece is started.</td>
+      </tr>
+      <tr>
+        <td>Microphone seems dead</td>
+        <td>The button on top is a physical microphone mute — press it again. No software can override it, by design.</td>
+      </tr>
+      <tr>
+        <td>Spoken total differs from the screen</td>
+        <td>Report this. Prices must be calculated, never improvised, and a mismatch is a real fault.</td>
+      </tr>
+      <tr>
+        <td>First reply after starting up is slow</td>
+        <td>Normal — the speech models load on first use. Do one throwaway interaction before a busy period.</td>
+      </tr>
+    </table>
+  </div>
+
+  <h2>Starting fresh</h2>
+  <p>
+    To move the box to a different WiFi network, or hand it to someone else: hold the
+    small button on the <strong>side</strong> for five seconds. That erases the stored
+    WiFi details and its saved password, and the box returns to the QR screen from
+    step 2.
+  </p>
+  <p>
+    The button on top won't do this — that one only mutes the microphone.
+  </p>
+
+  <footer>
+    <p>
+      Progress on this page is remembered in your browser, so you can close it and come
+      back. Nothing you tick is sent anywhere.
+    </p>
+  </footer>
+</div>
+
+<script>
+(function(){
+  "use strict";
+
+  /* ---- OS detection, user-overridable ---- */
+  var KEY_OS = "voicebox.os", KEY_STEPS = "voicebox.steps";
+  function store(k,v){ try{ localStorage.setItem(k,v); }catch(e){} }
+  function read(k){ try{ return localStorage.getItem(k); }catch(e){ return null; } }
+
+  function detectOS(){
+    var p = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || "";
+    var u = navigator.userAgent || "";
+    var s = (p + " " + u).toLowerCase();
+    if (s.indexOf("win") > -1) return "win";
+    if (s.indexOf("mac") > -1 || s.indexOf("iphone") > -1 || s.indexOf("ipad") > -1) return "mac";
+    if (s.indexOf("linux") > -1 || s.indexOf("android") > -1) return "linux";
+    return "mac";
+  }
+
+  var LABEL = { mac:"Mac", win:"Windows", linux:"Linux" };
+  var saved = read(KEY_OS);
+  var os = (saved === "mac" || saved === "win" || saved === "linux") ? saved : detectOS();
+  var wasDetected = !saved;
+
+  function applyOS(next, fromClick){
+    os = next;
+    document.querySelectorAll("[data-os]").forEach(function(el){
+      el.classList.toggle("active", el.getAttribute("data-os") === os);
+    });
+    document.querySelectorAll("[data-set-os]").forEach(function(b){
+      b.setAttribute("aria-pressed", String(b.getAttribute("data-set-os") === os));
+    });
+    var note = document.getElementById("osnote");
+    if (fromClick){
+      note.textContent = "Showing " + LABEL[os] + " instructions.";
+      store(KEY_OS, os);
+    } else if (wasDetected){
+      note.textContent = "We detected " + LABEL[os] + ". Change it if that's wrong — a web page can't check what's installed on your computer, only which one you're using.";
+    } else {
+      note.textContent = "Showing " + LABEL[os] + " instructions.";
+    }
+  }
+
+  document.querySelectorAll("[data-set-os]").forEach(function(b){
+    b.addEventListener("click", function(){ applyOS(b.getAttribute("data-set-os"), true); });
+  });
+  applyOS(os, false);
+
+  /* ---- copy buttons ---- */
+  document.querySelectorAll(".copy").forEach(function(btn){
+    btn.addEventListener("click", function(){
+      var pre = btn.closest(".cmd").querySelector("pre");
+      var text = pre.innerText;
+      var done = function(){
+        btn.textContent = "Copied";
+        btn.classList.add("copied");
+        setTimeout(function(){ btn.textContent = "Copy"; btn.classList.remove("copied"); }, 1600);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText){
+        navigator.clipboard.writeText(text).then(done, fallback);
+      } else { fallback(); }
+      function fallback(){
+        var ta = document.createElement("textarea");
+        ta.value = text; ta.setAttribute("readonly","");
+        ta.style.position = "absolute"; ta.style.left = "-9999px";
+        document.body.appendChild(ta); ta.select();
+        try { document.execCommand("copy"); done(); } catch(e){ btn.textContent = "Press ⌘C"; }
+        document.body.removeChild(ta);
+      }
+    });
+  });
+
+  /* ---- step progress, persisted ---- */
+  var steps = Array.prototype.slice.call(document.querySelectorAll("[data-step]"));
+  var fill = document.getElementById("fill");
+  var pcount = document.getElementById("pcount");
+  document.getElementById("ptotal").textContent = String(steps.length);
+
+  var state = {};
+  try { state = JSON.parse(read(KEY_STEPS) || "{}") || {}; } catch(e){ state = {}; }
+
+  function refresh(){
+    var n = 0;
+    steps.forEach(function(step, i){
+      var box = step.querySelector("input");
+      if (box.checked) n++;
+      step.classList.toggle("done", box.checked);
+    });
+    pcount.textContent = String(n);
+    fill.style.width = (steps.length ? (n / steps.length) * 100 : 0) + "%";
+  }
+
+  steps.forEach(function(step, i){
+    var box = step.querySelector("input");
+    box.checked = state["s" + i] === true;
+    box.addEventListener("change", function(){
+      state["s" + i] = box.checked;
+      store(KEY_STEPS, JSON.stringify(state));
+      refresh();
+    });
+  });
+  refresh();
+})();
+</script>

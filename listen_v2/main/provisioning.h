@@ -34,6 +34,25 @@ esp_err_t prov_save_fleet_token(const char *token);
 // Pushed by the server alongside post_url, never typed in by hand.
 bool prov_load_ws_url(char *out, size_t out_len);
 esp_err_t prov_save_ws_url(const char *url);
+// Where the on-screen help QR points. Stored rather than compiled in so the
+// guide can be rehosted without reflashing; pushed by the server like ws_url.
+bool prov_load_help_url(char *out, size_t out_len);
+esp_err_t prov_save_help_url(const char *url);
+
+// ---- Recovery gesture -------------------------------------------------------
+// True when this boot followed the previous one closely enough to count as
+// "RST tapped twice" — the gesture for "show me the setup guide". Call ONCE,
+// early in app_main: it also arms the flag for the next boot and schedules its
+// own disarm, so calling it twice would break the detection.
+//
+// Deliberately NVS-backed, not RTC-backed: RST pulls the chip enable pin low,
+// which clears RTC memory, so an RTC flag would be missing exactly when needed.
+bool prov_double_reset(void);
+
+// Draw a QR of `url` with two caption lines beneath it. Returns false if the
+// URL is empty or too long to encode at this screen's size (cap is QR v6),
+// leaving the display untouched so the caller can fall back.
+bool prov_show_url_qr(const char *url, const char *line1, const char *line2);
 // Clears ssid/pass/post_url/box_name. box_id and ap_psk are NOT touched.
 void prov_erase_creds(void);
 

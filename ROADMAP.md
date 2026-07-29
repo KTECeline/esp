@@ -169,7 +169,7 @@ with its stored token, never entering provisioning. No more cables for this box.
 
 **Still open:** remote config updates and file transfer.
 
-## 9. Private Networking (Tailscale) — *DONE — reverse channel + Funnel, not a VPN on the box*
+## 9. Private Networking (Tailscale) — *approach proven, Funnel transport NOT production-ready*
 
 **Done (2026-07-24):** mcp-core is on the tailnet and reachable from anywhere at
 a stable `100.x` address (and its MagicDNS name) with no port forwarding — the
@@ -184,6 +184,14 @@ Also fixed: `lanIp()` used to return the first non-internal IPv4 in enumeration
 order. Tailscale adds a `100.x` interface, so it was one enumeration flip away
 from pushing an unroutable address to every box every 60s and bricking the
 fleet's upload path. CGNAT is now filtered explicitly and the choice is logged.
+
+> ⚠️ **STATUS CORRECTION (2026-07-30, same day).** This was briefly marked DONE
+> after a single successful `esp_speak` over Funnel. That was premature — under
+> sustained use the Funnel-proxied socket **drops repeatedly, specifically around
+> large audio pushes**, which is audible as chopped/glitching speech. `ws_url` is
+> back to the LAN default; **do not demo on the Funnel path.** The *approach*
+> below is sound and the VPN-on-the-box plan really is superseded — but the
+> public transport needs the work in "What's left" before it can be trusted.
 
 **Superseded — boxes don't need to be on the tailnet after all (2026-07-30).**
 The plan below (MicroLink / esp_wireguard) is now moot. The reverse WebSocket
@@ -231,6 +239,32 @@ found either one:
   the crash, so it was confirmed and stuck — rollback only guards "can't get
   online," not "runs, but has a bug." A push that boots and phones home can
   still need a second push to actually fix.
+
+**A third bug, found by the glitching this caused (fixed):** `play_after()` ran
+inline on the WebSocket event task, and for a greeting it calls
+`run_auto_listen()`, which blocks until the customer's whole turn finishes (up
+to `MAX_RECORD_SECONDS` = 30, plus upload and STT). That task is the *only* one
+servicing the socket, so it answered no pings and read no incoming pushes for
+the entire window — server saw a missed heartbeat, killed the channel, and the
+mid-clip drop tripped `play_abort()`. The HTTP path never showed this because
+httpd gives every request its own task. Fixed by dispatching `play_after()` to
+its own task (`play_after_async()` in `ws_client.c`), with a busy guard so turns
+can't stack. **Generalisable lesson: nothing long-running may execute on the WS
+event task** — any future instruction handler needs the same treatment.
+
+**What's left before the Funnel path can be trusted:**
+- The socket still drops around large audio pushes even with the box idle and
+  the `play_after` fix in. Suspected: Funnel's HTTP proxy and multi-hundred-KB
+  binary WebSocket messages. Not yet root-caused.
+- Server-side liveness was widened to count *any* inbound frame, not just a
+  pong (`ws-hub.js`), because Funnel appears not to relay WS control frames —
+  a healthy box looked dead. That was necessary but not sufficient.
+- Likely real fix: **chunk audio into smaller WS messages** rather than one
+  large one (mcp-core already sentence-chunks for latency — the same seam could
+  cap frame size), and/or an application-level keepalive that doesn't depend on
+  control frames traversing the proxy.
+- Until then `ws_url` stays empty (LAN-derived). LAN reverse channel is stable
+  and measurably faster (`total_ms` 6100 vs 7433 through Funnel).
 
 ## 10. Vision Tool (esp-see) — *todo, blocked on item 4 hardware*
 
@@ -285,8 +319,8 @@ Item	Evidence
 7. Flexible MCP (partial)	Verified — no restaurant strings anywhere in mcp-core, own README + registry manifest exist (5356fb1).
 8. OTA firmware updates	Done 2026-07-29 — two app slots + auto-rollback; POST /ota on box and on mcp-core, image served from GET /firmware, all behind X-Fleet-Token. The "4MB partition blocks this" note was simply wrong: the chip has 16MB. BOX-C3B4 migrated to the OTA table the same day with nvs preserved (no re-provisioning), and BOTH the update and the unattended-rollback paths were exercised on real hardware. Boxes now report fw/fw_sha/slot/pending_verify on /register, surfaced via esp_list_boxes — the only way to catch a silent revert, since a rolled-back box looks perfectly healthy on the older image. Caught en route: sdkconfig.defaults never reached the local sdkconfig, so rollback was compiled OUT while looking enabled — see item 8's landmine note.
 9. Tailscale (server side)	Done 2026-07-24 — mcp-core reachable on tailnet at stable 100.x address, no port forwarding; X-Fleet-Token now authenticates all box endpoints and mcp-core's box-facing routes (closes the "anyone on WiFi could repoint a box" hole). Also fixed lanIp() CGNAT-filtering bug this surfaced.
-9. Tailscale (boxes reachable anywhere)	Done 2026-07-30 — NOT via a VPN on the box (that plan is superseded). ws_url in config.json points the existing reverse channel at a Tailscale Funnel address; mcp-core reaches a box from anywhere without the box being on the tailnet. Verified live with esp_speak over the public Funnel URL. Found and fixed two real bugs surfaced only by this being the first time the reverse channel carried real traffic over a public relay: (1) the WiFi router's own DNS returned NXDOMAIN for the Funnel hostname while a public resolver answered fine — fixed by overriding DNS to 1.1.1.1/1.0.0.1 in firmware; (2) a live wss:// session's TLS buffers competing with the 64KB per-clip audio ring buffer for internal SRAM caused xStreamBufferCreate() to return NULL, which nothing checked, crashing the box on an unhandled assert — fixed via CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y (TLS buffers move to PSRAM) plus defensive alloc checks in play_begin()/play_feed(). Rollback did NOT catch the crash (the image had already confirmed itself before crashing) — a reminder that rollback only covers "can't get online," not "runs but has a bug." heap_caps_get_free_size() is still absent from the firmware; this bug was root-caused from sdkconfig reasoning, not a heap reading.
-11. Remote fleet control	Done — the LAN-only limit is gone now that #9 covers both halves. esp_speak/esp_display/OTA all work over the reverse channel + Funnel from anywhere. What's left is a dashboard/status UI, not connectivity.
+9. Tailscale (boxes reachable anywhere)	PARTIAL 2026-07-30 — approach proven, transport not production-ready. NOT via a VPN on the box (that plan is superseded). ws_url in config.json points the existing reverse channel at a Tailscale Funnel address; mcp-core reaches a box from anywhere without the box being on the tailnet. One esp_speak succeeded over the public Funnel URL, but under sustained use the Funnel-proxied socket drops around large audio pushes (audible glitching), so ws_url is back to the LAN default — see item 9's status correction. Found and fixed two real bugs surfaced only by this being the first time the reverse channel carried real traffic over a public relay: (1) the WiFi router's own DNS returned NXDOMAIN for the Funnel hostname while a public resolver answered fine — fixed by overriding DNS to 1.1.1.1/1.0.0.1 in firmware; (2) a live wss:// session's TLS buffers competing with the 64KB per-clip audio ring buffer for internal SRAM caused xStreamBufferCreate() to return NULL, which nothing checked, crashing the box on an unhandled assert — fixed via CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y (TLS buffers move to PSRAM) plus defensive alloc checks in play_begin()/play_feed(). Rollback did NOT catch the crash (the image had already confirmed itself before crashing) — a reminder that rollback only covers "can't get online," not "runs but has a bug." heap_caps_get_free_size() is still absent from the firmware; this bug was root-caused from sdkconfig reasoning, not a heap reading.
+11. Remote fleet control	LAN: done. Beyond-LAN: blocked on #9's transport being made reliable. esp_speak/esp_display/OTA all work over the reverse channel + Funnel from anywhere. What's left is a dashboard/status UI, not connectivity.
 Not started
 Item	Status
 4. Camera & QR	Zero commits. The cheap half (displaying a payment QR) is buildable today and isn't done. Scanning still needs camera hardware.

@@ -709,6 +709,10 @@ async function adoptKnownBoxes(reason) {
       // (e.g. a Tailscale Funnel wss:// address) to make boxes reachable from
       // networks that have no route to this LAN at all.
       headers["X-Ws-Url"] = config.wsUrl || `ws://${ip}:${config.listenPort}/ws`;
+      // Target of the box's help QR (tap RST twice). Pushed rather than baked
+      // into firmware so the guide can move hosts without reflashing. Omitted
+      // when unset, which leaves the box on its built-in fallback.
+      if (config.helpUrl) headers["X-Help-Url"] = config.helpUrl;
       const res = await fetch(`http://${b.ip}/server`, {
         method: "POST", body: url, headers, signal: AbortSignal.timeout(3000)
       });
