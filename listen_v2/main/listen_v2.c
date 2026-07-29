@@ -52,6 +52,7 @@
 #include "mdns.h"
 #include "touch.h"
 #include "sensor.h"
+#include "ota.h"
 
 // WiFi credentials and the PC endpoint are NO LONGER compiled in (the old
 // wifi_config.h path put a real password in source once — never again). They
@@ -227,6 +228,7 @@ static EventGroupHandle_t s_wifi_events;
 static char s_ip_str[16] = "";
 #define WIFI_MAX_RETRIES   5
 static int s_disconn_retries = 0;
+static esp_netif_t *s_sta_netif = NULL;
 
 // Exposed to display.c so it can probe the touch chip to pick the panel type.
 i2c_master_bus_handle_t bsp_i2c_bus(void) { return s_i2c_bus; }
@@ -354,6 +356,18 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
         snprintf(s_ip_str, sizeof(s_ip_str), IPSTR, IP2STR(&e->ip_info.ip));
         ESP_LOGI(TAG, "connected, got IP %s", s_ip_str);
+        // Override the DHCP-supplied DNS server with a public one. Some
+        // routers (seen MEASURED on a mesh network) NXDOMAIN anything that
+        // looks like a VPN/tunnel hostname — including the Tailscale Funnel
+        // address the reverse channel dials — while a public resolver answers
+        // the same query fine. This fires on every IP acquisition, including a
+        // DHCP renewal, so a router that reasserts its own DNS gets overridden
+        // again rather than just once at boot.
+        esp_netif_dns_info_t dns = { .ip.type = ESP_IPADDR_TYPE_V4 };
+        dns.ip.u_addr.ip4.addr = esp_ip4addr_aton("1.1.1.1");
+        esp_netif_set_dns_info(s_sta_netif, ESP_NETIF_DNS_MAIN, &dns);
+        dns.ip.u_addr.ip4.addr = esp_ip4addr_aton("1.0.0.1");
+        esp_netif_set_dns_info(s_sta_netif, ESP_NETIF_DNS_BACKUP, &dns);
         s_disconn_retries = 0;   // a fresh drop later gets a fresh retry budget
         xEventGroupSetBits(s_wifi_events, WIFI_CONNECTED_BIT);
     }
@@ -397,7 +411,7 @@ static void wifi_stack_init(void)
     s_wifi_events = xEventGroupCreate();
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
+    s_sta_netif = esp_netif_create_default_wifi_sta();
     // Also needed for provisioning mode's SoftAP (APSTA): without this netif,
     // there's no DHCP server on the AP side — a phone can complete the WPA2
     // handshake and "join" the hotspot, but never gets an IP, so it can never
@@ -570,10 +584,17 @@ static bool wait_server_reachable(void)
 // self-healing covers the same ground on the server side.
 static void register_with_core(void)
 {
-    char body[160];
+    // fw/slot/sha say which image is really running. Registration is the right
+    // place for them: it happens on every boot, including the boot that follows
+    // a rollback — which is the one where the reported build silently stops
+    // matching the build that was pushed.
+    char body[320];
     int len = snprintf(body, sizeof(body),
-                       "{\"box_id\":\"%s\",\"name\":\"%s\",\"ip\":\"%s\"}",
-                       s_box_id, s_box_name[0] ? s_box_name : s_box_id, s_ip_str);
+                       "{\"box_id\":\"%s\",\"name\":\"%s\",\"ip\":\"%s\","
+                       "\"fw\":\"%s\",\"fw_sha\":\"%s\",\"slot\":\"%s\",\"pending_verify\":%s}",
+                       s_box_id, s_box_name[0] ? s_box_name : s_box_id, s_ip_str,
+                       ota_running_version(), ota_running_sha(), ota_running_slot(),
+                       ota_pending_verify() ? "true" : "false");
     esp_http_client_config_t cfg = { .url = s_register_url,
                                      .method = HTTP_METHOD_POST, .timeout_ms = 5000 };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
@@ -826,10 +847,10 @@ static void playback_task(void *arg)
     uint32_t written = 0;
     uint32_t prebuffer = PLAYBACK_PREBUFFER_BYTES < a->total_bytes ? PLAYBACK_PREBUFFER_BYTES : a->total_bytes;
 
-    while (xStreamBufferBytesAvailable(a->ring) < prebuffer && written < a->total_bytes) {
+    while (!a->abort_now && xStreamBufferBytesAvailable(a->ring) < prebuffer && written < a->total_bytes) {
         vTaskDelay(pdMS_TO_TICKS(5));
     }
-    while (written < a->total_bytes) {
+    while (!a->abort_now && written < a->total_bytes) {
         size_t want = sizeof(buf);
         if (a->total_bytes - written < want) want = a->total_bytes - written;
         size_t got = xStreamBufferReceive(a->ring, buf, want, pdMS_TO_TICKS(3000));
@@ -872,12 +893,29 @@ void play_begin(play_session_t *ps, const uint8_t h[44], uint32_t body_len,
 
     ps->args.ring = xStreamBufferCreate(PLAYBACK_RINGBUF_BYTES, 1);
     ps->args.done = xSemaphoreCreateBinary();
+    // Under real memory pressure (e.g. a live TLS session competing for the
+    // same internal-RAM pool) either allocation can come back NULL. Every
+    // FreeRTOS call below trusts a non-null handle without checking — feeding
+    // one a NULL handle doesn't fail softly, it hits an internal assert and
+    // reboots the box. A skipped clip beats that.
+    if (!ps->args.ring || !ps->args.done) {
+        ESP_LOGE(TAG, "playback alloc failed (ring=%p done=%p) — dropping this clip",
+                  ps->args.ring, ps->args.done);
+        if (ps->args.ring) { vStreamBufferDelete(ps->args.ring); ps->args.ring = NULL; }
+        if (ps->args.done) { vSemaphoreDelete(ps->args.done); ps->args.done = NULL; }
+        esp_codec_dev_close(s_spk);
+        ps->active = false;
+        return;
+    }
     ps->args.total_bytes = body_len;
+    ps->args.abort_now = false;
+    ps->active = true;
     xTaskCreate(playback_task, "playback", 4096, &ps->args, 5, NULL);
 }
 
 void play_feed(play_session_t *ps, const void *data, size_t len)
 {
+    if (!ps->active) return;   // play_begin() couldn't start this clip — nowhere to put these bytes
     const uint8_t *p = (const uint8_t *)data;
     size_t sent = 0;
     while (sent < len) {
@@ -888,12 +926,26 @@ void play_feed(play_session_t *ps, const void *data, size_t len)
 // Blocks until the audio has actually finished coming out of the speaker.
 void play_finish_audio(play_session_t *ps)
 {
+    if (!ps->active) return;   // already finished or aborted
     xSemaphoreTake(ps->args.done, portMAX_DELAY);
     vSemaphoreDelete(ps->args.done);
     vStreamBufferDelete(ps->args.ring);
     esp_codec_dev_close(s_spk);
-    ESP_LOGI(TAG, "playback done");
+    ps->active = false;
+    if (!ps->args.abort_now) ESP_LOGI(TAG, "playback done");
     ps->end_tick = xTaskGetTickCount();
+}
+
+// Same teardown as play_finish_audio(), but tells the playback task to stop
+// first. The distinction matters: the normal path waits for every promised byte
+// to reach the speaker, whereas here those bytes are never coming, so waiting
+// would just stall the caller for the full starvation timeout.
+void play_abort(play_session_t *ps)
+{
+    if (!ps->active) return;
+    ESP_LOGW(TAG, "playback aborted — transport dropped mid-clip");
+    ps->args.abort_now = true;
+    play_finish_audio(ps);
 }
 
 // Screen/auto-listen policy, run AFTER the transport has acknowledged, so the
@@ -1264,6 +1316,50 @@ static esp_err_t server_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+// Update this box's firmware over the network, instead of over a USB cable:
+//   curl -X POST http://<box-ip>/ota --data "http://10.0.0.5:8000/firmware.bin"
+// Answers immediately and downloads in the background — the transfer takes far
+// longer than a request should be held open, and the box reboots itself when
+// it's done. Safe to get wrong: a bad image is rejected before boot, and one
+// that boots but can't reach the server reverts on its own (see ota.h).
+static esp_err_t ota_handler(httpd_req_t *req)
+{
+    if (!fleet_authed(req)) return fleet_deny(req);
+    char url[256];
+    int len = req->content_len;
+    if (len <= 0 || len >= (int)sizeof(url)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body must be the firmware URL");
+        return ESP_FAIL;
+    }
+    int got = 0;
+    while (got < len) {
+        int r = httpd_req_recv(req, url + got, len - got);
+        if (r <= 0) { httpd_resp_send_500(req); return ESP_FAIL; }
+        got += r;
+    }
+    url[got] = 0;
+    while (got > 0 && (url[got - 1] == '\n' || url[got - 1] == '\r' || url[got - 1] == ' ')) url[--got] = 0;
+
+    if (strncmp(url, "http://", 7) != 0 && strncmp(url, "https://", 8) != 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "must start with http:// or https://");
+        return ESP_FAIL;
+    }
+
+    esp_err_t err = ota_start(url, s_fleet_token);
+    if (err == ESP_ERR_INVALID_STATE) {
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_sendstr(req, "an update is already running");
+        return ESP_OK;
+    }
+    if (err != ESP_OK) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "firmware update requested from %s", url);
+    httpd_resp_sendstr(req, "ok — downloading, the box will reboot when done");
+    return ESP_OK;
+}
+
 static esp_err_t session_handler(httpd_req_t *req)
 {
     if (!fleet_authed(req)) return fleet_deny(req);
@@ -1293,6 +1389,8 @@ static void start_http_server(void)
         httpd_register_uri_handler(server, &srv);
         httpd_uri_t sess = { .uri = "/session", .method = HTTP_POST, .handler = session_handler };
         httpd_register_uri_handler(server, &sess);
+        httpd_uri_t ota = { .uri = "/ota", .method = HTTP_POST, .handler = ota_handler };
+        httpd_register_uri_handler(server, &ota);
         ESP_LOGI(TAG, "TALK server up: POST a WAV to http://%s/play", s_ip_str);
     } else {
         ESP_LOGE(TAG, "failed to start HTTP server");
@@ -1352,6 +1450,9 @@ void app_main(void)
         // Bad/absent network: only re-provisioning can fix this. The QR screen
         // replaces the old behavior of retrying forever behind "CONNECTING".
         ESP_LOGW(TAG, "could not join \"%s\" — entering provisioning mode", wifi_ssid);
+        // If this boot is a just-installed image, prefer the version that was
+        // working over a QR screen nobody is standing in front of.
+        ota_rollback_if_pending();
         display_status("WIFI FAILED", "OPENING SETUP", rgb565(180, 0, 0));
         vTaskDelay(pdMS_TO_TICKS(1500));
         start_provisioning_mode();   // never returns
@@ -1384,11 +1485,17 @@ void app_main(void)
     // 5 minutes before concluding the post_url itself is wrong.
     if (!wait_server_reachable()) {
         ESP_LOGW(TAG, "server never became reachable — entering provisioning mode");
+        ota_rollback_if_pending();   // see the WiFi path above
         display_status("NO SERVER", "OPENING SETUP", rgb565(180, 0, 0));
         vTaskDelay(pdMS_TO_TICKS(1500));
         start_provisioning_mode();   // never returns
     }
     register_with_core();
+    // The box is on WiFi and the server answered, so if this boot is a freshly
+    // installed image it has now demonstrated the one thing OTA can break.
+    // Nothing before this point is proof — confirming earlier would keep an
+    // image that cannot phone home, which is exactly the un-fixable case.
+    ota_mark_valid();
     // Dial the reverse channel once the network is up. Non-blocking and
     // self-reconnecting, so a server that isn't listening yet costs nothing —
     // and a box with no URL stored simply keeps using LAN pushes.

@@ -1,6 +1,9 @@
 # BOX-3 voice assistant
 
 Fully local voice pipeline for the ESP32-S3-BOX-3. No cloud, no API keys.
+
+> **Running a demo?** → **[`DEMO.md`](DEMO.md)** — system overview, WiFi setup,
+> Tailscale, OTA, troubleshooting and a pre-demo checklist, in order.
 ~/esp/start_voice_assistant.sh 
 ~/esp/check_health.sh
 ~/esp/point_box_at_me.sh 192.168.68.142
@@ -163,6 +166,37 @@ is what protects them.
 > re-provisioned. CGNAT addresses are filtered explicitly, an interface sharing a
 > subnet with a known box is preferred, `lan_ip` in `config.json` overrides, and
 > the chosen address is logged at startup so a bad pick is visible immediately.
+
+## Firmware updates over WiFi (OTA)
+
+Build, then push — no USB cable:
+
+```bash
+cd listen_v2 && source idfenv.sh && idf.py build
+curl -X POST http://<mcp-core>:8000/ota                 # whole fleet
+curl -X POST "http://<mcp-core>:8000/ota?box=<box-id>"  # one box
+```
+
+mcp-core serves the built image from `GET /firmware` and tells each box to fetch
+it. Both routes need `X-Fleet-Token` when fleet auth is on. The box answers
+immediately and downloads in the background, then reboots — watch its log or
+`/health` to see it come back. You can also point a box at any image directly:
+`curl -X POST http://<box-ip>/ota --data "http://<host>/firmware.bin"`.
+
+Firmware is **never** pushed automatically. Adoption re-runs every 60s because
+repointing a box is always safe; reflashing the fleet on every build is not.
+
+**Why a bad push can't strand a box.** There are two app slots: a download
+writes to the idle one, so the running firmware survives a failed or corrupt
+transfer. A new image then boots in `PENDING_VERIFY` and is only made permanent
+after the box joins WiFi *and* its server answers (`ota_mark_valid()`). If it
+can't get online it reverts to the previous slot and reboots, so the worst case
+is one reboot rather than a site visit with a cable.
+
+> ⚠️ **Each box needs one final USB flash** to move onto the OTA partition
+> table — a box on the old single-slot table has nowhere to put an update.
+> `nvs` keeps its exact offset and size in the new table, so WiFi credentials,
+> server URL and fleet token all survive; no box needs re-provisioning.
 
 ## 1. Start the full stack
 

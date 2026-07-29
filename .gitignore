@@ -60,6 +60,11 @@ sdkconfig.old
 .DS_Store
 .vscode/*
 !.vscode/extensions.json
+# clangd/IDE index — regenerated from compile_commands.json, machine-specific
+# and large. Appears next to any component the editor opens.
+.cache/
+**/.cache/
+compile_commands.json
 
 # =========================
 # Environment secrets

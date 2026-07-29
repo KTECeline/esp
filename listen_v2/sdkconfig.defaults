@@ -16,10 +16,31 @@ CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y
 
 # BOX-3 has 16MB flash but the default config assumed 2MB with a 1MB app
-# partition (was 96% full). Custom table gives the app 4MB of headroom.
+# partition (was 96% full). Custom table gives each app slot 4MB of headroom.
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# Rollback is what makes OTA safe to use on a box you can't physically reach.
+# With this on, a freshly-flashed image boots in PENDING_VERIFY and the
+# bootloader reverts to the previous slot unless the new image explicitly
+# confirms itself. ota_mark_valid() only confirms AFTER the box has joined WiFi
+# and reached its server, so an update that breaks networking undoes itself on
+# the next reboot instead of stranding the box. Without this flag the OTA path
+# still works but has no safety net — do not turn it off.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# A live wss:// reverse channel keeps an mbedTLS session (record buffers +
+# parsed cert-bundle state) alive in INTERNAL SRAM for as long as it's
+# connected — by default mbedTLS never uses PSRAM. Combined with the 64KB
+# internal-SRAM ring buffer play_begin() allocates for every /play, this
+# starves internal heap: xStreamBufferCreate() returns NULL, and nothing
+# checked that, so playback_task's first touch of the (null) handle hit a
+# FreeRTOS assert and crashed the box — MEASURED, the first time audio was
+# ever actually played over the reverse channel in the field (DNS had blocked
+# every earlier connection attempt, so this combination was never exercised
+# before). 16MB PSRAM is sitting right there; move mbedTLS's buffers into it.
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 
 # Default 512B header budget is too tight for a modern mobile browser's
 # request headers (User-Agent, Accept-Language, Sec-CH-UA client hints, etc.)

@@ -462,6 +462,37 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    // The firmware image a box downloads during an update. Authenticated like
+    // every other box-facing route: this is the exact byte stream that becomes
+    // the code running on the hardware, so it is not served to strangers.
+    if (req.method === "GET" && req.url === "/firmware") {
+      if (!fleetAuthed()) return denyFleet();
+      let image;
+      try {
+        image = await readFile(FIRMWARE_PATH);
+      } catch {
+        return json(404, { error: `no firmware at ${FIRMWARE_PATH} — run \`idf.py build\` first` });
+      }
+      // Content-Length matters: the box compares it against what it received
+      // and refuses a short read rather than flashing a truncated image.
+      res.writeHead(200, {
+        "Content-Type": "application/octet-stream",
+        "Content-Length": image.length,
+      });
+      return res.end(image);
+    }
+
+    // Start a firmware update. `?box=<id>` targets one box; otherwise all of
+    // them. Returns as soon as the boxes have accepted the job — see
+    // pushFirmware() on why that isn't the same as "the update worked".
+    if (req.method === "POST" && req.url.startsWith("/ota")) {
+      if (!fleetAuthed()) return denyFleet();
+      const only = new URL(req.url, "http://x").searchParams.get("box");
+      const result = await pushFirmware(only);
+      if (result.error) return json(400, result);
+      return json(200, { started: result.ok, failed: result.failed });
+    }
+
     if (req.method === "POST" && req.url === "/upload") {
       if (!fleetAuthed()) return denyFleet();
       const box = boxes.fromId(req);
@@ -541,12 +572,23 @@ const server = http.createServer(async (req, res) => {
       } catch {
         return json(400, { error: "invalid JSON" });
       }
-      const { box_id, name, ip } = parsed;
+      const { box_id, name, ip, fw, fw_sha, slot, pending_verify } = parsed;
       if (typeof box_id !== "string" || !box_id || typeof ip !== "string" || !ip) {
         return json(400, { error: "box_id and ip are required strings" });
       }
       const action = boxes.upsert(box_id, typeof name === "string" && name ? name : null, ip);
-      console.log(`Box registered: ${box_id} ("${name || box_id}") @ ${ip} [${action}]`);
+      // Optional: boxes on pre-OTA firmware don't send these, and must keep
+      // registering exactly as before rather than being rejected for it.
+      if (typeof fw === "string") {
+        boxes.setFirmware(box_id, {
+          fw, fw_sha: fw_sha ?? null, slot: slot ?? null,
+          pending_verify: pending_verify === true
+        });
+      }
+      const fwNote = typeof fw === "string"
+        ? ` fw=${fw}/${fw_sha ?? "?"} slot=${slot ?? "?"}${pending_verify === true ? " PENDING-VERIFY" : ""}`
+        : "";
+      console.log(`Box registered: ${box_id} ("${name || box_id}") @ ${ip} [${action}]${fwNote}`);
       return json(200, { ok: true, box_id, name: name || box_id, ip, action });
     }
 
@@ -673,6 +715,46 @@ async function adoptKnownBoxes(reason) {
       if (res.ok) console.log(`Pointed ${b.name} @ ${b.ip} at ${url} (${reason})`);
     } catch { /* offline / old firmware / different subnet — nothing to do */ }
   }
+}
+
+// The firmware image this server hands out, built by `idf.py build`.
+const FIRMWARE_PATH = path.join(ESP_ROOT, "listen_v2", "build", "listen_v2.bin");
+
+// Tell boxes to update themselves.
+//
+// Same shape as adoptKnownBoxes(): plain unicast to each box's own HTTP server,
+// carrying a URL pointing back at GET /firmware here. The box downloads it into
+// its spare app slot and reboots. `only` limits the push to one box id; without
+// it every known box updates.
+//
+// Deliberately NOT automatic. Adoption runs every 60s because pointing a box at
+// the right server is always safe; reflashing every box the moment a build
+// appears is not — a bad build would roll through the entire fleet unattended.
+// Firmware moves when a human asks for it.
+async function pushFirmware(only) {
+  const ip = lanIp();
+  if (!ip) return { ok: [], failed: [], error: "no LAN address to serve firmware from" };
+  const url = `http://${ip}:${config.listenPort}/firmware`;
+  const targets = only ? boxes.boxes.filter((b) => b.id === only) : boxes.boxes;
+  if (only && targets.length === 0) return { ok: [], failed: [], error: `no box with id ${only}` };
+
+  const ok = [], failed = [];
+  for (const b of targets) {
+    try {
+      const headers = config.fleetToken ? { "X-Fleet-Token": config.fleetToken } : {};
+      const res = await fetch(`http://${b.ip}/ota`, {
+        method: "POST", body: url, headers, signal: AbortSignal.timeout(5000)
+      });
+      // Only the request to START the update is confirmed here. The download,
+      // the reboot and the health check all happen after this returns — watch
+      // the box's own log, or /health, to see whether it came back.
+      if (res.ok) { ok.push(b.name); console.log(`Told ${b.name} @ ${b.ip} to update from ${url}`); }
+      else { failed.push(`${b.name}: HTTP ${res.status}`); }
+    } catch (err) {
+      failed.push(`${b.name}: ${err.message}`);
+    }
+  }
+  return { ok, failed };
 }
 
 let bonjour = null;

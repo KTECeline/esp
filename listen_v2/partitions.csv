@@ -1,6 +1,23 @@
 # BOX-3 has 16MB flash; the default 1MB app partition was 96% full, which
-# blocked adding anything (QR encoder etc). 4MB app leaves plenty of headroom.
-# Name,   Type, SubType, Offset,  Size
-nvs,      data, nvs,     0x9000,  0x6000
-phy_init, data, phy,     0xf000,  0x1000
-factory,  app,  factory, 0x10000, 4M
+# blocked adding anything (QR encoder etc).
+#
+# OTA layout: TWO app slots, so firmware updates go over WiFi instead of over a
+# USB cable. The running slot is never overwritten — a new image lands in the
+# idle slot and only becomes permanent once it proves it can reach the server
+# (see ota.c). If it can't, the bootloader falls back to the slot that worked.
+# That fallback is the entire reason for two slots: without it, one bad push
+# bricks a box you can no longer reach over the network to fix.
+#
+# nvs keeps its original offset AND size on purpose. Migrating a box to this
+# table costs one final USB flash, and leaving nvs untouched means saved WiFi
+# credentials, server URL and fleet token survive that flash — the fleet does
+# not need re-provisioning. Do not move it.
+#
+# 4M per slot against a ~1.2MB binary is deliberate headroom for the camera and
+# vision work later. This uses 8.25MB of 16MB, so a data partition still fits.
+# Name,   Type, SubType, Offset,   Size
+nvs,      data, nvs,     0x9000,   0x6000
+phy_init, data, phy,     0xf000,   0x1000
+otadata,  data, ota,     0x10000,  0x2000
+ota_0,    app,  ota_0,   0x20000,  4M
+ota_1,    app,  ota_1,   0x420000, 4M

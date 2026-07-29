@@ -66,8 +66,22 @@ export class BoxRegistry {
       // process started, or is on firmware too old to). Live-only, never
       // written to config.json — a customer being at the box right now isn't
       // fleet-registry data.
-      occupied: null
+      occupied: null,
+      // Which firmware the box reported at its last /register. Live-only for
+      // the same reason as `occupied`, and null until it registers — boxes on
+      // pre-OTA firmware never send it, so null means "unknown", not "stale".
+      fw: null
     }));
+  }
+
+  // Record the firmware a box reported when it registered. Deliberately does
+  // NOT persist: this is an observation about a running box, and it changes on
+  // every update, so writing it to config.json would be churn. Keeping it live
+  // also means a restarted server shows "unknown" rather than a remembered
+  // version that may no longer be what's on the hardware.
+  setFirmware(id, fw) {
+    const b = this.byId(id);
+    if (b) b.fw = fw;
   }
 
   // The shape that goes back into config.json's "boxes" array.

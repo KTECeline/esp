@@ -118,16 +118,58 @@ restaurant-specific logic inside mcp-core.
 > **Remaining:** more example agents (a non-restaurant one would prove the
 > claim), and keeping the boundary honest as features land.
 
-## 8. Remote Deployment — *medium*
+## 8. Remote Deployment — *OTA DONE; rest medium*
 
 SSH/IP deployment, remote config updates, remote file transfer.
 
-> The highest-value piece is **OTA firmware updates**. Today every firmware
-> change needs a USB cable, which has been a real friction point. ESP-IDF has
-> built-in OTA support; the 4MB partition would need re-planning for an OTA
-> layout (two app slots).
+**Done (2026-07-29): OTA firmware updates.** `POST /ota` on the box takes a
+firmware URL, downloads into the idle app slot and reboots into it;
+`POST /ota` on mcp-core pushes that to one box (`?box=<id>`) or the whole fleet,
+serving the image from `GET /firmware`. Both are behind `X-Fleet-Token` like
+every other box-facing route. Firmware pushes are **manual on purpose** —
+adoption re-runs every 60s because repointing a box is always safe, whereas
+auto-reflashing the fleet on every build would roll a bad image out unattended.
 
-## 9. Private Networking (Tailscale) — *server side DONE; boxes deferred*
+Safety net, which is the part that matters for a box you can't reach: two app
+slots, so a failed download never touches the running image; and
+`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`, so a new image is only made permanent
+after it has joined WiFi *and* reached its server. An update that breaks
+networking reverts itself instead of stranding the box.
+
+> ❌ **The old note here was wrong** and is worth recording, because it blocked
+> this item for months. It said "the 4MB partition would need re-planning for an
+> OTA layout (two app slots)" — that confused the *app partition* with the
+> *chip*. BOX-3 has **16MB of flash** and was using ~4MB of it; `partitions.csv`
+> even said so on line 1. Two 4MB slots fit with ~7.75MB still spare. There was
+> never a space problem.
+
+**Migration done for BOX-C3B4 (2026-07-29).** The final USB flash landed and
+`nvs` survived exactly as designed — the box rejoined WiFi and re-registered
+with its stored token, never entering provisioning. No more cables for this box.
+
+> ⚠️ **Landmine, found the hard way: `sdkconfig.defaults` is only read when
+> `sdkconfig` does not exist.** `sdkconfig` is gitignored, so the local one
+> (dated Jul 25) predated `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y` and silently
+> ignored it. The partition table still applied (it's read from `partitions.csv`
+> at build time), so *everything looked correct while the entire safety net was
+> absent*: without rollback compiled in, images never enter `PENDING_VERIFY`, so
+> `ota_mark_valid()` and `ota_rollback_if_pending()` both hit their early-return
+> guards and do nothing. Fix is to delete `sdkconfig` and rebuild. **Verify with
+> `grep ROLLBACK sdkconfig`, never by reading `sdkconfig.defaults`.**
+
+**Both halves verified on hardware (2026-07-29), not assumed:**
+- *OTA works*: pushed build downloaded into the idle slot, rebooted, and the
+  reported slot flipped `ota_0` → `ota_1` with a new `fw_sha`. It then survived
+  a reboot still on `ota_1`, proving `ota_mark_valid()` cancelled the rollback.
+- *Rollback works*: pushed again into `ota_0`, then killed mcp-core the moment
+  the box rebooted. It retried `/health` at 2/4/8/16/32s backoff for the full
+  5-minute deadline, logged "could not get online — reverting", and came back on
+  `ota_1` **unattended**. This is the failure that must never strand a box, and
+  it is now a tested path rather than a design intention.
+
+**Still open:** remote config updates and file transfer.
+
+## 9. Private Networking (Tailscale) — *DONE — reverse channel + Funnel, not a VPN on the box*
 
 **Done (2026-07-24):** mcp-core is on the tailnet and reachable from anywhere at
 a stable `100.x` address (and its MagicDNS name) with no port forwarding — the
@@ -143,28 +185,52 @@ order. Tailscale adds a `100.x` interface, so it was one enumeration flip away
 from pushing an unroutable address to every box every 60s and bricking the
 fleet's upload path. CGNAT is now filtered explicitly and the choice is logged.
 
-**Deferred — boxes on the tailnet.** [MicroLink](https://github.com/CamM2325/microlink)
-is genuinely ESP32-S3-optimised and PSRAM-aware, but it does **not** integrate
-with lwIP sockets — it exposes a proprietary `microlink_tcp_*` API, so the
-firmware's entire networking layer (`esp_http_client` ×5 + `esp_http_server` ×4)
-would need rewriting by hand on a library with 9 commits and no tagged releases.
-The lwIP-native alternative, `trombik/esp_wireguard`, would be transparent but is
-self-described alpha and lists neither ESP32-S3 nor ESP-IDF v5.x (we're on
-v5.4.4). Revisit as its own project; **add heap instrumentation first** — there
-is no `heap_caps_get_free_size()` anywhere in the firmware today, the "~300KB
-free" figure below is boot-time and unreproducible, and there's a 64KB
-internal-SRAM spike during every `/play`.
+**Superseded — boxes don't need to be on the tailnet after all (2026-07-30).**
+The plan below (MicroLink / esp_wireguard) is now moot. The reverse WebSocket
+channel (`ws_client.c`, shipped 2026-07-29) already lets mcp-core reach a box
+from anywhere — the box dials OUT, so no VPN client on the chip is needed.
+Point `ws_url` in `config.json` at a **Tailscale Funnel** address (a normal
+public `wss://` endpoint mcp-core already answers on `/ws`) and any box on any
+WiFi can be reached, LAN or not. Verified live: a box on a home network,
+mcp-core on a laptop on the same network, talking over the public internet via
+Funnel rather than the LAN — `esp_speak` round-tripped in ~9s.
 
-> This would **structurally fix** the recurring "the server's IP changed" pain:
-> both ends get a fixed private IP regardless of the physical network.
-> ⚠️ **Two honest cautions.**
-> **Memory:** MicroLink needs ~100KB SRAM. The box has ~300KB internal SRAM free
-> at boot (MEASURED) alongside 16MB PSRAM — so it's roughly a third of the fast
-> RAM, on top of mic/display/touch/radar. Measure free heap *under load*, not at
-> boot, before trusting it fits.
-> **Maturity vs "must be stable":** it's a young project (few commits, first
-> releases this year). Those two goals are in tension — adopt it deliberately,
-> with time to test, never right before a demo.
+Two real bugs surfaced getting there, both now fixed, both worth recording
+because neither was hit until the reverse channel *actually* carried traffic
+over a public relay for the first time — LAN-only testing could never have
+found either one:
+
+- **DNS.** MEASURED: the WiFi router's own DNS resolver returned `NXDOMAIN` for
+  the Funnel hostname (a mesh router, likely filtering anything that looks
+  VPN/tunnel-shaped) while a public resolver answered it fine — `esp-tls`
+  failed with `ESP_ERR_ESP_TLS_CANNOT_RESOLVE_HOSTNAME` on every connect
+  attempt. Fixed by overriding DNS to `1.1.1.1`/`1.0.0.1` in the
+  `IP_EVENT_STA_GOT_IP` handler (`listen_v2.c`), reapplied on every IP
+  acquisition including DHCP renewal. **Any future client site could hit the
+  same wall** if their router does similar filtering — this fix generalizes to
+  that case for free.
+- **Heap exhaustion → hard crash.** MEASURED: the very first clip played over
+  a *live* `wss://` reverse channel crashed the box (`assert failed:
+  xStreamBufferBytesAvailable`). Root cause: `CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC`
+  keeps the TLS session's buffers in internal SRAM for the connection's whole
+  lifetime; combined with the 64KB internal-SRAM ring buffer `play_begin()`
+  allocates per clip, internal heap ran out and `xStreamBufferCreate()`
+  returned NULL — which nothing checked, so the first FreeRTOS call on that
+  NULL handle asserted and rebooted the box. This is exactly the heap-pressure
+  risk this section already warned about *before* it was ever measured. Fixed
+  two ways: `CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y` moves TLS buffers to the 16MB
+  PSRAM instead, and `play_begin()`/`play_feed()` now check the allocation and
+  skip the clip instead of crashing if it ever fails again regardless of cause.
+- **Still true, still open:** there is still no `heap_caps_get_free_size()`
+  anywhere in the firmware. This bug was root-caused by reasoning from the
+  sdkconfig, not from an actual heap reading — real instrumentation would have
+  shown it directly and would catch the *next* heap surprise faster than
+  another crash-and-diagnose cycle.
+- Also worth knowing: **rollback did not protect against this.** The crashed
+  image had already reached the server and called `ota_mark_valid()` *before*
+  the crash, so it was confirmed and stuck — rollback only guards "can't get
+  online," not "runs, but has a bug." A push that boots and phones home can
+  still need a second push to actually fix.
 
 ## 10. Vision Tool (esp-see) — *todo, blocked on item 4 hardware*
 
@@ -175,13 +241,16 @@ QR, recognise objects on request.
 > `esp_list_boxes`) — the pattern is proven, so this is mostly gated on the
 > camera hardware, not on architecture.
 
-## 11. Remote Fleet Control — *depends on item 9*
+## 11. Remote Fleet Control — *the LAN-only limit is gone*
 
 Remote access to every box, status monitoring, remote speech/display, restart
 and update, central dashboard.
 
-> The MCP tool surface already does remote speech/display and box listing — over
-> the LAN. Item 9 is what extends that beyond the local network.
+> The MCP tool surface already does remote speech/display and box listing.
+> The thing that used to gate this beyond the LAN — item 9 — is now resolved by
+> the reverse channel + Funnel, not by a separate project. `esp_speak`,
+> `esp_display` and OTA pushes already work over that path. What's left here is
+> a dashboard/status UI, not connectivity.
 
 ---
 
@@ -191,9 +260,13 @@ and update, central dashboard.
    session-clear mechanism first, given the top-button constraint.
 2. **Item 7** finish (a second, non-restaurant example agent) — cheap, proves
    the platform claim.
-3. **Item 3** remaining hardening + **item 8** OTA — removes the two biggest
-   day-to-day friction points (network changes, USB flashing).
-4. **Item 9** Tailscale — do it calmly, with test time; it makes item 11 real.
+3. ~~**Item 3** remaining hardening + **item 8** OTA~~ — OTA landed 2026-07-29
+   and BOX-C3B4 is migrated onto the OTA table, with both the update path and
+   the rollback path verified on hardware. The USB-cable friction is gone.
+   Any future box still needs that one migration flash. Item 3's remaining piece
+   (auto-recovery after a network interruption) is still open.
+4. ~~**Item 9** Tailscale~~ — done 2026-07-30 via reverse channel + Funnel
+   (not the VPN-on-the-box plan this used to point to). Item 11 is real now.
 5. **Item 4/10** camera + vision — once hardware is chosen.
 6. **Items 5/6** healthcare — gate on the privacy/legal answer before building.
 
@@ -210,14 +283,15 @@ Item	Evidence
 2. Radar/presence	Nothing to build — roadmap itself concludes there's no polling cost to reclaim; folded into item 1.
 3. Network reliability	Largely done: /server push + auto-adopt (97307b8), hold-BOOT-5s fixed during pre-READY (461da4f), mDNS crash-guard + MDNS_DISABLE. Remaining: better auto-recovery after an interruption (currently needs reboot/manual repoint).
 7. Flexible MCP (partial)	Verified — no restaurant strings anywhere in mcp-core, own README + registry manifest exist (5356fb1).
+8. OTA firmware updates	Done 2026-07-29 — two app slots + auto-rollback; POST /ota on box and on mcp-core, image served from GET /firmware, all behind X-Fleet-Token. The "4MB partition blocks this" note was simply wrong: the chip has 16MB. BOX-C3B4 migrated to the OTA table the same day with nvs preserved (no re-provisioning), and BOTH the update and the unattended-rollback paths were exercised on real hardware. Boxes now report fw/fw_sha/slot/pending_verify on /register, surfaced via esp_list_boxes — the only way to catch a silent revert, since a rolled-back box looks perfectly healthy on the older image. Caught en route: sdkconfig.defaults never reached the local sdkconfig, so rollback was compiled OUT while looking enabled — see item 8's landmine note.
 9. Tailscale (server side)	Done 2026-07-24 — mcp-core reachable on tailnet at stable 100.x address, no port forwarding; X-Fleet-Token now authenticates all box endpoints and mcp-core's box-facing routes (closes the "anyone on WiFi could repoint a box" hole). Also fixed lanIp() CGNAT-filtering bug this surfaced.
+9. Tailscale (boxes reachable anywhere)	Done 2026-07-30 — NOT via a VPN on the box (that plan is superseded). ws_url in config.json points the existing reverse channel at a Tailscale Funnel address; mcp-core reaches a box from anywhere without the box being on the tailnet. Verified live with esp_speak over the public Funnel URL. Found and fixed two real bugs surfaced only by this being the first time the reverse channel carried real traffic over a public relay: (1) the WiFi router's own DNS returned NXDOMAIN for the Funnel hostname while a public resolver answered fine — fixed by overriding DNS to 1.1.1.1/1.0.0.1 in firmware; (2) a live wss:// session's TLS buffers competing with the 64KB per-clip audio ring buffer for internal SRAM caused xStreamBufferCreate() to return NULL, which nothing checked, crashing the box on an unhandled assert — fixed via CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y (TLS buffers move to PSRAM) plus defensive alloc checks in play_begin()/play_feed(). Rollback did NOT catch the crash (the image had already confirmed itself before crashing) — a reminder that rollback only covers "can't get online," not "runs but has a bug." heap_caps_get_free_size() is still absent from the firmware; this bug was root-caused from sdkconfig reasoning, not a heap reading.
+11. Remote fleet control	Done — the LAN-only limit is gone now that #9 covers both halves. esp_speak/esp_display/OTA all work over the reverse channel + Funnel from anywhere. What's left is a dashboard/status UI, not connectivity.
 Not started
 Item	Status
 4. Camera & QR	Zero commits. The cheap half (displaying a payment QR) is buildable today and isn't done. Scanning still needs camera hardware.
 5. Healthcare	Not started — correctly gated on a privacy/legal answer first.
 6. Fall detection	Not started — gated on #5.
 7. Flexible MCP (remainder)	Only agents/restaurant exists — the second, non-restaurant example agent that would prove the platform claim hasn't been built.
-8. Remote deployment / OTA	Not started. Every firmware change still needs a USB cable — this is real, current friction, not hypothetical.
-9. Tailscale (boxes on tailnet)	Deferred, not started — MicroLink doesn't integrate with lwIP sockets (would need a full networking-layer rewrite); esp_wireguard is alpha and untested on ESP32-S3/IDF v5.x. Revisit as its own project once heap instrumentation exists to check it actually fits. (Server side is done — see above.)
+8. Remote deployment / OTA	OTA done 2026-07-29 — moved to the Done list above. Remote config updates and file transfer are still not started.
 10. Vision (esp-see)	Not started — blocked on #4's hardware.
-11. Remote fleet control	The LAN half already works (MCP tools do remote speech/display/listing today); the beyond-LAN half depends entirely on #9.

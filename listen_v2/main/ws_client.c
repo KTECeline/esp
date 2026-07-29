@@ -278,12 +278,17 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     case WEBSOCKET_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "reverse channel disconnected (auto-reconnecting)");
         s_state = WS_IDLE;
+        // Resetting the parser is not enough: a clip already handed to
+        // play_begin() has an open codec and a task waiting for bytes that will
+        // never arrive now. Left alone it holds the speaker open and buzzes.
+        play_abort(&s_play);
         break;
     case WEBSOCKET_EVENT_DATA:
         if (d->data_len > 0) on_data(d);
         break;
     case WEBSOCKET_EVENT_ERROR:
         ESP_LOGW(TAG, "reverse channel error");
+        play_abort(&s_play);   // same reasoning as DISCONNECTED
         break;
     default: break;
     }

@@ -88,7 +88,7 @@ export function createMcpServer({ boxes, speakToBox }) {
     {
       title: "List ESP Boxes",
       description:
-        "Lists every ESP32-S3-BOX voice device registered with this server, whether each is currently reachable, and whether each currently has a customer at it. Call this first to discover valid box_id values for esp_speak and esp_display.\n\nArgs:\n  (none)\n\nReturns:\n  { \"boxes\": [{ \"id\": string, \"name\": string, \"ip\": string, \"online\": boolean, \"occupied\": boolean|null }] }\n\nExamples:\n  - Use when: you need to know which boxes exist, which are powered on, or which currently have someone at them\n  - Don't use when: there is exactly one box and you already know it responds\n\nError Handling:\n  - Never errors; an empty list means no box has registered yet\n  - online=false means the box did not answer within 2s (powered off, or off-network)\n  - occupied is null until the box reports its first session event (a customer approaching, or ordering) since this server started",
+        "Lists every ESP32-S3-BOX voice device registered with this server, whether each is currently reachable, and whether each currently has a customer at it. Call this first to discover valid box_id values for esp_speak and esp_display.\n\nArgs:\n  (none)\n\nReturns:\n  { \"boxes\": [{ \"id\": string, \"name\": string, \"ip\": string, \"online\": boolean, \"occupied\": boolean|null, \"fw\": string, \"fw_sha\": string, \"slot\": string, \"pending_verify\": boolean }] }\n\nExamples:\n  - Use when: you need to know which boxes exist, which are powered on, or which currently have someone at them\n  - Don't use when: there is exactly one box and you already know it responds\n\nError Handling:\n  - Never errors; an empty list means no box has registered yet\n  - online=false means the box did not answer within 2s (powered off, or off-network)\n  - occupied is null until the box reports its first session event (a customer approaching, or ordering) since this server started\n  - fw/fw_sha/slot describe the firmware actually running: fw_sha changes on every rebuild (fw alone does not), and slot is the app partition it booted from. After a firmware push they are the way to confirm the new image stuck — a box that rolled back reports the OLD build while looking perfectly healthy\n  - pending_verify=true means the box is running a just-installed image that has not yet confirmed itself; it will either confirm or revert on its own\n  - all four are absent for boxes that have not registered since this server started, or that run pre-OTA firmware",
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -104,7 +104,10 @@ export function createMcpServer({ boxes, speakToBox }) {
           name: b.name,
           ip: b.ip,
           online: await probeOnline(b),
-          occupied: b.occupied
+          occupied: b.occupied,
+          // Spread so a box that has never registered contributes no fw keys at
+          // all, rather than a row of nulls that reads like a failed update.
+          ...(b.fw ?? {})
         }))
       );
       return mcpJson({ boxes: list });

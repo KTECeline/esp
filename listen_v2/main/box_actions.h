@@ -21,6 +21,10 @@ typedef struct {
     StreamBufferHandle_t ring;
     SemaphoreHandle_t done;
     uint32_t total_bytes;
+    // Set to make the playback task stop early instead of waiting out its
+    // 3s starvation timeout. Needed because a dropped transport stops feeding
+    // the ring without ever delivering the byte count play_begin() promised.
+    volatile bool abort_now;
 } playback_task_args_t;
 
 typedef struct {
@@ -34,6 +38,10 @@ typedef struct {
     playback_task_args_t args;
     play_opts_t opts;
     TickType_t end_tick;
+    // True between play_begin() and play_finish_audio()/play_abort(). Lets a
+    // transport tear down a clip it can no longer feed without having to track
+    // that state itself, and makes the teardown idempotent.
+    bool active;
 } play_session_t;
 
 // h is the 44-byte WAV header; body_len is the PCM byte count that follows.
@@ -42,6 +50,11 @@ void play_begin(play_session_t *ps, const uint8_t h[44], uint32_t body_len,
 void play_feed(play_session_t *ps, const void *data, size_t len);
 // Blocks until the audio has finished leaving the speaker.
 void play_finish_audio(play_session_t *ps);
+// Give up on a clip whose transport died mid-stream. Without this the codec is
+// left open and the still-enabled I2S TX channel keeps re-clocking its last DMA
+// buffer — an audible glitch loop until the box is rebooted — and the clip's
+// 64KB ring buffer is never freed. Safe to call when nothing is playing.
+void play_abort(play_session_t *ps);
 // Screen + auto-listen policy. Call AFTER acknowledging the transport, so the
 // 3.5s caption linger doesn't delay the server's next turn.
 void play_after(play_session_t *ps);
