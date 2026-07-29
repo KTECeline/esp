@@ -3,6 +3,7 @@
 Fully local voice pipeline for the ESP32-S3-BOX-3. No cloud, no API keys.
 ~/esp/start_voice_assistant.sh 
 ~/esp/check_health.sh
+~/esp/point_box_at_me.sh 192.168.68.142
 
 cd ~/esp/listen_v2 && source idfenv.sh 
 idf.py build     
@@ -84,7 +85,7 @@ fleet. This is the "pull and use" surface — it is not Claude-specific.
 
 ```
 any MCP client  ->  http://<host>:8000/mcp  ->  ESP fleet
-                    (Streamable HTTP, stateless, no auth — LAN only)
+                    (Streamable HTTP, stateless; Bearer token when configured)
 ```
 
 | Tool | Arguments | Does |
@@ -106,12 +107,62 @@ curl -s http://<host>:8000/mcp \
 
 Claude Code, as one example client:
 ```bash
-claude mcp add --transport http mcp-core http://<mac-ip>:8000/mcp
+claude mcp add --transport http mcp-core http://<mac-ip>:8000/mcp \
+  --header "Authorization: Bearer $ESP_MCP_TOKEN"
 ```
 
-> **Note:** `/mcp` has no authentication — fine on a trusted LAN, but it combines
-> device discovery *and* speaker/display control in one endpoint. Add a bearer token
-> or bind to localhost before exposing it any wider.
+## Security
+
+Two independent shared secrets, both read **only** from environment variables
+(never from `config.json`), kept in a gitignored `~/esp/.env` that
+`start_voice_assistant.sh` sources:
+
+| Secret | Config key | Protects |
+|---|---|---|
+| `ESP_FLEET_TOKEN` | `fleet_token_env` | Box ↔ server traffic, as `X-Fleet-Token` |
+| `ESP_MCP_TOKEN` | `mcp_token_env` | The `/mcp` tool surface, as `Authorization: Bearer` |
+
+They're separate on purpose: one authenticates **hardware**, the other
+authenticates **MCP clients**, and leaking one must not grant the other.
+
+**Why the fleet token matters.** The box's own HTTP server is on the LAN, and
+without a token anyone on the same WiFi could `POST /server` to permanently
+repoint where its microphone uploads — or `POST /play` with `X-Auto-Listen` to
+force a recording. With `fleet_token_env` set, all four box endpoints
+(`/play`, `/caption`, `/order`, `/server`) require the header, and mcp-core's
+box-facing routes do too. `/health` stays open for `check_health.sh` but hides
+the box inventory unless authenticated.
+
+**Rollout is safe in any order.** A box enforces only once it *holds* a token,
+and the only way it gets one is the server's `/server` adopt push
+(trust-on-first-use on your own LAN). So you can never lock yourself out — a box
+that rejects you is rejecting with a secret the server knows. To re-key: hold
+BOOT 5s on the box (wipes the token with the WiFi credentials) and re-provision.
+
+Leaving `fleet_token_env` unset keeps the old open behavior, and mcp-core prints
+`Fleet auth: OFF` at startup so the state is never ambiguous.
+
+## Remote access over Tailscale
+
+mcp-core is reachable on the machine's tailnet address, so you can drive the
+fleet from anywhere without port forwarding — and that address never changes,
+which is the permanent fix for "the server's IP moved":
+
+```bash
+curl -s http://<tailnet-ip>:8000/mcp -H "Authorization: Bearer $ESP_MCP_TOKEN" ...
+# MagicDNS names work too: http://<host>.<tailnet>.ts.net:8000/mcp
+```
+
+The boxes themselves are **not** on the tailnet — they stay LAN devices and
+reach mcp-core over the LAN, which is exactly why the fleet token (not the VPN)
+is what protects them.
+
+> ⚠️ **`lanIp()` must never return a tailnet address.** `adoptKnownBoxes()` pushes
+> whatever it returns to every box every 60s, and boxes can't route to `100.64/10`
+> — a wrong pick would brick the fleet's upload path until each box was physically
+> re-provisioned. CGNAT addresses are filtered explicitly, an interface sharing a
+> subnet with a known box is preferred, `lan_ip` in `config.json` overrides, and
+> the chosen address is logged at startup so a bad pick is visible immediately.
 
 ## 1. Start the full stack
 

@@ -10,6 +10,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
     "bonjour-service": "^1.4.3",
+    "ws": "^8.21.1",
     "zod": "^4.4.3"
   }
 }

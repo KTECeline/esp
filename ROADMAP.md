@@ -127,11 +127,33 @@ SSH/IP deployment, remote config updates, remote file transfer.
 > built-in OTA support; the 4MB partition would need re-planning for an OTA
 > layout (two app slots).
 
-## 9. Private Networking (Tailscale) — *high, must be stable*
+## 9. Private Networking (Tailscale) — *server side DONE; boxes deferred*
 
-Run Tailscale on mcp-core and devices; talk over private VPN IPs; drop manual
-port forwarding. Candidate: [MicroLink](https://github.com/CamM2325/microlink)
-(ESP-IDF Tailscale client).
+**Done (2026-07-24):** mcp-core is on the tailnet and reachable from anywhere at
+a stable `100.x` address (and its MagicDNS name) with no port forwarding — the
+structural fix for "the server's IP moved". Shipped alongside it, because
+Tailscale alone did **not** meet the stated goal of "other people can't control
+it": the boxes keep a LAN listener regardless, so a **fleet shared secret**
+(`X-Fleet-Token`) now authenticates all four box endpoints and mcp-core's
+box-facing routes. See README → Security. Before this, anyone on the same WiFi
+could `POST /server` and permanently repoint a box's microphone upload URL.
+
+Also fixed: `lanIp()` used to return the first non-internal IPv4 in enumeration
+order. Tailscale adds a `100.x` interface, so it was one enumeration flip away
+from pushing an unroutable address to every box every 60s and bricking the
+fleet's upload path. CGNAT is now filtered explicitly and the choice is logged.
+
+**Deferred — boxes on the tailnet.** [MicroLink](https://github.com/CamM2325/microlink)
+is genuinely ESP32-S3-optimised and PSRAM-aware, but it does **not** integrate
+with lwIP sockets — it exposes a proprietary `microlink_tcp_*` API, so the
+firmware's entire networking layer (`esp_http_client` ×5 + `esp_http_server` ×4)
+would need rewriting by hand on a library with 9 commits and no tagged releases.
+The lwIP-native alternative, `trombik/esp_wireguard`, would be transparent but is
+self-described alpha and lists neither ESP32-S3 nor ESP-IDF v5.x (we're on
+v5.4.4). Revisit as its own project; **add heap instrumentation first** — there
+is no `heap_caps_get_free_size()` anywhere in the firmware today, the "~300KB
+free" figure below is boot-time and unreproducible, and there's a 64KB
+internal-SRAM spike during every `/play`.
 
 > This would **structurally fix** the recurring "the server's IP changed" pain:
 > both ends get a fixed private IP regardless of the physical network.
@@ -180,3 +202,22 @@ and update, central dashboard.
 - **Manglish/accent STT accuracy is still unmeasured on real human speech.** The
   eval tooling exists; the test set doesn't. This is the project's biggest
   untested assumption, and it sits underneath every use case above.
+
+
+Done
+Item	Evidence
+1. Session lifecycle	d68a665 — the button blocker is fully resolved: sessions now start on presence/touch/BOOT and auto-clear on presence-departure (SESSION_ABSENT_MS), with the timer fed by interaction too (fixed a real "4 greetings in 70s" bug found on hardware). Server-scoped /session-end per box, isolation verified between boxes. This closes the exact gap flagged in the review — the roadmap text under item 1 is now stale, it still says "what's missing is a real session concept."
+2. Radar/presence	Nothing to build — roadmap itself concludes there's no polling cost to reclaim; folded into item 1.
+3. Network reliability	Largely done: /server push + auto-adopt (97307b8), hold-BOOT-5s fixed during pre-READY (461da4f), mDNS crash-guard + MDNS_DISABLE. Remaining: better auto-recovery after an interruption (currently needs reboot/manual repoint).
+7. Flexible MCP (partial)	Verified — no restaurant strings anywhere in mcp-core, own README + registry manifest exist (5356fb1).
+9. Tailscale (server side)	Done 2026-07-24 — mcp-core reachable on tailnet at stable 100.x address, no port forwarding; X-Fleet-Token now authenticates all box endpoints and mcp-core's box-facing routes (closes the "anyone on WiFi could repoint a box" hole). Also fixed lanIp() CGNAT-filtering bug this surfaced.
+Not started
+Item	Status
+4. Camera & QR	Zero commits. The cheap half (displaying a payment QR) is buildable today and isn't done. Scanning still needs camera hardware.
+5. Healthcare	Not started — correctly gated on a privacy/legal answer first.
+6. Fall detection	Not started — gated on #5.
+7. Flexible MCP (remainder)	Only agents/restaurant exists — the second, non-restaurant example agent that would prove the platform claim hasn't been built.
+8. Remote deployment / OTA	Not started. Every firmware change still needs a USB cable — this is real, current friction, not hypothetical.
+9. Tailscale (boxes on tailnet)	Deferred, not started — MicroLink doesn't integrate with lwIP sockets (would need a full networking-layer rewrite); esp_wireguard is alpha and untested on ESP32-S3/IDF v5.x. Revisit as its own project once heap instrumentation exists to check it actually fits. (Server side is done — see above.)
+10. Vision (esp-see)	Not started — blocked on #4's hardware.
+11. Remote fleet control	The LAN half already works (MCP tools do remote speech/display/listing today); the beyond-LAN half depends entirely on #9.

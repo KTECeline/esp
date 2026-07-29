@@ -22,8 +22,9 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { Bonjour } from "bonjour-service";
 import { loadConfig, loadRawConfig, writeConfig, ESP_ROOT } from "./config.js";
-import { BoxRegistry, asciiOneline, sendCaption, sendAudio, sendDisplay } from "./boxes.js";
+import { BoxRegistry, asciiOneline, sendCaption, sendAudio, sendDisplay, setFleetToken, isCgnat } from "./boxes.js";
 import { createMcpServer } from "./mcp-tools.js";
+import { startWsHub, setWsFleetToken, wsHas } from "./ws-hub.js";
 
 const config = loadConfig();
 // The raw parsed config is kept for round-tripping: box self-registration
@@ -158,6 +159,10 @@ async function getGreetingAudio() {
 // customer orders by tapping the screen, which records immediately. Starting a
 // recording here instead would capture the room while they're still deciding.
 async function handleWake(box) {
+  // A presence-triggered wake IS a session start — mark it here rather than
+  // adding a second round-trip, since the box is already calling us for the
+  // greeting audio anyway.
+  boxes.setOccupied(box.id, true);
   const t0 = nowMs();
   const wav = await getGreetingAudio();
   console.log(`[${box.name}] greeting ready at +${nowMs() - t0}ms, sending to box...`);
@@ -402,6 +407,18 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify(obj));
   };
 
+  // Shared-secret gate for the box-facing surface. Note X-Box-Id is NOT auth:
+  // it's MAC-derived, logged, and fromId() auto-registers unknown ids — it
+  // says who you claim to be, not that you're allowed. This is the check that
+  // stops a stranger on the same WiFi driving the hardware.
+  //
+  // Open until fleet_token_env is configured, so an existing deployment keeps
+  // running until the token is deliberately rolled out to the boxes.
+  const fleetAuthed = () =>
+    !config.fleetToken || req.headers["x-fleet-token"] === config.fleetToken;
+  const denyFleet = () =>
+    json(401, { error: "unauthorized — missing or wrong X-Fleet-Token" });
+
   try {
     // MCP tool surface (Streamable HTTP). Must be routed BEFORE any readBody()
     // — the transport needs the raw, unconsumed request stream.
@@ -428,15 +445,25 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && req.url === "/health") {
+      // Liveness stays open so check_health.sh works with no secrets, but the
+      // box inventory is exactly the target list for an attack on the boxes
+      // (id + IP for each), so it's only returned to an authenticated caller.
+      const base = { status: "ok", mcpConnected: mcpClient !== null, backends: config.priority };
+      if (!fleetAuthed()) return json(200, { ...base, boxCount: boxes.boxes.length });
       return json(200, {
-        status: "ok",
-        mcpConnected: mcpClient !== null,
-        backends: config.priority,
-        boxes: boxes.boxes.map((b) => ({ id: b.id, name: b.name, ip: b.ip }))
+        ...base,
+        // `channel` tells you HOW a box is reachable — "ws" means it holds a
+        // reverse channel and can be pushed to from any network; "lan" means
+        // pushes only work while it shares this machine's network.
+        boxes: boxes.boxes.map((b) => ({
+          id: b.id, name: b.name, ip: b.ip, channel: wsHas(b.id) ? "ws" : "lan",
+          occupied: b.occupied   // null = box hasn't reported a session event yet
+        }))
       });
     }
 
     if (req.method === "POST" && req.url === "/upload") {
+      if (!fleetAuthed()) return denyFleet();
       const box = boxes.fromId(req);
       if (!box) {
         // No silent IP-based guessing: a request without an identity is a bug
@@ -455,6 +482,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && req.url === "/wake") {
+      if (!fleetAuthed()) return denyFleet();
       const box = boxes.fromId(req);
       if (!box) {
         return json(400, { error: "missing X-Box-Id header — flash current firmware" });
@@ -470,7 +498,23 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // Touch/BOOT-started sessions skip the greeting on purpose (the customer
+    // is already engaging), so unlike a presence start there's no /wake call
+    // to piggyback occupied-status on — this is that missing signal.
+    if (req.method === "POST" && req.url === "/session-start") {
+      if (!fleetAuthed()) return denyFleet();
+      const box = boxes.fromId(req);
+      if (!box) {
+        return json(400, { error: "missing X-Box-Id header — flash current firmware" });
+      }
+      await readBody(req);
+      boxes.setOccupied(box.id, true);
+      console.log(`[${box.name}] session started (touch/BOOT)`);
+      return json(200, { ok: true });
+    }
+
     if (req.method === "POST" && req.url === "/confirm") {
+      if (!fleetAuthed()) return denyFleet();
       const box = boxes.fromId(req);
       if (!box) {
         return json(400, { error: "missing X-Box-Id header — flash current firmware" });
@@ -490,6 +534,7 @@ const server = http.createServer(async (req, res) => {
     // Box self-registration: fired by the firmware right after it gets an IP,
     // so config.json learns/refreshes the box without manual editing.
     if (req.method === "POST" && req.url === "/register") {
+      if (!fleetAuthed()) return denyFleet();
       let parsed;
       try {
         parsed = JSON.parse((await readBody(req)).toString("utf8"));
@@ -510,11 +555,13 @@ const server = http.createServer(async (req, res) => {
     // telling us to forget them. Scoped to THAT box (unlike /reset, which
     // wipes the whole fleet), so one kiosk clearing does not disturb another.
     if (req.method === "POST" && req.url === "/session-end") {
+      if (!fleetAuthed()) return denyFleet();
       const box = boxes.fromId(req);
       if (!box) {
         return json(400, { error: "missing X-Box-Id header — flash current firmware" });
       }
       await readBody(req);
+      boxes.setOccupied(box.id, false);
       llmHistoryByBox.delete(box.id);
       pendingByBox.delete(box.id);
       // Webhook backends keep their own per-session state, keyed by the same
@@ -536,6 +583,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && req.url === "/reset") {
+      if (!fleetAuthed()) return denyFleet();
       llmHistoryByBox.clear();
       pendingByBox.clear();
       // Reset every webhook backend, not just one called "agent" — backends are
@@ -562,13 +610,34 @@ const server = http.createServer(async (req, res) => {
 // resolves the fixed hostname itself after joining WiFi.
 // This machine's primary LAN IPv4 — the address a box on the same WiFi should
 // be sending its recordings to.
+//
+// This must NEVER return a tailnet address. adoptKnownBoxes() pushes whatever
+// this returns to every box every 60s and the box persists it to NVS; boxes are
+// not on the tailnet, so a 100.x here would silently brick the whole fleet's
+// upload path and need a physical re-provision per box to undo. The old version
+// returned the first non-internal IPv4 in enumeration order, which becomes a
+// coin flip the moment a VPN interface exists.
 function lanIp() {
-  for (const list of Object.values(networkInterfaces())) {
+  // Explicit override always wins — for when the heuristics below guess wrong.
+  if (config.lanIp) return config.lanIp;
+
+  const candidates = [];
+  for (const [name, list] of Object.entries(networkInterfaces())) {
     for (const ni of list || []) {
-      if (ni.family === "IPv4" && !ni.internal) return ni.address;
+      if (ni.family !== "IPv4" || ni.internal) continue;
+      if (isCgnat(ni.address)) continue;   // Tailscale et al — boxes can't route here
+      candidates.push({ name, address: ni.address });
     }
   }
-  return null;
+  if (candidates.length === 0) return null;
+
+  // Prefer an address on the same /24 as a box we already know about — that's
+  // provably the interface that can reach the fleet, not a guess.
+  for (const c of candidates) {
+    const prefix = c.address.slice(0, c.address.lastIndexOf(".") + 1);
+    if (boxes.boxes.some((b) => b.host.startsWith(prefix))) return c.address;
+  }
+  return candidates[0].address;
 }
 
 // Tell every known box where we actually are, right now.
@@ -587,8 +656,19 @@ async function adoptKnownBoxes(reason) {
   const url = `http://${ip}:${config.listenPort}/upload`;
   for (const b of boxes.boxes) {
     try {
+      // The adopt push doubles as token delivery (trust-on-first-use): a box
+      // with no token stored accepts and saves this one, and only starts
+      // enforcing afterwards. That's why a box can never lock us out — the
+      // token it enforces is one we handed it.
+      const headers = config.fleetToken ? { "X-Fleet-Token": config.fleetToken } : {};
+      // Same push also hands over the reverse-channel URL, so a box learns
+      // where to dial without a separate provisioning step. Defaults to this
+      // machine on the LAN; set ws_url in config.json to a public relay
+      // (e.g. a Tailscale Funnel wss:// address) to make boxes reachable from
+      // networks that have no route to this LAN at all.
+      headers["X-Ws-Url"] = config.wsUrl || `ws://${ip}:${config.listenPort}/ws`;
       const res = await fetch(`http://${b.ip}/server`, {
-        method: "POST", body: url, signal: AbortSignal.timeout(3000)
+        method: "POST", body: url, headers, signal: AbortSignal.timeout(3000)
       });
       if (res.ok) console.log(`Pointed ${b.name} @ ${b.ip} at ${url} (${reason})`);
     } catch { /* offline / old firmware / different subnet — nothing to do */ }
@@ -619,11 +699,21 @@ function startMdnsAdvertiser() {
 }
 
 async function main() {
+  setFleetToken(config.fleetToken);
+  setWsFleetToken(config.fleetToken);
+  // Shares the main HTTP server (one port, one thing to expose). Started before
+  // listen() so no box can race the upgrade handler.
+  startWsHub(server, { path: "/ws" });
   mcpClient = await connectToMcpServer();
   server.listen(config.listenPort, () => {
     console.log(`mcp-core listening on port ${config.listenPort}`);
     console.log(`Backends (priority order): ${config.priority.join(" -> ")}`);
     console.log(`Boxes: ${boxes.boxes.map((b) => `${b.name}@${b.ip}`).join(", ")}`);
+    // Logged explicitly: this is the address pushed to every box, and a wrong
+    // pick (e.g. a VPN interface) is otherwise invisible until the fleet breaks.
+    console.log(`LAN address boxes are told to use: ${lanIp() || "(none found)"}`);
+    console.log(`Fleet auth: ${config.fleetToken ? "ON" : "OFF (set fleet_token_env to enable)"}`
+              + ` | /mcp auth: ${config.mcpToken ? "ON" : "OFF"}`);
     startMdnsAdvertiser();
     // Immediately, then on a slow timer: a box that booted before us, or that
     // is pointed at a stale address after this machine changed networks, gets

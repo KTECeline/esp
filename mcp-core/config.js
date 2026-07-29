@@ -52,6 +52,20 @@ function backendTimeout(bc, type) {
   return type === "webhook" ? 120000 : 10000;
 }
 
+// Secrets are read from the environment only, never from config.json — a real
+// credential already leaked out of this repo once via a committed file.
+// `warning` says what degrades if the variable is missing, so an unset token is
+// loud at startup instead of a confusing 401 later.
+function envToken(envName, key, warning) {
+  if (!envName) return null;
+  const v = process.env[envName];
+  if (!v) {
+    console.warn(`${key} "${envName}" is not set in the environment — ${warning}. ` +
+                 `Export it, or remove ${key}.`);
+  }
+  return v || null;
+}
+
 // The untouched parsed JSON — for callers that need to WRITE the config back
 // (box self-registration). loadConfig() below returns a derived/validated
 // shape that drops fields; round-tripping that would silently lose them.
@@ -150,15 +164,21 @@ export function loadConfig() {
     // Gates /mcp when set — see server.js. Same env-var-only rule as backend
     // tokens: a real credential already leaked out of this repo once via a
     // committed file, so this is never read from config.json directly.
-    mcpToken: (() => {
-      if (!cfg.mcp_token_env) return null;
-      const v = process.env[cfg.mcp_token_env];
-      if (!v) {
-        console.warn(`mcp_token_env "${cfg.mcp_token_env}" is not set in the environment — ` +
-                     `/mcp will run WITHOUT auth. Export it, or remove mcp_token_env.`);
-      }
-      return v || null;
-    })(),
+    mcpToken: envToken(cfg.mcp_token_env, "mcp_token_env", "/mcp will run WITHOUT auth"),
+    // Shared secret between this server and the boxes, sent as X-Fleet-Token.
+    // DIFFERENT audience from mcpToken on purpose: mcpToken authenticates your
+    // MCP *clients* (Claude, agents), fleetToken authenticates your *hardware*.
+    // One leaking must not grant the other.
+    fleetToken: envToken(cfg.fleet_token_env, "fleet_token_env",
+                         "boxes and box-facing routes will run WITHOUT auth"),
+    // Explicit override for which local address boxes should be told to reach
+    // us on. Normally auto-detected (see lanIp() in server.js) — set this when
+    // the machine has several interfaces and the guess is wrong.
+    lanIp: cfg.lan_ip || null,
+    // Where boxes should dial their reverse channel. Empty = derive
+    // ws://<lanIp>:<port>/ws, which only helps boxes on this LAN. Point it at
+    // a public relay (Tailscale Funnel) to reach boxes on any network.
+    wsUrl: cfg.ws_url || null,
     configPath: CONFIG_PATH
   };
 }

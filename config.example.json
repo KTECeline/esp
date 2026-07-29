@@ -39,5 +39,22 @@
   "listen_port": 8000,
   "greeting_text": "Hi! How can I help you today?",
   "_mcp_token_help": "Optional. Set mcp_token_env to the name of an env var holding a bearer token, and /mcp will require 'Authorization: Bearer <token>'. Leave unset for LAN-only use — off by default.",
-  "mcp_token_env": ""
+  "mcp_token_env": "",
+
+  "_fleet_token_help": [
+    "Shared secret between this server and the boxes, sent as X-Fleet-Token.",
+    "Set it to the NAME of an env var (never the secret itself — config.json is",
+    "not the place for credentials). When set: box-facing routes (/upload,",
+    "/wake, /confirm, /register, /session-end, /reset) require it, /health hides",
+    "the box inventory from unauthenticated callers, and every push to a box",
+    "carries it. WITHOUT this, anyone on the same WiFi can repoint a box's",
+    "microphone upload URL with a single curl. Separate from mcp_token_env on",
+    "purpose: that one authenticates MCP clients, this one authenticates hardware.",
+    "Rollout is safe in either order — a box only starts enforcing once it has",
+    "been handed the token (trust-on-first-use via the /server adopt push)."
+  ],
+  "fleet_token_env": "",
+
+  "_lan_ip_help": "Optional override for the address boxes are told to reach this machine on. Auto-detected normally (tailnet/CGNAT 100.64.0.0/10 addresses are always skipped, since boxes can't route to them). Set only if the auto-pick is wrong on a multi-interface machine.",
+  "lan_ip": ""
 }

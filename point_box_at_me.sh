@@ -44,13 +44,33 @@ else
   fi
 fi
 
+# Boxes that have been given a fleet token reject unauthenticated /server
+# pushes — which is the whole point, since this endpoint repoints where the
+# microphone uploads to. Pass the same secret mcp-core uses.
+FLEET_TOKEN_VAR=$(python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/esp/config.json'))).get('fleet_token_env',''))" 2>/dev/null || echo "")
+TOKEN=""
+if [ -n "$FLEET_TOKEN_VAR" ]; then
+  TOKEN=$(printenv "$FLEET_TOKEN_VAR" 2>/dev/null || echo "")
+  if [ -z "$TOKEN" ]; then
+    echo "WARNING: config.json sets fleet_token_env=$FLEET_TOKEN_VAR but it isn't exported here."
+    echo "         Boxes that already hold a token will reject this. Run: export $FLEET_TOKEN_VAR=..."
+  fi
+fi
+
 echo "Pointing boxes at $URL"
 ok=0
 for ip in $boxes; do
-  code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 -X POST "http://$ip/server" --data "$URL")
+  if [ -n "$TOKEN" ]; then
+    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 -X POST "http://$ip/server" \
+           -H "X-Fleet-Token: $TOKEN" --data "$URL")
+  else
+    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 -X POST "http://$ip/server" --data "$URL")
+  fi
   if [ "$code" = "200" ]; then
     echo "  $ip  OK"
     ok=$((ok+1))
+  elif [ "$code" = "401" ]; then
+    echo "  $ip  REFUSED (401) — box holds a fleet token; export $FLEET_TOKEN_VAR and retry"
   else
     echo "  $ip  FAILED (HTTP ${code:-timeout}) — old firmware without /server, or not a box"
   fi

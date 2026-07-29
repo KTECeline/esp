@@ -1,0 +1,64 @@
+// The three things a server can tell this box to do — play audio, show a
+// caption, show an order — separated from HOW the instruction arrived.
+//
+// There are two transports now: the inbound HTTP server (works while the box
+// shares a network with the server) and an outbound WebSocket the box dials
+// itself (works from anywhere, see ws_client.h). Both end up here, so the
+// behavior can't drift between them.
+#pragma once
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/stream_buffer.h"
+
+// ---- Playback ---------------------------------------------------------------
+// Split into begin/feed/finish so neither transport has to buffer a whole clip
+// before starting — a ~170KB reply chunk would otherwise add real latency.
+
+typedef struct {
+    StreamBufferHandle_t ring;
+    SemaphoreHandle_t done;
+    uint32_t total_bytes;
+} playback_task_args_t;
+
+typedef struct {
+    char reply_txt[256];   // X-Reply-Text: show as a BOX caption, linger after
+    bool quiet;            // X-Quiet:  mid-chunk of a pipelined reply, leave the screen alone
+    bool final;            // X-Final:  last chunk, linger then READY
+    bool auto_listen;      // X-Auto-Listen: start a listen turn once playback ends
+} play_opts_t;
+
+typedef struct {
+    playback_task_args_t args;
+    play_opts_t opts;
+    TickType_t end_tick;
+} play_session_t;
+
+// h is the 44-byte WAV header; body_len is the PCM byte count that follows.
+void play_begin(play_session_t *ps, const uint8_t h[44], uint32_t body_len,
+                const play_opts_t *opts);
+void play_feed(play_session_t *ps, const void *data, size_t len);
+// Blocks until the audio has finished leaving the speaker.
+void play_finish_audio(play_session_t *ps);
+// Screen + auto-listen policy. Call AFTER acknowledging the transport, so the
+// 3.5s caption linger doesn't delay the server's next turn.
+void play_after(play_session_t *ps);
+
+// ---- Screen -----------------------------------------------------------------
+// `who` picks the speaker-bar colour ("BOX" = green, anything else = amber).
+// confirm=true arms the tap-to-confirm window and draws CANCEL/SEND buttons;
+// any other caption disarms it, since a new screen means the pending question
+// is gone.
+void do_caption(const char *text, const char *who, bool confirm);
+
+// Pipe-delimited line protocol (TITLE|.. / ITEM|name|price / TOTAL|..).
+// NOTE: mutates `body` in place while parsing.
+void do_order(char *body);
+
+// Server-initiated session override: occupied=true forces a session start
+// (plays the greeting, same as real presence detection); occupied=false
+// forces a session end (same cleanup a real departure does). See listen_v2.c
+// for why this exists — testing without the radar, or clearing a stuck box.
+void do_session(bool occupied);

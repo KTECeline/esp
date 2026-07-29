@@ -48,6 +48,16 @@ AGENT_PID=$!
 
 sleep 1
 
+# Secrets (fleet + /mcp tokens) live in ~/esp/.env, which is gitignored — they
+# must never sit in config.json, which is committed-adjacent and gets pasted
+# into issues. Absent = auth simply stays off, and mcp-core says so at startup.
+if [ -f ~/esp/.env ]; then
+  set -a; . ~/esp/.env; set +a
+  echo "Loaded secrets from ~/esp/.env"
+else
+  echo "No ~/esp/.env — running WITHOUT fleet/MCP auth (see config.example.json)."
+fi
+
 echo "Starting mcp-core (router; auto-starts voice-mcp-server over stdio)..."
 # Whisper model + Manglish bias prompt are set in config.json (stt section),
 # not here — mcp-core passes them to voice-mcp-server itself.

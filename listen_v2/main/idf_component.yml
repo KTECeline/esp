@@ -20,3 +20,7 @@ dependencies:
   espressif/esp_lcd_touch: '^1.1.0'
   espressif/esp_lcd_touch_tt21100: '^1.0.4'
   espressif/esp_lcd_touch_gt911: '^1.1.5'
+  # Outbound reverse channel so the server can reach the box from any
+  # network without a VPN on the device. Espressif-maintained; its
+  # reconnect/backoff state machine is why none is hand-rolled here.
+  espressif/esp_websocket_client: '^1.2.0'

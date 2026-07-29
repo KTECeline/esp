@@ -46,6 +46,8 @@
 #include "esp_codec_dev_defaults.h"
 #include "display.h"
 #include "provisioning.h"
+#include "box_actions.h"
+#include "ws_client.h"
 #include "esp_timer.h"
 #include "mdns.h"
 #include "touch.h"
@@ -118,6 +120,15 @@ static char s_health_url[112];
 static char s_register_url[112];
 static char s_wake_url[112];
 static char s_session_end_url[112];
+static char s_session_start_url[112];
+// Shared secret with our server. Empty = not yet adopted, in which case the box
+// accepts unauthenticated requests so it can be bootstrapped (see
+// prov_load_fleet_token). Once set, every inbound request must carry it and
+// every outbound request sends it.
+static char s_fleet_token[65] = "";
+// Reverse-channel URL. Empty = LAN push only (the original behavior).
+static char s_ws_url[120] = "";
+
 
 // ---- BOX-3 wiring ----
 #define I2C_PORT        I2C_NUM_0
@@ -172,6 +183,40 @@ static char s_session_end_url[112];
 #define MAX_RECORD_BYTES  ((uint32_t)SAMPLE_RATE * MAX_RECORD_SECONDS * (BITS_PER_SAMPLE/8) * CHANNELS)
 
 static const char *TAG = "listen_v2";
+
+// Identity + shared secret on every outbound request. The token is omitted
+// while un-adopted, so a fresh box can still reach a server that has fleet auth
+// turned off — that's the bootstrap path, and it's why rollout order doesn't
+// matter. One helper so a new call site can't silently forget the header.
+static void set_box_headers(esp_http_client_handle_t client)
+{
+    esp_http_client_set_header(client, "X-Box-Id", s_box_id);
+    if (s_fleet_token[0]) esp_http_client_set_header(client, "X-Fleet-Token", s_fleet_token);
+}
+
+// Is this inbound request from our own server?
+//
+// With no token stored the box is un-adopted and accepts anything — that's the
+// bootstrap window on your own LAN, and it's also what makes lockout
+// impossible. Once adopted, every request must carry the secret; without this,
+// anyone on the same WiFi can repoint the microphone upload URL (POST /server)
+// or force a recording (POST /play with X-Auto-Listen) with a single curl.
+static bool fleet_authed(httpd_req_t *req)
+{
+    if (s_fleet_token[0] == '\0') return true;   // not adopted yet
+    char got[sizeof(s_fleet_token)] = "";
+    if (httpd_req_get_hdr_value_str(req, "X-Fleet-Token", got, sizeof(got)) != ESP_OK) return false;
+    return strcmp(got, s_fleet_token) == 0;
+}
+
+// 401 + a reason, so a legitimate operator hitting this by hand knows why.
+static esp_err_t fleet_deny(httpd_req_t *req)
+{
+    ESP_LOGW(TAG, "rejected unauthenticated request to %s", req->uri);
+    httpd_resp_set_status(req, "401 Unauthorized");
+    httpd_resp_sendstr(req, "missing or wrong X-Fleet-Token");
+    return ESP_FAIL;
+}
 static esp_codec_dev_handle_t s_mic = NULL;   // ES7210 input
 static esp_codec_dev_handle_t s_spk = NULL;   // ES8311 output
 static i2c_master_bus_handle_t s_i2c_bus = NULL;
@@ -533,7 +578,7 @@ static void register_with_core(void)
                                      .method = HTTP_METHOD_POST, .timeout_ms = 5000 };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     esp_http_client_set_header(client, "Content-Type", "application/json");
-    esp_http_client_set_header(client, "X-Box-Id", s_box_id);
+    set_box_headers(client);
     esp_http_client_set_post_field(client, body, len);
     esp_err_t err = esp_http_client_perform(client);
     int status = (err == ESP_OK) ? esp_http_client_get_status_code(client) : -1;
@@ -657,7 +702,7 @@ static void record_toggle_and_send(const char *rec_line2)
     esp_http_client_set_header(client, "Content-Type", "audio/wav");
     // The box declares its own identity — the server must never have to guess
     // it from a source IP that DHCP can reassign tomorrow.
-    esp_http_client_set_header(client, "X-Box-Id", s_box_id);
+    set_box_headers(client);
 
     int status = -1;
     if (esp_http_client_open(client, total_len) != ESP_OK) {
@@ -738,11 +783,18 @@ static void clear_and_relisten(void)
 // listening (a greeting-on-approach can come later from a presence sensor).
 // Runs on the main-task stack (called from the main loop, not an httpd
 // handler), so record_toggle_and_send() needs no trampoline task.
+static void report_session_start(void);   // defined below, near end_session_on_server
+
 static void start_listening(void)
 {
     // Ordering by touch/BOOT starts a session too — without a greeting, since
     // they're already talking to us. This is also what keeps a box with NO
     // sensor dock working: sessions still begin, they just never auto-end.
+    // Report it (only on the actual transition) so occupied-status queries
+    // stay accurate no matter which trigger started the session — presence
+    // starts already report as a side effect of asking for the greeting
+    // (/wake), but a silent start has no other server call to piggyback on.
+    if (!s_session_active) report_session_start();
     s_session_active = true;
     note_activity();
     record_toggle_and_send("TAP WHEN DONE");
@@ -764,11 +816,8 @@ static void start_listening(void)
 #define PLAYBACK_RINGBUF_BYTES   (64 * 1024)   // ~1.45s of audio at 22050/16/mono
 #define PLAYBACK_PREBUFFER_BYTES (16 * 1024)   // ~0.36s prebuffer before starting
 
-typedef struct {
-    StreamBufferHandle_t ring;
-    SemaphoreHandle_t done;
-    uint32_t total_bytes;
-} playback_task_args_t;
+// playback_task_args_t / play_opts_t / play_session_t now live in box_actions.h
+// so the WebSocket transport can drive the same playback path.
 
 static void playback_task(void *arg)
 {
@@ -792,15 +841,15 @@ static void playback_task(void *arg)
     vTaskDelete(NULL);
 }
 
-static esp_err_t play_handler(httpd_req_t *req)
+// Playback is split into begin/feed/finish so it can be driven by EITHER
+// transport without either one buffering the whole clip:
+//   - HTTP: httpd_req_recv() loop feeds it (unchanged behavior)
+//   - WebSocket: message fragments feed it as they arrive (ws_client.c)
+// Keeping it streaming on both paths is the point — buffering a whole 170KB
+// chunk before starting would add audible latency to every reply.
+void play_begin(play_session_t *ps, const uint8_t h[44], uint32_t body_len,
+                const play_opts_t *opts)
 {
-    uint8_t h[44];
-    int got = 0;
-    while (got < 44) {
-        int r = httpd_req_recv(req, (char *)h + got, 44 - got);
-        if (r <= 0) { httpd_resp_send_500(req); return ESP_FAIL; }
-        got += r;
-    }
     uint32_t rate = h[24] | (h[25]<<8) | (h[26]<<16) | ((uint32_t)h[27]<<24);
     uint16_t ch   = h[22] | (h[23]<<8);
     uint16_t bits = h[34] | (h[35]<<8);
@@ -810,92 +859,140 @@ static esp_err_t play_handler(httpd_req_t *req)
     if (bits != 16) bits = 16;
     ESP_LOGI(TAG, "playing: %u Hz, %u ch, %u-bit", (unsigned)rate, ch, bits);
 
+    ps->opts = *opts;
+    if (opts->reply_txt[0]) {
+        display_caption("BOX", rgb565(0, 150, 0), opts->reply_txt);
+    } else if (!opts->quiet) {
+        display_status("PLAYING", NULL, rgb565(0, 150, 0));
+    }
+
+    esp_codec_dev_sample_info_t fs = { .bits_per_sample = bits, .channel = ch, .sample_rate = rate };
+    esp_codec_dev_open(s_spk, &fs);
+    esp_codec_dev_set_out_vol(s_spk, 85);
+
+    ps->args.ring = xStreamBufferCreate(PLAYBACK_RINGBUF_BYTES, 1);
+    ps->args.done = xSemaphoreCreateBinary();
+    ps->args.total_bytes = body_len;
+    xTaskCreate(playback_task, "playback", 4096, &ps->args, 5, NULL);
+}
+
+void play_feed(play_session_t *ps, const void *data, size_t len)
+{
+    const uint8_t *p = (const uint8_t *)data;
+    size_t sent = 0;
+    while (sent < len) {
+        sent += xStreamBufferSend(ps->args.ring, p + sent, len - sent, portMAX_DELAY);
+    }
+}
+
+// Blocks until the audio has actually finished coming out of the speaker.
+void play_finish_audio(play_session_t *ps)
+{
+    xSemaphoreTake(ps->args.done, portMAX_DELAY);
+    vSemaphoreDelete(ps->args.done);
+    vStreamBufferDelete(ps->args.ring);
+    esp_codec_dev_close(s_spk);
+    ESP_LOGI(TAG, "playback done");
+    ps->end_tick = xTaskGetTickCount();
+}
+
+// Screen/auto-listen policy, run AFTER the transport has acknowledged, so the
+// 3.5s caption linger never delays the server's next turn.
+void play_after(play_session_t *ps)
+{
+    if (ps->opts.quiet && !ps->opts.final) return;
+
+    if (ps->opts.auto_listen) {
+        // Greeting just finished — go straight into a listen turn, no button
+        // needed. Same recording+upload path BOOT uses, so everything
+        // downstream (STT, confirm screen, order) is completely unchanged.
+        run_auto_listen("LISTENING...");
+        if ((int32_t)(s_caption_at_tick - s_upload_done_tick) <= 0) show_ready();
+        return;
+    }
+
+    if (ps->opts.reply_txt[0] || ps->opts.final) vTaskDelay(pdMS_TO_TICKS(3500));
+    if ((int32_t)(s_caption_at_tick - ps->end_tick) <= 0) show_ready();
+}
+
+static esp_err_t play_handler(httpd_req_t *req)
+{
+    if (!fleet_authed(req)) return fleet_deny(req);
+    uint8_t h[44];
+    int got = 0;
+    while (got < 44) {
+        int r = httpd_req_recv(req, (char *)h + got, 44 - got);
+        if (r <= 0) { httpd_resp_send_500(req); return ESP_FAIL; }
+        got += r;
+    }
+
     // Display policy per chunk-protocol headers:
     //   X-Reply-Text (legacy /respond path): show reply caption, linger after.
     //   X-Quiet: sentence chunk of a pipelined reply — the BOX caption is
     //            already on screen via /caption, so touch nothing.
     //   X-Final: last chunk — after playback, linger the caption then READY.
     //   none of the above (talk.sh etc.): old PLAYING/READY behavior.
-    char reply_txt[256];
-    bool had_caption = (httpd_req_get_hdr_value_str(req, "X-Reply-Text", reply_txt,
-                                                    sizeof(reply_txt)) == ESP_OK) && reply_txt[0];
-    char hdr[4] = "";
-    bool quiet = (httpd_req_get_hdr_value_str(req, "X-Quiet", hdr, sizeof(hdr)) == ESP_OK)
-                 && hdr[0] == '1';
-    hdr[0] = 0;
-    bool final = (httpd_req_get_hdr_value_str(req, "X-Final", hdr, sizeof(hdr)) == ESP_OK)
-                 && hdr[0] == '1';
-    hdr[0] = 0;
-    bool auto_listen = (httpd_req_get_hdr_value_str(req, "X-Auto-Listen", hdr, sizeof(hdr)) == ESP_OK)
-                       && hdr[0] == '1';
-    if (had_caption) {
-        display_caption("BOX", rgb565(0, 150, 0), reply_txt);
-    } else if (!quiet) {
-        display_status("PLAYING", NULL, rgb565(0, 150, 0));
+    play_opts_t opts = { 0 };
+    if (httpd_req_get_hdr_value_str(req, "X-Reply-Text", opts.reply_txt,
+                                    sizeof(opts.reply_txt)) != ESP_OK) {
+        opts.reply_txt[0] = 0;
     }
-    esp_codec_dev_sample_info_t fs = { .bits_per_sample = bits, .channel = ch, .sample_rate = rate };
-    esp_codec_dev_open(s_spk, &fs);
-    esp_codec_dev_set_out_vol(s_spk, 85);
+    char hdr[4] = "";
+    opts.quiet = (httpd_req_get_hdr_value_str(req, "X-Quiet", hdr, sizeof(hdr)) == ESP_OK)
+                 && hdr[0] == '1';
+    hdr[0] = 0;
+    opts.final = (httpd_req_get_hdr_value_str(req, "X-Final", hdr, sizeof(hdr)) == ESP_OK)
+                 && hdr[0] == '1';
+    hdr[0] = 0;
+    opts.auto_listen = (httpd_req_get_hdr_value_str(req, "X-Auto-Listen", hdr, sizeof(hdr)) == ESP_OK)
+                       && hdr[0] == '1';
 
+    play_session_t ps;
     uint32_t remaining = req->content_len - 44;
-    playback_task_args_t args = {
-        .ring = xStreamBufferCreate(PLAYBACK_RINGBUF_BYTES, 1),
-        .done = xSemaphoreCreateBinary(),
-        .total_bytes = remaining,
-    };
-    xTaskCreate(playback_task, "playback", 4096, &args, 5, NULL);
+    play_begin(&ps, h, remaining, &opts);
 
     char buf[4096];
     while (remaining > 0) {
         int want = remaining < sizeof(buf) ? remaining : sizeof(buf);
         int r = httpd_req_recv(req, buf, want);
         if (r <= 0) break;
-        size_t sent = 0;
-        while (sent < (size_t)r) {
-            sent += xStreamBufferSend(args.ring, buf + sent, r - sent, portMAX_DELAY);
-        }
+        play_feed(&ps, buf, r);
         remaining -= r;
     }
-    xSemaphoreTake(args.done, portMAX_DELAY);
-    vSemaphoreDelete(args.done);
-    vStreamBufferDelete(args.ring);
+    play_finish_audio(&ps);
 
-    esp_codec_dev_close(s_spk);
-    ESP_LOGI(TAG, "playback done");
-
-    // Answer the Mac first, THEN linger, so the reply caption stays readable for
-    // a few seconds after the audio ends without delaying the Mac's next turn.
-    // If the Mac pushes new content during the linger (the order screen arrives
-    // right after /play returns), that content owns the screen — skip READY.
-    // Quiet middle chunks return immediately and leave the screen alone.
-    TickType_t playback_end_tick = xTaskGetTickCount();
+    // Answer first, THEN linger — see play_after().
     httpd_resp_sendstr(req, "played");
-    if (quiet && !final) return ESP_OK;
-
-    if (auto_listen) {
-        // Greeting just finished — go straight into a listen turn, no button
-        // needed. Same recording+upload path BOOT uses, so everything
-        // downstream (STT, confirm screen, order) is completely unchanged.
-        // Runs in its own task — see run_auto_listen()'s comment for why.
-        run_auto_listen("LISTENING...");
-        if ((int32_t)(s_caption_at_tick - s_upload_done_tick) <= 0) {
-            show_ready();
-        }
-        return ESP_OK;
-    }
-
-    if (had_caption || final) vTaskDelay(pdMS_TO_TICKS(3500));
-    if ((int32_t)(s_caption_at_tick - playback_end_tick) <= 0) {
-        show_ready();
-    }
+    play_after(&ps);
     return ESP_OK;
 }
 
 // Show a live caption. Body = the text; optional "X-Speaker" header ("YOU"/"BOX")
 // picks the bar label + color (defaults to YOU / amber). Used by the Mac to push
 // "what was heard" the moment STT finishes, before the reply audio arrives.
+void do_caption(const char *text, const char *who, bool confirm)
+{
+    uint16_t bar = (strcmp(who, "BOX") == 0) ? rgb565(0, 150, 0)   // green
+                                             : rgb565(200, 120, 0); // amber
+
+    // Arms the tap-to-confirm window; any other caption disarms it (a new
+    // screen means the pending question is no longer on display).
+    if (confirm) {
+        s_confirm_deadline_tick = xTaskGetTickCount() + pdMS_TO_TICKS(CONFIRM_WINDOW_MS);
+        s_confirm_pending = true;
+    } else {
+        s_confirm_pending = false;
+    }
+
+    s_caption_at_tick = xTaskGetTickCount();
+    // The confirm screen carries CANCEL/SEND buttons; a plain caption doesn't.
+    if (s_confirm_pending) display_confirm(who, bar, text);
+    else                   display_caption(who, bar, text);
+}
+
 static esp_err_t caption_handler(httpd_req_t *req)
 {
+    if (!fleet_authed(req)) return fleet_deny(req);
     int len = req->content_len;
     if (len < 0) len = 0;
     if (len > 255) len = 255;
@@ -910,24 +1007,10 @@ static esp_err_t caption_handler(httpd_req_t *req)
 
     char who[16] = "YOU";
     httpd_req_get_hdr_value_str(req, "X-Speaker", who, sizeof(who));
-    uint16_t bar = (strcmp(who, "BOX") == 0) ? rgb565(0, 150, 0)   // green
-                                             : rgb565(200, 120, 0); // amber
-
-    // X-Confirm: 1 arms the tap-to-confirm window; any other caption disarms
-    // it (a new screen means the pending question is no longer on display).
     char cf[4] = "";
     httpd_req_get_hdr_value_str(req, "X-Confirm", cf, sizeof(cf));
-    if (cf[0] == '1') {
-        s_confirm_deadline_tick = xTaskGetTickCount() + pdMS_TO_TICKS(CONFIRM_WINDOW_MS);
-        s_confirm_pending = true;
-    } else {
-        s_confirm_pending = false;
-    }
 
-    s_caption_at_tick = xTaskGetTickCount();
-    // The confirm screen carries CANCEL/SEND buttons; a plain caption doesn't.
-    if (s_confirm_pending) display_confirm(who, bar, text);
-    else                   display_caption(who, bar, text);
+    do_caption(text, who, cf[0] == '1');
     httpd_resp_sendstr(req, "ok");
     return ESP_OK;
 }
@@ -941,7 +1024,7 @@ static void trigger_wake(void)
     esp_http_client_config_t cfg = { .url = s_wake_url, .method = HTTP_METHOD_POST,
                                      .timeout_ms = 5000 };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
-    esp_http_client_set_header(client, "X-Box-Id", s_box_id);
+    set_box_headers(client);
     esp_http_client_set_post_field(client, "1", 1);
     esp_err_t err = esp_http_client_perform(client);
     int status = (err == ESP_OK) ? esp_http_client_get_status_code(client) : -1;
@@ -962,12 +1045,54 @@ static void end_session_on_server(void)
     esp_http_client_config_t cfg = { .url = s_session_end_url, .method = HTTP_METHOD_POST,
                                      .timeout_ms = 5000 };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
-    esp_http_client_set_header(client, "X-Box-Id", s_box_id);
+    set_box_headers(client);
     esp_http_client_set_post_field(client, "1", 1);
     esp_err_t err = esp_http_client_perform(client);
     int status = (err == ESP_OK) ? esp_http_client_get_status_code(client) : -1;
     esp_http_client_cleanup(client);
     ESP_LOGI(TAG, "session-end -> %s (%d)", s_session_end_url, status);
+}
+
+// Touch/BOOT-started sessions skip the greeting on purpose (the customer is
+// already engaging — a "hi" would be redundant), so unlike a presence start
+// there's no /wake call for the server to piggyback occupied-status on. This
+// is that missing signal, so esp_list_boxes/health stay accurate regardless
+// of which trigger began the session.
+static void report_session_start(void)
+{
+    esp_http_client_config_t cfg = { .url = s_session_start_url, .method = HTTP_METHOD_POST,
+                                     .timeout_ms = 5000 };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    set_box_headers(client);
+    esp_http_client_set_post_field(client, "1", 1);
+    esp_err_t err = esp_http_client_perform(client);
+    int status = (err == ESP_OK) ? esp_http_client_get_status_code(client) : -1;
+    esp_http_client_cleanup(client);
+    ESP_LOGI(TAG, "session-start -> %s (%d)", s_session_start_url, status);
+}
+
+// Server-initiated override — lets an operator/agent mark a box occupied or
+// free without waiting for the radar (useful for testing), or clear a session
+// the radar failed to end on its own (a stuck-occupied box). Deliberately
+// mirrors the two NATURAL paths rather than inventing a third behavior:
+// forcing occupied=true plays the same one-time greeting a real presence
+// detection would; forcing occupied=false does the same cleanup a real
+// departure does. No echo back to the server in either direction — the
+// server already knows, since it's the one that just asked for this.
+void do_session(bool occupied)
+{
+    if (occupied) {
+        if (!s_session_active && !s_confirm_pending) {
+            s_session_active = true;
+            note_activity();
+            ESP_LOGI(TAG, "session start (manual override) — greeting once");
+            trigger_wake();
+        }
+    } else if (s_session_active) {
+        s_session_active = false;
+        ESP_LOGI(TAG, "session end (manual override)");
+        show_ready();
+    }
 }
 
 // Tell the Mac the customer tap-confirmed the transcript on screen.
@@ -976,7 +1101,7 @@ static void post_confirm(void)
     esp_http_client_config_t cfg = { .url = s_confirm_url, .method = HTTP_METHOD_POST,
                                      .timeout_ms = 5000 };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
-    esp_http_client_set_header(client, "X-Box-Id", s_box_id);
+    set_box_headers(client);
     esp_http_client_set_post_field(client, "1", 1);
     esp_err_t err = esp_http_client_perform(client);
     int status = (err == ESP_OK) ? esp_http_client_get_status_code(client) : -1;
@@ -992,20 +1117,8 @@ static void post_confirm(void)
 //   TITLE|YOUR ORDER
 //   ITEM|2X NASI LEMAK|RM11.00     (up to 5 ITEM lines)
 //   TOTAL|RM15.50
-static esp_err_t order_handler(httpd_req_t *req)
+void do_order(char *body)
 {
-    static char body[512];   // static: keeps httpd task stack small
-    int len = req->content_len;
-    if (len < 0) len = 0;
-    if (len > (int)sizeof(body) - 1) len = sizeof(body) - 1;
-    int got = 0;
-    while (got < len) {
-        int r = httpd_req_recv(req, body + got, len - got);
-        if (r <= 0) break;
-        got += r;
-    }
-    body[got] = 0;
-
     const char *title = "YOUR ORDER";
     static char total[20];
     order_line_t lines[5];
@@ -1034,6 +1147,24 @@ static esp_err_t order_handler(httpd_req_t *req)
     s_caption_at_tick = xTaskGetTickCount();   // order owns the screen now
     display_order(title, lines, count, total[0] ? total : NULL);
     ESP_LOGI(TAG, "order screen: %d items, total %s", count, total);
+}
+
+static esp_err_t order_handler(httpd_req_t *req)
+{
+    if (!fleet_authed(req)) return fleet_deny(req);
+    static char body[512];   // static: keeps httpd task stack small
+    int len = req->content_len;
+    if (len < 0) len = 0;
+    if (len > (int)sizeof(body) - 1) len = sizeof(body) - 1;
+    int got = 0;
+    while (got < len) {
+        int r = httpd_req_recv(req, body + got, len - got);
+        if (r <= 0) break;
+        got += r;
+    }
+    body[got] = 0;
+
+    do_order(body);
     httpd_resp_sendstr(req, "ok");
     return ESP_OK;
 }
@@ -1042,15 +1173,28 @@ static esp_err_t order_handler(httpd_req_t *req)
 // server, so they're derived from post_url (which carries the real host AND
 // port). Re-run whenever post_url changes so a repointed box updates every URL
 // at once instead of leaving stale ones behind.
+// snprintf truncates silently, which would leave a plausible-looking but wrong
+// URL (e.g. ".../session-en") that fails in a way nobody would trace back to
+// here. Check every one and say so loudly.
+static void derive_one_url(char *dst, size_t cap, const char *suffix, int base_len)
+{
+    int n = snprintf(dst, cap, "%.*s%s", base_len, s_post_url, suffix);
+    if (n < 0 || (size_t)n >= cap) {
+        ESP_LOGE(TAG, "server URL too long, truncated: %s%s (max %u) — shorten the server address",
+                 suffix, "", (unsigned)cap);
+    }
+}
+
 static void derive_server_urls(void)
 {
     const char *slash = strrchr(s_post_url, '/');
     int base_len = slash ? (int)(slash - s_post_url) : (int)strlen(s_post_url);
-    snprintf(s_confirm_url, sizeof(s_confirm_url), "%.*s/confirm", base_len, s_post_url);
-    snprintf(s_health_url, sizeof(s_health_url), "%.*s/health", base_len, s_post_url);
-    snprintf(s_register_url, sizeof(s_register_url), "%.*s/register", base_len, s_post_url);
-    snprintf(s_wake_url, sizeof(s_wake_url), "%.*s/wake", base_len, s_post_url);
-    snprintf(s_session_end_url, sizeof(s_session_end_url), "%.*s/session-end", base_len, s_post_url);
+    derive_one_url(s_confirm_url,     sizeof(s_confirm_url),     "/confirm",     base_len);
+    derive_one_url(s_health_url,      sizeof(s_health_url),      "/health",      base_len);
+    derive_one_url(s_register_url,    sizeof(s_register_url),    "/register",    base_len);
+    derive_one_url(s_wake_url,        sizeof(s_wake_url),        "/wake",        base_len);
+    derive_one_url(s_session_end_url, sizeof(s_session_end_url), "/session-end", base_len);
+    derive_one_url(s_session_start_url, sizeof(s_session_start_url), "/session-start", base_len);
 }
 
 // Repoint this box at a different server, live, over the network:
@@ -1061,6 +1205,7 @@ static void derive_server_urls(void)
 // on its next pass (or immediately, if it's already waiting).
 static esp_err_t server_handler(httpd_req_t *req)
 {
+    if (!fleet_authed(req)) return fleet_deny(req);
     char url[sizeof(s_post_url)];
     int len = req->content_len;
     if (len <= 0 || len >= (int)sizeof(url)) {
@@ -1077,14 +1222,55 @@ static esp_err_t server_handler(httpd_req_t *req)
     while (got > 0 && (url[got - 1] == '\n' || url[got - 1] == '\r' || url[got - 1] == ' ')) url[--got] = 0;
 
     if (strncmp(url, "http://", 7) != 0 && strncmp(url, "https://", 8) != 0) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "must start with http://");
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "must start with http:// or https://");
         return ESP_FAIL;
+    }
+
+    // The adopt push also carries the reverse-channel URL, so a box learns it
+    // the same way it learns everything else — no extra provisioning step.
+    // Changing it re-dials, which is how a box follows the server to a new
+    // address (e.g. LAN ws:// today, public wss:// once a relay is set up).
+    {
+        char ws[sizeof(s_ws_url)] = "";
+        if (httpd_req_get_hdr_value_str(req, "X-Ws-Url", ws, sizeof(ws)) == ESP_OK && ws[0]) {
+            if (strcmp(ws, s_ws_url) != 0) {
+                strlcpy(s_ws_url, ws, sizeof(s_ws_url));
+                prov_save_ws_url(s_ws_url);
+                ESP_LOGI(TAG, "reverse-channel URL set to %s", s_ws_url);
+                ws_client_start(s_ws_url, s_box_id, s_fleet_token);
+            }
+        }
+    }
+
+    // Trust-on-first-use adoption: an un-adopted box takes the token from the
+    // first server that reaches it (on your own LAN, during bring-up) and
+    // starts enforcing immediately afterwards. Only ever assigned when empty —
+    // an adopted box getting a different token has already been rejected by
+    // fleet_authed() above, so this can't be used to steal an adopted box.
+    if (s_fleet_token[0] == '\0') {
+        char tok[sizeof(s_fleet_token)] = "";
+        if (httpd_req_get_hdr_value_str(req, "X-Fleet-Token", tok, sizeof(tok)) == ESP_OK && tok[0]) {
+            strlcpy(s_fleet_token, tok, sizeof(s_fleet_token));
+            prov_save_fleet_token(s_fleet_token);
+            ESP_LOGI(TAG, "adopted fleet token — this box now requires X-Fleet-Token");
+        }
     }
 
     strlcpy(s_post_url, url, sizeof(s_post_url));
     derive_server_urls();
     prov_save_post_url(s_post_url);
     ESP_LOGI(TAG, "server address updated to %s", s_post_url);
+    httpd_resp_sendstr(req, "ok");
+    return ESP_OK;
+}
+
+static esp_err_t session_handler(httpd_req_t *req)
+{
+    if (!fleet_authed(req)) return fleet_deny(req);
+    char v[4] = "";
+    bool occupied = (httpd_req_get_hdr_value_str(req, "X-Occupied", v, sizeof(v)) == ESP_OK)
+                    && v[0] == '1';
+    do_session(occupied);
     httpd_resp_sendstr(req, "ok");
     return ESP_OK;
 }
@@ -1105,6 +1291,8 @@ static void start_http_server(void)
         httpd_register_uri_handler(server, &order);
         httpd_uri_t srv = { .uri = "/server", .method = HTTP_POST, .handler = server_handler };
         httpd_register_uri_handler(server, &srv);
+        httpd_uri_t sess = { .uri = "/session", .method = HTTP_POST, .handler = session_handler };
+        httpd_register_uri_handler(server, &sess);
         ESP_LOGI(TAG, "TALK server up: POST a WAV to http://%s/play", s_ip_str);
     } else {
         ESP_LOGE(TAG, "failed to start HTTP server");
@@ -1143,6 +1331,13 @@ void app_main(void)
     // Identity first — box_id exists before the box touches any network, so
     // even a fresh box's provisioning AP is already named after it.
     prov_ensure_box_id(s_box_id, sizeof(s_box_id));
+    // Load before the HTTP server comes up, so the box is never briefly open
+    // during boot. Absent = un-adopted; the first /server push adopts us.
+    prov_load_fleet_token(s_fleet_token, sizeof(s_fleet_token));
+    prov_load_ws_url(s_ws_url, sizeof(s_ws_url));
+    ESP_LOGI(TAG, "fleet auth: %s", s_fleet_token[0]
+             ? "ON (X-Fleet-Token required on all endpoints)"
+             : "OFF — un-adopted, accepting unauthenticated requests until a server adopts this box");
     wifi_stack_init();
 
     char wifi_ssid[33], wifi_pass[64];
@@ -1194,6 +1389,10 @@ void app_main(void)
         start_provisioning_mode();   // never returns
     }
     register_with_core();
+    // Dial the reverse channel once the network is up. Non-blocking and
+    // self-reconnecting, so a server that isn't listening yet costs nothing —
+    // and a box with no URL stored simply keeps using LAN pushes.
+    ws_client_start(s_ws_url, s_box_id, s_fleet_token);
 
     show_ready();   // blue = ready
     // GPIO1 (top mute button) intentionally not configured/read — see the

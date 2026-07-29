@@ -135,6 +135,56 @@ esp_err_t prov_save_post_url(const char *post_url)
     return err;
 }
 
+// Shared secret proving a request came from our own server. Stored separately
+// from the WiFi credentials because it is delivered separately: the server
+// hands it over on its first /server adopt push (trust-on-first-use on your own
+// LAN), not through the provisioning portal.
+//
+// Trust-on-first-use is what makes this impossible to lock yourself out with:
+// the box enforces ONLY once it holds a token, and the only way it got one was
+// from the server — so a box that rejects you is rejecting with a secret the
+// server knows. To re-key, hold BOOT 5s (wipes it with the rest) and re-provision.
+// URL of the server's reverse channel (ws:// on the LAN, wss:// through a
+// public relay). Delivered by the server the same way post_url is, so a box
+// never has it typed in by hand.
+bool prov_load_ws_url(char *out, size_t out_len)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) { out[0] = '\0'; return false; }
+    bool have = nvs_get_str_ok(h, "ws_url", out, out_len);
+    nvs_close(h);
+    return have;
+}
+
+esp_err_t prov_save_ws_url(const char *url)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    if ((err = nvs_set_str(h, "ws_url", url)) == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    return err;
+}
+
+bool prov_load_fleet_token(char *out, size_t out_len)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) { out[0] = '\0'; return false; }
+    bool have = nvs_get_str_ok(h, "fleet_tok", out, out_len);
+    nvs_close(h);
+    return have;
+}
+
+esp_err_t prov_save_fleet_token(const char *token)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    if ((err = nvs_set_str(h, "fleet_tok", token)) == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    return err;
+}
+
 void prov_erase_creds(void)
 {
     nvs_handle_t h;
@@ -144,9 +194,14 @@ void prov_erase_creds(void)
     nvs_erase_key(h, "pass");
     nvs_erase_key(h, "post_url");
     nvs_erase_key(h, "box_name");
+    // The fleet token goes too: this is the documented way out of a bad key.
+    // Clearing it returns the box to trust-on-first-use so a server with a
+    // different token can adopt it, instead of the box being permanently
+    // unreachable by anyone who doesn't hold the old secret.
+    nvs_erase_key(h, "fleet_tok");
     nvs_commit(h);
     nvs_close(h);
-    ESP_LOGI(TAG, "WiFi credentials erased (box_id kept)");
+    ESP_LOGI(TAG, "WiFi credentials + fleet token erased (box_id kept)");
 }
 
 // --------------------------------------------------------------------------

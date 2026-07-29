@@ -23,6 +23,17 @@ esp_err_t prov_save_creds(const char *ssid, const char *pass,
 // Updates ONLY post_url, leaving WiFi credentials intact — used by POST /server
 // so a box can be repointed at a moved server without re-provisioning.
 esp_err_t prov_save_post_url(const char *post_url);
+// Shared secret authenticating traffic between this box and its server.
+// Delivered by the server's /server adopt push on first contact, then required
+// on every inbound request. Returns false when none is stored (a fresh box, or
+// one just factory-reset) — in which case the box accepts unauthenticated
+// requests so it can be bootstrapped. Cleared by prov_erase_creds().
+bool prov_load_fleet_token(char *out, size_t out_len);
+esp_err_t prov_save_fleet_token(const char *token);
+// Reverse-channel URL (ws:// or wss://). Empty = feature off, LAN push only.
+// Pushed by the server alongside post_url, never typed in by hand.
+bool prov_load_ws_url(char *out, size_t out_len);
+esp_err_t prov_save_ws_url(const char *url);
 // Clears ssid/pass/post_url/box_name. box_id and ap_psk are NOT touched.
 void prov_erase_creds(void);
 

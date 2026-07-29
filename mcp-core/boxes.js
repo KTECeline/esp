@@ -9,6 +9,7 @@
 // every request the box makes.
 
 import { networkInterfaces } from "node:os";
+import { wsHas, wsPush } from "./ws-hub.js";
 
 // The mcp-core host's own addresses. A real box is NEVER at one of these, so a
 // request that appears to come "from" the host (loopback, or the Mac's own LAN
@@ -20,6 +21,22 @@ const OWN_IPS = new Set(["127.0.0.1", "::1", "localhost"]);
 for (const list of Object.values(networkInterfaces())) {
   for (const ni of list || []) OWN_IPS.add(ni.address.replace(/^::ffff:/, ""));
 }
+
+// 100.64.0.0/10 — CGNAT space, which is what Tailscale hands out. A box's
+// entry must always hold the address we can reach it at from the LAN: every
+// outbound push (/play, /caption, /order, /server) dials `box.ip` directly.
+// If a box ever appeared over a tunnel, recording that 100.x address would
+// overwrite the working LAN address and silently break every push to it.
+export function isCgnat(ip) {
+  const m = /^(\d+)\.(\d+)\./.exec(ip || "");
+  return !!m && +m[1] === 100 && +m[2] >= 64 && +m[2] <= 127;
+}
+
+// Shared secret proving a request came from our own system, sent on every push
+// to a box. Set once at startup by server.js; boxes.js deliberately doesn't
+// import config.js (it stays a dumb transport layer).
+let fleetToken = null;
+export function setFleetToken(token) { fleetToken = token; }
 
 // The box font is ASCII-only (renders uppercase); HTTP headers must be latin-1
 // and single-line — strip anything else so captions don't corrupt the request.
@@ -44,7 +61,12 @@ export class BoxRegistry {
       id: b.id || b.name || `box${i + 1}`,
       name: b.name || b.id || `box${i + 1}`,
       ip: b.ip,
-      host: b.ip.split(":")[0]
+      host: b.ip.split(":")[0],
+      // null = unknown (box hasn't reported a session event since this
+      // process started, or is on firmware too old to). Live-only, never
+      // written to config.json — a customer being at the box right now isn't
+      // fleet-registry data.
+      occupied: null
     }));
   }
 
@@ -55,6 +77,15 @@ export class BoxRegistry {
 
   byId(id) {
     return this.boxes.find((b) => b.id === id) || null;
+  }
+
+  // Live status only — deliberately does NOT call onChange/persist to
+  // config.json. Whether a customer is standing at a box right now isn't
+  // fleet-registry data, and periodic writes for something that changes every
+  // few seconds would be pure churn.
+  setOccupied(id, occupied) {
+    const b = this.byId(id);
+    if (b) b.occupied = occupied;
   }
 
   // Add or update a box, keyed by its immutable id — a DHCP-renewed IP updates
@@ -99,22 +130,56 @@ export class BoxRegistry {
       this.upsert(id, id, ip);
       return this.byId(id);
     }
-    if (existing.host !== ip && !OWN_IPS.has(ip)) {
+    if (existing.host !== ip && !OWN_IPS.has(ip) && !isCgnat(ip)) {
       console.log(`Box "${id}" moved ${existing.ip} -> ${ip} (DHCP drift) — config updated.`);
       this.upsert(id, null, ip);
     } else if (existing.host !== ip) {
-      console.warn(`Ignoring "${id}" IP change to ${ip}: that's this host's own address, ` +
-                   `not a real box (test harness or proxy?). Keeping ${existing.ip}.`);
+      const why = isCgnat(ip)
+        ? `that's a tailnet/CGNAT address, not the LAN address we push to`
+        : `that's this host's own address, not a real box (test harness or proxy?)`;
+      console.warn(`Ignoring "${id}" IP change to ${ip}: ${why}. Keeping ${existing.ip}.`);
     }
     return existing;
   }
 }
 
+// Every push to a box funnels through here — the shared secret and the
+// transport choice both live in one place, so a new call site can't forget
+// either.
+//
+// Two transports, and the live reverse channel wins when there is one:
+//
+//   1. WebSocket (ws-hub.js) — the box dialled US, so this connection is
+//      PROVEN to work right now, whatever network the box is on. On the LAN it
+//      rides the same LAN, so preferring it costs nothing.
+//   2. Direct LAN HTTP to box.ip — the original path. Still the only option for
+//      a box on older firmware with no reverse channel.
+//
+// Preferring (1) is a deliberate inversion of "try LAN, fall back to WS": a
+// stale box.ip doesn't fail fast, it HANGS until the timeout (60s for /play),
+// so trying it first would stall every push to a box that has moved networks.
+// Asking "is there a proven-live channel?" is instant and has no such failure
+// mode. The heartbeat in ws-hub.js is what keeps "live" honest.
 async function postToBox(box, boxPath, body, headers = {}, timeoutMs = 60000) {
+  const withToken = fleetToken ? { ...headers, "X-Fleet-Token": fleetToken } : headers;
+
+  if (wsHas(box.id)) {
+    try {
+      // No token in the frame: the socket was authenticated once at the
+      // upgrade, so repeating the secret on every message would just spread it
+      // across more bytes (and more logs) for no additional guarantee.
+      return await wsPush(box.id, boxPath, body, headers, timeoutMs);
+    } catch (err) {
+      // Socket died between the check and the send, or the box never acked.
+      // Fall through to LAN rather than failing the push outright.
+      console.warn(`       (reverse channel to ${box.name} failed: ${err.message} — trying LAN)`);
+    }
+  }
+
   const res = await fetch(`http://${box.ip}${boxPath}`, {
     method: "POST",
     body,
-    headers,
+    headers: withToken,
     signal: AbortSignal.timeout(timeoutMs)
   });
   return res.status;
@@ -143,6 +208,18 @@ export async function sendAudio(box, wavBuffer, { quiet = false, final = false, 
   // until the ENTIRE listen+upload round trip completes on its end.
   if (autoListen) headers["X-Auto-Listen"] = "1";
   return await postToBox(box, "/play", wavBuffer, headers, autoListen ? 120000 : 60000);
+}
+
+// Force a box's session state — occupied=true plays the same greeting a real
+// presence detection would; occupied=false does the same cleanup a real
+// departure does. No body needed, the header carries everything.
+export async function sendSessionOverride(box, occupied) {
+  try {
+    return await postToBox(box, "/session", "", { "X-Occupied": occupied ? "1" : "0" }, 5000);
+  } catch (err) {
+    console.warn(`       (session override to ${box.name} failed: ${err.message})`);
+    return null;
+  }
 }
 
 // Verbatim passthrough of a backend-supplied display entry:

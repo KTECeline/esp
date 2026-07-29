@@ -9,7 +9,8 @@
 // server.js — server.js imports this file, so importing back would be circular.
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { asciiOneline, sendCaption, sendDisplay } from "./boxes.js";
+import { asciiOneline, sendCaption, sendDisplay, sendSessionOverride } from "./boxes.js";
+import { wsHas } from "./ws-hub.js";
 
 // MCP clients consume tool failures through the protocol's own error shape, so
 // a raw JS throw escaping a handler is something a model can't reason about.
@@ -54,6 +55,12 @@ function resolveBox(boxes, boxId) {
 // the mock). Only a thrown error — timeout, connection refused, DNS failure —
 // means nothing is there.
 async function probeOnline(box) {
+  // A live reverse channel is stronger evidence than any probe: the box dialled
+  // us and the heartbeat says the socket is still answering. It's also the ONLY
+  // evidence available for a box on another network, whose LAN ip we cannot
+  // reach at all — probing that would report a perfectly healthy box as
+  // offline, which is worse than not probing.
+  if (wsHas(box.id)) return true;
   try {
     await fetch(`http://${box.ip}/caption`, {
       method: "GET",
@@ -81,7 +88,7 @@ export function createMcpServer({ boxes, speakToBox }) {
     {
       title: "List ESP Boxes",
       description:
-        "Lists every ESP32-S3-BOX voice device registered with this server, and whether each is currently reachable. Call this first to discover valid box_id values for esp_speak and esp_display.\n\nArgs:\n  (none)\n\nReturns:\n  { \"boxes\": [{ \"id\": string, \"name\": string, \"ip\": string, \"online\": boolean }] }\n\nExamples:\n  - Use when: you need to know which boxes exist, or which are powered on\n  - Don't use when: there is exactly one box and you already know it responds\n\nError Handling:\n  - Never errors; an empty list means no box has registered yet\n  - online=false means the box did not answer within 2s (powered off, or off-network)",
+        "Lists every ESP32-S3-BOX voice device registered with this server, whether each is currently reachable, and whether each currently has a customer at it. Call this first to discover valid box_id values for esp_speak and esp_display.\n\nArgs:\n  (none)\n\nReturns:\n  { \"boxes\": [{ \"id\": string, \"name\": string, \"ip\": string, \"online\": boolean, \"occupied\": boolean|null }] }\n\nExamples:\n  - Use when: you need to know which boxes exist, which are powered on, or which currently have someone at them\n  - Don't use when: there is exactly one box and you already know it responds\n\nError Handling:\n  - Never errors; an empty list means no box has registered yet\n  - online=false means the box did not answer within 2s (powered off, or off-network)\n  - occupied is null until the box reports its first session event (a customer approaching, or ordering) since this server started",
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -96,7 +103,8 @@ export function createMcpServer({ boxes, speakToBox }) {
           id: b.id,
           name: b.name,
           ip: b.ip,
-          online: await probeOnline(b)
+          online: await probeOnline(b),
+          occupied: b.occupied
         }))
       );
       return mcpJson({ boxes: list });
@@ -238,6 +246,52 @@ export function createMcpServer({ boxes, speakToBox }) {
         return mcpJson({ displayed: "order", box_id: box.id });
       } catch (err) {
         return mcpError(`Could not display on "${box.id}": ${err.message}`);
+      }
+    }
+  );
+
+  // ---- esp_set_occupied -----------------------------------------------------
+  const SetOccupiedInput = z
+    .object({
+      box_id: z
+        .string()
+        .optional()
+        .describe("Which box to change. Optional when only one box is registered."),
+      occupied: z
+        .boolean()
+        .describe("true: force a session start — plays the greeting, exactly as if the presence sensor had just detected someone. false: force a session end — clears the conversation, exactly as if the customer had walked away.")
+    })
+    .strict();
+
+  server.registerTool(
+    "esp_set_occupied",
+    {
+      title: "Force a Box's Occupied Status",
+      description:
+        "Manually marks a box as occupied or free, bypassing its presence sensor. Mirrors the box's own natural behavior exactly rather than a separate silent mode: occupied=true triggers the same one-time greeting a real customer approaching would, occupied=false does the same conversation-reset a real departure does.\n\nArgs:\n  - box_id (string, optional): target box; defaults to the only box when just one is registered\n  - occupied (boolean): true = start a session (greets), false = end it (resets)\n\nReturns:\n  { \"box_id\": string, \"occupied\": boolean }\n\nExamples:\n  - Use when: testing the greeting/order flow without walking in front of the sensor\n  - Use when: a box is stuck showing occupied because its sensor missed a departure\n  - Don't use when: you just want to READ the current status — use esp_list_boxes for that\n\nError Handling:\n  - Returns an error naming valid ids if box_id is unknown or ambiguous\n  - Returns an error if the box is unreachable\n  - A no-op if the box is already in the requested state (won't re-greet an already-occupied box)",
+      inputSchema: SetOccupiedInput,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false
+      }
+    },
+    async ({ box_id, occupied }) => {
+      const { box, error } = resolveBox(boxes, box_id);
+      if (error) return mcpError(error);
+      try {
+        const status = await sendSessionOverride(box, occupied);
+        if (status === null) return mcpError(`Box "${box.id}" is unreachable at ${box.ip}.`);
+        // do_session() on the box deliberately doesn't echo this back (the
+        // server already knows — it's the one that just asked), which means
+        // the server's OWN status has to be updated here, not just the box's.
+        // occupied=true happens to also flow through /wake's side effect, but
+        // occupied=false has no such path — this is the only place it's set.
+        boxes.setOccupied(box.id, occupied);
+        return mcpJson({ box_id: box.id, occupied });
+      } catch (err) {
+        return mcpError(`Could not set occupied on "${box.id}": ${err.message}`);
       }
     }
   );
