@@ -236,7 +236,7 @@ i2c_master_bus_handle_t bsp_i2c_bus(void) { return s_i2c_bus; }
 // Customer-facing idle screen. Touch anywhere (or tap BOOT) starts a turn.
 static void show_ready(void)
 {
-    display_status("TAP TO", "ORDER", rgb565(0, 90, 160));
+    display_status("ORDER", "TAP TO START", COL_ACCENT);
 }
 
 // --------------------------------------------------------------------------
@@ -431,7 +431,7 @@ static void show_help_qr_if_double_reset(void)
     if (!prov_show_url_qr(url, "SCAN FOR HELP", "SETUP GUIDE")) {
         // Encoding failed (empty or over-long URL) — say so plainly instead of
         // leaving whatever was on screen and looking like a freeze.
-        display_status("NO HELP LINK", "SET HELP URL", rgb565(180, 120, 0));
+        display_status("NO HELP LINK", "SET HELP URL", COL_WARN);
         vTaskDelay(pdMS_TO_TICKS(4000));
         return;
     }
@@ -582,7 +582,7 @@ static bool sleep_watching_for_wifi_reset(int seconds)
         if (gpio_get_level(PIN_REC_BTN) == 0) {
             held += slice;
             if (held >= pdMS_TO_TICKS(5000)) {
-                display_status("RESET WIFI", "RELEASE NOW", rgb565(180, 0, 0));
+                display_status("RESET WIFI", "RELEASE NOW", COL_ERR);
                 while (gpio_get_level(PIN_REC_BTN) == 0) vTaskDelay(pdMS_TO_TICKS(20));
                 return true;
             }
@@ -609,14 +609,14 @@ static bool wait_server_reachable(void)
         if (!shown) {
             // Show the box's OWN ip: it's reachable now (the HTTP server is up
             // before this wait), so this is the address to POST /server to.
-            display_status("NO SERVER", s_ip_str, rgb565(180, 120, 0));
+            display_status("NO SERVER", s_ip_str, COL_WARN);
             shown = true;
         }
         ESP_LOGW(TAG, "server not reachable at %s (%d) — retrying in %ds "
                       "(hold BOOT 5s to re-provision)", s_health_url, status, delay_s);
         if (sleep_watching_for_wifi_reset(delay_s)) {
             prov_erase_creds();
-            display_status("WIFI RESET", "REBOOTING", rgb565(180, 0, 0));
+            display_status("WIFI RESET", "REBOOTING", COL_ERR);
             vTaskDelay(pdMS_TO_TICKS(800));
             esp_restart();
         }
@@ -690,7 +690,7 @@ static void record_toggle_and_send(const char *rec_line2)
     s_record_buf = heap_caps_malloc(MAX_RECORD_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!s_record_buf) {
         ESP_LOGE(TAG, "recording buffer alloc FAILED (%u bytes)", (unsigned)MAX_RECORD_BYTES);
-        display_status("MEM", "ERROR", rgb565(180, 0, 0));
+        display_status("MEM", "ERROR", COL_ERR);
         vTaskDelay(pdMS_TO_TICKS(1200));
         show_ready();
         return;
@@ -704,7 +704,7 @@ static void record_toggle_and_send(const char *rec_line2)
     esp_codec_dev_set_in_gain(s_mic, MIC_GAIN_DB);
     ESP_LOGI(TAG, ">>> recording (auto-stops after %dms silence, or tap REC, max %ds) <<<",
             VAD_SILENCE_HOLD_MS, MAX_RECORD_SECONDS);
-    display_status("REC", rec_line2, rgb565(200, 0, 0));
+    display_status("REC", rec_line2, COL_REC);
 
     const uint32_t chunk = 1024;
     uint8_t tmp[1024];
@@ -759,7 +759,7 @@ static void record_toggle_and_send(const char *rec_line2)
     }
 
     esp_codec_dev_close(s_mic);
-    display_status("SENDING", NULL, rgb565(0, 90, 160));
+    display_status("SENDING", NULL, COL_INFO);
 
     uint32_t data_bytes = s_record_len;
     uint32_t total_len = 44 + data_bytes;
@@ -791,9 +791,9 @@ static void record_toggle_and_send(const char *rec_line2)
     s_record_len = 0;
 
     s_upload_done_tick = xTaskGetTickCount();
-    if (status == 200) display_status("SENT", NULL, rgb565(0, 150, 0));
-    else if (status < 0) display_status("NO PC", "START SERVER", rgb565(180, 0, 0));
-    else display_status("SEND", "FAILED", rgb565(180, 0, 0));
+    if (status == 200) display_status("SENT", NULL, COL_OK);
+    else if (status < 0) display_status("NO PC", "START SERVER", COL_ERR);
+    else display_status("SEND", "FAILED", COL_ERR);
     vTaskDelay(pdMS_TO_TICKS(1200));
 }
 
@@ -928,9 +928,9 @@ void play_begin(play_session_t *ps, const uint8_t h[44], uint32_t body_len,
 
     ps->opts = *opts;
     if (opts->reply_txt[0]) {
-        display_caption("BOX", rgb565(0, 150, 0), opts->reply_txt);
+        display_caption("BOX", COL_OK, opts->reply_txt);
     } else if (!opts->quiet) {
-        display_status("PLAYING", NULL, rgb565(0, 150, 0));
+        display_status("PLAYING", NULL, COL_OK);
     }
 
     esp_codec_dev_sample_info_t fs = { .bits_per_sample = bits, .channel = ch, .sample_rate = rate };
@@ -1070,8 +1070,8 @@ static esp_err_t play_handler(httpd_req_t *req)
 // "what was heard" the moment STT finishes, before the reply audio arrives.
 void do_caption(const char *text, const char *who, bool confirm)
 {
-    uint16_t bar = (strcmp(who, "BOX") == 0) ? rgb565(0, 150, 0)   // green
-                                             : rgb565(200, 120, 0); // amber
+    uint16_t bar = (strcmp(who, "BOX") == 0) ? COL_OK   // green
+                                             : COL_ACCENT; // amber
 
     // Arms the tap-to-confirm window; any other caption disarms it (a new
     // screen means the pending question is no longer on display).
@@ -1206,7 +1206,7 @@ static void post_confirm(void)
     esp_http_client_cleanup(client);
     ESP_LOGI(TAG, "confirm -> %s (%d)", s_confirm_url, status);
     if (status != 200) {
-        display_status("EXPIRED", "TAP TO RETRY", rgb565(180, 0, 0));
+        display_status("EXPIRED", "TAP TO RETRY", COL_ERR);
     }
 }
 
@@ -1487,7 +1487,7 @@ void app_main(void)
     // started yet — meaning the gesture still works on a box that never gets as
     // far as WiFi, which is exactly when someone needs the guide.
     show_help_qr_if_double_reset();
-    display_status("STARTING", NULL, COL_BLACK);
+    display_status("STARTING", NULL, COL_ACCENT);
     i2s_chan_handle_t rx = i2s_init();
     mic_init(rx);
     speaker_init();
@@ -1511,7 +1511,7 @@ void app_main(void)
         start_provisioning_mode();   // never returns
     }
 
-    display_status("WIFI", "CONNECTING", COL_BLACK);
+    display_status("WIFI", "CONNECTING", COL_INFO);
     if (!wifi_connect_sta(wifi_ssid, wifi_pass)) {
         // Bad/absent network: only re-provisioning can fix this. The QR screen
         // replaces the old behavior of retrying forever behind "CONNECTING".
@@ -1519,7 +1519,7 @@ void app_main(void)
         // If this boot is a just-installed image, prefer the version that was
         // working over a QR screen nobody is standing in front of.
         ota_rollback_if_pending();
-        display_status("WIFI FAILED", "OPENING SETUP", rgb565(180, 0, 0));
+        display_status("WIFI FAILED", "OPENING SETUP", COL_ERR);
         vTaskDelay(pdMS_TO_TICKS(1500));
         start_provisioning_mode();   // never returns
     }
@@ -1552,7 +1552,7 @@ void app_main(void)
     if (!wait_server_reachable()) {
         ESP_LOGW(TAG, "server never became reachable — entering provisioning mode");
         ota_rollback_if_pending();   // see the WiFi path above
-        display_status("NO SERVER", "OPENING SETUP", rgb565(180, 0, 0));
+        display_status("NO SERVER", "OPENING SETUP", COL_ERR);
         vTaskDelay(pdMS_TO_TICKS(1500));
         start_provisioning_mode();   // never returns
     }
@@ -1608,13 +1608,13 @@ void app_main(void)
                 if (!long_press && high == 0 &&
                     (xTaskGetTickCount() - press_start) >= pdMS_TO_TICKS(5000)) {
                     long_press = true;
-                    display_status("RESET WIFI", "RELEASE NOW", rgb565(180, 0, 0));
+                    display_status("RESET WIFI", "RELEASE NOW", COL_ERR);
                 }
                 vTaskDelay(pdMS_TO_TICKS(10));
             }
             if (long_press) {
                 prov_erase_creds();   // box_id survives; only network creds go
-                display_status("WIFI RESET", "REBOOTING", rgb565(180, 0, 0));
+                display_status("WIFI RESET", "REBOOTING", COL_ERR);
                 vTaskDelay(pdMS_TO_TICKS(800));
                 esp_restart();
             }
@@ -1646,7 +1646,7 @@ void app_main(void)
             display_button_t btn = display_hit_test(tx, ty);
             if (btn == BTN_SEND) {
                 s_confirm_pending = false;
-                display_status("SENDING", "TO ASSISTANT", rgb565(0, 90, 160));
+                display_status("SENDING", "TO ASSISTANT", COL_INFO);
                 post_confirm();
                 continue;
             } else if (btn == BTN_CANCEL) {
@@ -1661,7 +1661,7 @@ void app_main(void)
         if (s_confirm_pending &&
             (int32_t)(xTaskGetTickCount() - s_confirm_deadline_tick) >= 0) {
             s_confirm_pending = false;
-            display_status("TIMED OUT", "TAP TO ORDER", rgb565(180, 0, 0));
+            display_status("TIMED OUT", "TAP TO ORDER", COL_ERR);
             ESP_LOGI(TAG, "confirm window expired — transcript discarded");
         }
         // ---- Session lifecycle (one session = one customer) ----------------

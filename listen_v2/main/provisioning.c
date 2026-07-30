@@ -507,7 +507,7 @@ static void show_qr_screen(void)
     cfg.display_func = qr_display_cb;
     if (esp_qrcode_generate(&cfg, payload) != ESP_OK) {
         // Encoder failure shouldn't strand the user — plain text still works.
-        display_status(s_ap_ssid, s_ap_psk, rgb565(0, 90, 160));
+        display_status(s_ap_ssid, s_ap_psk, COL_INFO);
     }
 }
 
@@ -608,7 +608,7 @@ void start_provisioning_mode(void)
         // and wait for a human to ask for it again.
         portal_down();
         ESP_LOGI(TAG, "portal window expired — AP down, tap BOOT to reopen");
-        display_status("WIFI SETUP", "TAP BOOT TO START", COL_BLACK);
+        display_status("WIFI SETUP", "TAP BOOT TO START", COL_ACCENT);
         wait_for_boot_tap();
         // Same PSK on re-entry by design: it's read off the screen, not memorized.
     }

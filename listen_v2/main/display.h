@@ -1,37 +1,51 @@
-// Minimal status display for the ESP32-S3-BOX-3 (ILI9341/ST7789 over SPI).
-// No LVGL — just solid color fills + a small embedded font. White-on-black
-// text is robust to any panel color-order quirks.
+// UI for the ESP32-S3-BOX-3 (ILI9341/ST7789 over SPI). No LVGL: display.c
+// composes each screen into a PSRAM framebuffer with anti-aliased Inter glyphs
+// (main/ui_font.h), rounded cards and gradients, then blits the frame in one
+// pass so nothing flickers.
 #pragma once
 #include <stdint.h>
 
-// Byte-swapped RGB565 (SPI panels want big-endian pixels).
+// Native RGB565. display.c byte-swaps once per frame on the way to the panel,
+// so every color here stays in the order the blending math wants.
 static inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
 {
-    uint16_t v = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
-    return (uint16_t)((v >> 8) | (v << 8));
+    return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
 }
 #define COL_BLACK   0x0000
 #define COL_WHITE   0xFFFF
 
-void display_init(void);
-// Fill the screen with bg and show up to two centered lines (line2 may be NULL).
-void display_status(const char *line1, const char *line2, uint16_t bg);
+// ---- Palette: warm restaurant dark. Deep charcoal ground, amber accent,
+// cream text. Status colors stay semantic but are desaturated to sit in it. ---
+#define COL_ACCENT  rgb565(0xE8, 0x93, 0x3A)   // amber: default / branded
+#define COL_OK      rgb565(0x4F, 0xA9, 0x6A)   // green: sent, playing, done
+#define COL_ERR     rgb565(0xD9, 0x53, 0x4F)   // red: failures, resets
+#define COL_WARN    rgb565(0xE0, 0xA9, 0x3A)   // yellow: misconfigured, degraded
+#define COL_INFO    rgb565(0x5A, 0x9E, 0xD6)   // blue: in-progress, neutral
+#define COL_REC     rgb565(0xE5, 0x4B, 0x4B)   // red: recording
 
-// One row of an itemized order. Both strings are UPPERCASE (the 5x7 font has no
-// lowercase glyphs). name e.g. "2X NASI LEMAK", price e.g. "RM11.00".
+void display_init(void);
+
+// Status screen: one big auto-fitted line, an optional smaller second line, and
+// `accent` used for the top rule / second line / underline (NOT as a full-screen
+// flood -- pass a palette color such as COL_OK or COL_ERR).
+void display_status(const char *line1, const char *line2, uint16_t accent);
+
+// One row of an itemized order. name e.g. "2X NASI LEMAK", price e.g. "RM11.00".
+// Mixed case renders correctly now, so callers may send "2x Nasi Lemak".
 typedef struct {
     const char *name;
     const char *price;
 } order_line_t;
 
-// Order screen: blue title bar, up to 5 itemized rows, blue TOTAL bar at bottom.
-// Rows past the 5th are dropped (no scrolling yet). title e.g. "YOUR ORDER".
+// Order screen: amber header with an item-count chip, up to 5 rows separated by
+// dotted rules, and a rounded amber TOTAL card pinned to the bottom. Rows past
+// the 5th are dropped (no scrolling yet). title e.g. "YOUR ORDER".
 void display_order(const char *title, const order_line_t *lines, int count,
                    const char *total);
 
-// Live-caption screen: colored speaker bar ("YOU"/"BOX") on top, then the text
-// word-wrapped below. Text is uppercased for the font; overflow past the screen
-// is dropped. Used to show what was heard / what is being said in realtime.
+// Live-caption screen: a rounded speaker pill ("YOU"/"BOX") tinted `bar`, then
+// the text word-wrapped inside a raised card. Used to show what was heard /
+// what is being said in realtime.
 void display_caption(const char *speaker, uint16_t bar, const char *text);
 
 // On-screen buttons. Only the confirm screen has any today.
@@ -41,17 +55,18 @@ typedef enum {
     BTN_SEND,
 } display_button_t;
 
-// Confirm screen: like display_caption(), but the transcript area is shortened
-// to fit CANCEL (red, left) and SEND (green, right) buttons along the bottom.
-// The BOOT button still confirms — touch is an addition, not a replacement.
+// Confirm screen: like display_caption(), but the card is shortened to fit
+// CANCEL (outlined, left) and SEND (green, right) buttons along the bottom.
+// The BOOT button still confirms -- touch is an addition, not a replacement.
 void display_confirm(const char *speaker, uint16_t bar, const char *text);
 
 // Which button contains this point, in DISPLAY coordinates (touch.c converts
 // from panel coordinates). Meaningful only while a display_confirm() screen is
-// up — the caller tracks that. Geometry lives in display.c beside the drawing
+// up -- the caller tracks that. Geometry lives in display.c beside the drawing
 // code so the buttons and their hit boxes can never drift apart.
 display_button_t display_hit_test(int x, int y);
 
 // Provisioning QR screen: modules is a size*size byte array (1 = black module),
-// drawn centered on white with "JOIN <ssid>" / "PASS <psk>" text underneath.
+// drawn on a white rounded card (which doubles as the quiet zone) with
+// "JOIN <ssid>" / "PASS <psk>" underneath for phones that can't read WiFi QRs.
 void display_qr(const uint8_t *modules, int size, const char *ssid, const char *psk);

@@ -33,7 +33,7 @@ static char s_token[65];
 static void ota_fail(const char *why)
 {
     ESP_LOGE(TAG, "update aborted: %s — box keeps running the current firmware", why);
-    display_status("UPDATE FAILED", "STILL RUNNING", rgb565(180, 0, 0));
+    display_status("UPDATE FAILED", "STILL RUNNING", COL_ERR);
 }
 
 static void ota_task(void *arg)
@@ -56,7 +56,7 @@ static void ota_task(void *arg)
     }
 
     ESP_LOGI(TAG, "downloading %s into slot %s", s_url, target->label);
-    display_status("UPDATING", "DO NOT UNPLUG", rgb565(0, 90, 160));
+    display_status("UPDATING", "DO NOT UNPLUG", COL_INFO);
 
     esp_http_client_config_t cfg = {
         .url               = s_url,
@@ -121,7 +121,7 @@ static void ota_task(void *arg)
                 ESP_LOGI(TAG, "%d%% (%d/%d bytes)", pct, written, total);
                 char sub[24];
                 snprintf(sub, sizeof(sub), "%d%%", pct);
-                display_status("UPDATING", sub, rgb565(0, 90, 160));
+                display_status("UPDATING", sub, COL_INFO);
             }
         }
     }
@@ -155,7 +155,7 @@ static void ota_task(void *arg)
     ESP_LOGI(TAG, "installed %d bytes into %s — rebooting into it. If it cannot "
                   "reach the server, the bootloader reverts to the previous slot.",
              written, target->label);
-    display_status("UPDATED", "REBOOTING", rgb565(0, 140, 0));
+    display_status("UPDATED", "REBOOTING", COL_OK);
     vTaskDelay(pdMS_TO_TICKS(1200));   // let the screen land before the reboot
     esp_restart();
 
@@ -244,7 +244,7 @@ void ota_rollback_if_pending(void)
     if (state != ESP_OTA_IMG_PENDING_VERIFY) return;   // nothing to revert to
 
     ESP_LOGE(TAG, "freshly-installed firmware could not get online — reverting to the previous version");
-    display_status("UPDATE BAD", "REVERTING", rgb565(180, 0, 0));
+    display_status("UPDATE BAD", "REVERTING", COL_ERR);
     vTaskDelay(pdMS_TO_TICKS(1500));
     esp_ota_mark_app_invalid_rollback_and_reboot();   // does not return
 }
