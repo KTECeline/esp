@@ -180,6 +180,47 @@ Startup logs the active pair (`Speech: stt=… tts=…`) and `/health` reports i
 cd mcp-core && npm test     # contract tests for the provider layer
 ```
 
+## Running in Docker
+
+Folds Node, `sox` and the router into one command, and works the same on Linux
+and Windows (the shell scripts are Mac-only):
+
+```bash
+docker compose up          # secrets read from ~/esp/.env automatically
+```
+
+**Speech support in the image:** `openai_whisper`, `openai_tts`, and `moss_local`
+pointed at a MOSS server running *outside* the container.
+
+**`whisper_local` is not supported in the image, on purpose.** Compiling
+whisper.cpp in would add a multi-GB layer *and* lose Metal: on Apple Silicon
+that costs encode 180ms → 672ms, dragging warm STT from ~0.7s back toward ~8s,
+because a Linux container cannot reach the Mac's GPU. Run whisper natively, or
+use a hosted STT provider.
+
+> ⚠️ **Networking — get this right before the first run.** Boxes must reach the
+> server, and the server tells each box which address to use — which the box
+> **persists**. Inside a bridge network the only address visible is a
+> Docker-internal one no box can route to, which is the same class of failure
+> as the CGNAT landmine. mcp-core therefore **refuses to guess in a container**:
+> it logs an explicit error and disables adoption, the reverse channel and OTA
+> rather than stranding the fleet.
+
+Because deployments span Linux, macOS and Windows, the host address is supplied
+at **start time** rather than written into `config.json` — the same config file
+has to run on every machine, and a baked-in address is wrong everywhere else and
+stale the moment DHCP moves. Precedence is `LAN_IP` env → `lan_ip` in config →
+auto-detect (native only).
+
+| Host | Command |
+|---|---|
+| **Linux** | uncomment `network_mode: host` — no `LAN_IP` needed, mDNS works too |
+| **macOS** | `LAN_IP=$(ipconfig getifaddr en0) docker compose up` |
+| **Windows** | set `$env:LAN_IP` to the adapter's IPv4 address, then `docker compose up` (see `docker-compose.yml` for the PowerShell one-liner) |
+
+`LAN_IP` must be an address a **box** can reach — same subnet as the IP shown on
+the box's own screen.
+
 ## Security
 
 Two independent shared secrets, both read **only** from environment variables

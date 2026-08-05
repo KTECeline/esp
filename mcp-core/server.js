@@ -14,6 +14,7 @@
 // listen_v2/assistant_via_bridge.py (one service instead of two hops).
 import http from "node:http";
 import { writeFile, readFile, mkdtemp, appendFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir, homedir, networkInterfaces } from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
@@ -684,9 +685,42 @@ const server = http.createServer(async (req, res) => {
 // upload path and need a physical re-provision per box to undo. The old version
 // returned the first non-internal IPv4 in enumeration order, which becomes a
 // coin flip the moment a VPN interface exists.
+// Inside a container, every address networkInterfaces() reports belongs to a
+// virtual network the boxes cannot route to (Docker's default bridge hands out
+// 172.17.x.x). That address is not merely useless: adoptKnownBoxes() pushes it
+// to every box every 60s and the box PERSISTS it, so one containerized start
+// would strand the whole fleet until each box is physically re-provisioned —
+// the same failure the CGNAT filter exists to prevent, arriving through a
+// different door.
+//
+// Blanket-filtering 172.16/12 would be wrong (plenty of real LANs live there),
+// so this detects the container instead and refuses to guess. Set `lan_ip` in
+// config.json to the HOST's LAN address, or run with host networking.
+const IN_CONTAINER =
+  process.env.MCP_CORE_IN_CONTAINER === "1" || existsSync("/.dockerenv");
+let warnedNoLanIp = false;
+
 function lanIp() {
   // Explicit override always wins — for when the heuristics below guess wrong.
   if (config.lanIp) return config.lanIp;
+
+  if (IN_CONTAINER) {
+    if (!warnedNoLanIp) {
+      warnedNoLanIp = true;
+      console.error(
+        "Running in a container with no LAN address configured.\n" +
+        "  Refusing to guess: the container's own address is unroutable from the boxes,\n" +
+        "  and adoption would persist it on each box until it is re-provisioned by hand.\n" +
+        "  Fix, in order of preference:\n" +
+        "    Linux            run with --network host (mDNS works too)\n" +
+        "    macOS            LAN_IP=$(ipconfig getifaddr en0) docker compose up\n" +
+        "    Windows (PS)     $env:LAN_IP=(...IPv4 address...); docker compose up\n" +
+        "    any              set \"lan_ip\" in config.json (pins it to one machine)\n" +
+        "  Until then, box adoption, the reverse-channel URL and OTA are disabled."
+      );
+    }
+    return null;   // adoptKnownBoxes()/pushFirmware() both no-op safely on null
+  }
 
   const candidates = [];
   for (const [name, list] of Object.entries(networkInterfaces())) {

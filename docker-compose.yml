@@ -1,0 +1,73 @@
+# mcp-core in one command:  docker compose up
+#
+# Secrets come from ~/esp/.env (the same gitignored file start_voice_assistant.sh
+# sources) — compose reads it automatically. Never put tokens in this file.
+#
+# READ THE NETWORKING NOTE BELOW BEFORE FIRST RUN. Getting it wrong does not
+# fail loudly at startup; it strands boxes.
+
+services:
+  mcp-core:
+    build: .
+    image: mcp-core:latest
+    container_name: mcp-core
+    restart: unless-stopped
+
+    # The operator's config, mounted read-only: box registry, backend priority
+    # and the speech block all live here. Not baked into the image, so one
+    # person's box IPs never ship to anyone else.
+    volumes:
+      - ./config.json:/app/config.json:ro
+
+    # Only names are listed — values come from ~/esp/.env or the parent shell,
+    # so no secret is ever written into this file or an image layer.
+    environment:
+      - ESP_FLEET_TOKEN
+      - ESP_MCP_TOKEN
+      - OPENAI_API_KEY
+      # Which address boxes are told to reach this machine on. Passed at start
+      # time rather than written into config.json, because it is per-machine and
+      # changes with the DHCP lease — see the NETWORKING note below. Ignored
+      # (and unnecessary) when network_mode: host is used.
+      - LAN_IP
+    env_file:
+      - path: .env
+        required: false
+
+    ports:
+      - "8000:8000"
+
+    # ---- NETWORKING ---------------------------------------------------------
+    # Boxes must reach this server, AND this server tells each box which address
+    # to use — a box PERSISTS what it is told. In a bridge network the only
+    # address visible from inside is a Docker-internal one no box can route to,
+    # so mcp-core refuses to guess (see lanIp() in server.js) and adoption, the
+    # reverse channel and OTA all stay disabled until you resolve this.
+    #
+    # LINUX — uncomment for the simplest correct setup. Boxes reach the host
+    # directly, mDNS works, and LAN_IP is not needed at all; the ports: block
+    # above becomes redundant.
+    #   network_mode: host
+    #
+    # macOS / WINDOWS (Docker Desktop) — host networking is limited, so pass the
+    # host's LAN address in at start time. Prefer this over editing config.json:
+    # the same config file is meant to run on every machine, and a baked-in
+    # address is wrong everywhere else and stale as soon as DHCP moves.
+    #
+    #   macOS         LAN_IP=$(ipconfig getifaddr en0) docker compose up
+    #   Linux         LAN_IP=$(hostname -I | awk '{print $1}') docker compose up
+    #   Windows (PS)  $env:LAN_IP=(Get-NetIPAddress -AddressFamily IPv4 `
+    #                   | Where-Object InterfaceAlias -notmatch 'Loopback|vEthernet' `
+    #                   | Select-Object -First 1 -ExpandProperty IPAddress)
+    #                 docker compose up
+    #
+    # Sanity check: LAN_IP must be the address a BOX can reach — the same one
+    # printed on the box's own screen minus the last octet. If mcp-core logs
+    # "Refusing to guess", this is unset.
+
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3

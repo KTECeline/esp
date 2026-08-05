@@ -1,0 +1,37 @@
+# Keep the build context small and, more importantly, keep secrets and
+# multi-gigabyte local assets OUT of the image.
+
+# Secrets — tokens belong in the environment at run time, never in a layer.
+.env
+*.pem
+
+# Local speech engines: deliberately not in the image (see Dockerfile header).
+# whisper.cpp alone is several GB with models.
+whisper.cpp/
+MOSS-TTS-Nano/
+
+# Firmware + ESP-IDF build output — nothing the server needs.
+listen_v2/
+.espressif/
+
+node_modules/
+**/node_modules/
+**/build/
+**/dist/
+
+.git/
+.gitignore
+.vscode/
+.claude/
+
+# Docs and evaluation data.
+docs/
+agents/
+*.md
+**/*.wav
+**/*.mp3
+**/interaction_log.jsonl
+
+# The operator's own config is mounted at run time, not baked in — otherwise
+# one person's box IPs and lan_ip ship to everyone.
+config.json

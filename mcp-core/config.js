@@ -262,7 +262,14 @@ export function loadConfig() {
     // Explicit override for which local address boxes should be told to reach
     // us on. Normally auto-detected (see lanIp() in server.js) — set this when
     // the machine has several interfaces and the guess is wrong.
-    lanIp: cfg.lan_ip || null,
+    //
+    // The LAN_IP env var wins over the config file because this is per-MACHINE,
+    // not per-deployment: the same config.json is meant to run on a Linux
+    // server, a Mac and a Windows box, and only Linux can use host networking.
+    // Baking one machine's address into a shared file makes the file wrong
+    // everywhere else, and stale the moment DHCP moves. A start-time env var is
+    // recomputed on every boot instead — see docker-compose.yml.
+    lanIp: process.env.LAN_IP || cfg.lan_ip || null,
     // Where boxes should dial their reverse channel. Empty = derive
     // ws://<lanIp>:<port>/ws, which only helps boxes on this LAN. Point it at
     // a public relay (Tailscale Funnel) to reach boxes on any network.
