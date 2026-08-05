@@ -25,6 +25,7 @@ import { loadConfig, loadRawConfig, writeConfig, ESP_ROOT } from "./config.js";
 import { BoxRegistry, asciiOneline, sendCaption, sendAudio, sendDisplay, setFleetToken, isCgnat } from "./boxes.js";
 import { createMcpServer } from "./mcp-tools.js";
 import { startWsHub, setWsFleetToken, wsHas } from "./ws-hub.js";
+import { createSpeechEngine, needsLocalEngine } from "./speech.js";
 
 const config = loadConfig();
 // The raw parsed config is kept for round-tripping: box self-registration
@@ -77,6 +78,15 @@ async function connectToMcpServer() {
   // voice-mcp-server through the env it already understands.
   if (config.stt.model) env.WHISPER_MODEL = config.stt.model;
   if (config.stt.promptFile) env.WHISPER_PROMPT_FILE = config.stt.promptFile;
+  // voice-mcp-server otherwise falls back to its own ~/esp/whisper.cpp guess,
+  // which breaks the moment this tree lives anywhere else — it would still find
+  // the model (we pass that explicitly above) but not the whisper-cli binary.
+  // Handing it our resolved root keeps both halves on the same install.
+  if (!env.WHISPER_DIR) env.WHISPER_DIR = path.join(ESP_ROOT, "whisper.cpp");
+  // Lets speech.tts.url repoint local MOSS without editing voice-mcp-server.
+  if (config.speech.tts.type === "moss_local" && config.speech.tts.url) {
+    env.TTS_URL = config.speech.tts.url;
+  }
   const transport = new StdioClientTransport({ command: "node", args: [MCP_SERVER_PATH], env });
   const client = new Client({ name: "mcp-core", version: "1.0.0" });
   await client.connect(transport);
@@ -104,6 +114,15 @@ function extractStructured(result) {
   return {};
 }
 
+// Which engines actually run is a config decision (see speech.js). mcpClient is
+// read through a getter because it is assigned later, in main() — and only when
+// a local provider is configured at all.
+const USES_LOCAL_ENGINE = needsLocalEngine(config.speech);
+const speech = createSpeechEngine(config.speech, {
+  get mcpClient() { return mcpClient; },
+  extractStructured
+});
+
 // Quiet / far-from-mic recordings transcribe as garbage unless normalized
 // first (confirmed with the ESP32-S3-BOX-3's mic). "norm -3" brings the peak
 // up to -3 dBFS.
@@ -113,26 +132,23 @@ async function sttFromBuffer(audioBuffer) {
   const normPath = path.join(tempDir, "input.wav");
   await writeFile(rawPath, audioBuffer);
   await runCommand("sox", [rawPath, normPath, "norm", "-3"]);
-  const result = await mcpClient.callTool({
-    name: "voice_transcribe_audio",
-    arguments: { audio_file_path: normPath, language: config.stt.language }
-  });
-  if (result.isError) throw new Error("MCP transcribe failed: " + JSON.stringify(result.content));
-  return (extractStructured(result).text || "").trim();
+  // Normalization stays here rather than inside a provider: it's a property of
+  // this microphone, so every engine wants it applied the same way.
+  return await speech.transcribe(normPath);
 }
 
 // text -> 48kHz WAV (MOSS-TTS) -> 22.05kHz mono for the box. The box's
 // speaker is mono, and sending full stereo over WiFi takes ~4x longer for
 // identical-sounding audio.
 async function ttsForBox(text) {
-  const result = await mcpClient.callTool({
-    name: "voice_speak_text",
-    arguments: { text, voice: "default" }
-  });
-  if (result.isError) throw new Error("MCP speak failed: " + JSON.stringify(result.content));
-  const rawPath = extractStructured(result).audio_file_path;
-  if (!rawPath) throw new Error("MCP speak tool did not return an audio file path");
-  const boxPath = rawPath.replace(/\.wav$/, "_box.wav");
+  const wav = await speech.synthesize(text);
+  // Providers hand back WAV bytes at whatever rate they like; the box needs
+  // 22.05kHz mono 16-bit. Staging through a temp file keeps this as one sox
+  // invocation regardless of which engine produced the audio.
+  const tempDir = await mkdtemp(path.join(tmpdir(), "mcp-core-tts-"));
+  const rawPath = path.join(tempDir, "reply_raw.wav");
+  const boxPath = path.join(tempDir, "reply_box.wav");
+  await writeFile(rawPath, wav);
   await runCommand("sox", [rawPath, "-r", "22050", "-c", "1", "-b", "16", boxPath]);
   return await readFile(boxPath);
 }
@@ -448,7 +464,16 @@ const server = http.createServer(async (req, res) => {
       // Liveness stays open so check_health.sh works with no secrets, but the
       // box inventory is exactly the target list for an attack on the boxes
       // (id + IP for each), so it's only returned to an authenticated caller.
-      const base = { status: "ok", mcpConnected: mcpClient !== null, backends: config.priority };
+      // `speech` reports the configured engines; mcpConnected is about the local
+      // engine subprocess specifically, so it is null — not false — when no local
+      // provider is configured. false would read as "the thing that should be up
+      // is down", which for an all-hosted deployment is simply wrong.
+      const base = {
+        status: "ok",
+        mcpConnected: USES_LOCAL_ENGINE ? mcpClient !== null : null,
+        speech: { stt: config.speech.stt.type, tts: config.speech.tts.type },
+        backends: config.priority
+      };
       if (!fleetAuthed()) return json(200, { ...base, boxCount: boxes.boxes.length });
       return json(200, {
         ...base,
@@ -790,10 +815,21 @@ async function main() {
   // Shares the main HTTP server (one port, one thing to expose). Started before
   // listen() so no box can race the upgrade handler.
   startWsHub(server, { path: "/ws" });
-  mcpClient = await connectToMcpServer();
+  // The whole point of the hosted providers: an all-hosted config never spawns
+  // voice-mcp-server, so that deployment needs neither whisper.cpp compiled nor
+  // MOSS-TTS installed — the two steps the setup guide calls genuinely hard.
+  if (USES_LOCAL_ENGINE) {
+    mcpClient = await connectToMcpServer();
+  } else {
+    console.log("Speech: all providers are hosted — voice-mcp-server not started.");
+  }
   server.listen(config.listenPort, () => {
     console.log(`mcp-core listening on port ${config.listenPort}`);
+    // Every relative path in config.json hangs off this, so a wrong root turns
+    // into "model not found" three layers down. Same reason lanIp is logged.
+    console.log(`Project root: ${ESP_ROOT}  (config: ${config.configPath})`);
     console.log(`Backends (priority order): ${config.priority.join(" -> ")}`);
+    console.log(`Speech: ${speech.describe()}`);
     console.log(`Boxes: ${boxes.boxes.map((b) => `${b.name}@${b.ip}`).join(", ")}`);
     // Logged explicitly: this is the address pushed to every box, and a wrong
     // pick (e.g. a VPN interface) is otherwise invisible until the fleet breaks.

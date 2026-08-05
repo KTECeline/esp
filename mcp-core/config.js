@@ -4,10 +4,20 @@
 // a router with nothing to route to is a bug waiting to look like silence.
 import { readFileSync } from "node:fs";
 import { writeFile, rename } from "node:fs/promises";
-import { homedir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { STT_TYPES, TTS_TYPES } from "./speech.js";
 
-export const ESP_ROOT = path.join(homedir(), "esp");
+// The project root. config.json, whisper.cpp, the firmware image and
+// voice-mcp-server are all resolved relative to it.
+//
+// Derived from THIS file's own location (mcp-core/config.js -> up one) rather
+// than a hardcoded ~/esp, so the tree works wherever it is cloned. The old
+// constant assumed ~/esp silently: anyone who put it elsewhere got "cannot read
+// config file", which points at the wrong problem entirely. Set ESP_ROOT to
+// override — a container or a split code/data layout needs that.
+export const ESP_ROOT =
+  process.env.ESP_ROOT || path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const CONFIG_PATH = process.env.MCP_CORE_CONFIG || path.join(ESP_ROOT, "config.json");
 
 // Relative paths in the config resolve against ~/esp so the file stays
@@ -94,6 +104,83 @@ export async function writeConfig(rawCfg) {
   await rename(tmp, CONFIG_PATH);
 }
 
+// Endpoint defaults per provider, so a hosted config only has to name a type
+// and a token_env. Overridable with `url` — the OpenAI-compatible types point
+// at plenty of things that are not OpenAI (Groq, a local faster-whisper).
+const SPEECH_DEFAULT_URL = {
+  openai_whisper: "https://api.openai.com/v1/audio/transcriptions",
+  openai_tts: "https://api.openai.com/v1/audio/speech",
+  moss_local: "http://localhost:8080/v1/audio/speech"
+};
+
+// Same rule as backends: a hang reads as a crash to whoever is standing at the
+// box, so anything over a network gets a voice-appropriate timeout. Local
+// engines are trusted and can be genuinely slow on a cold model load.
+const speechTimeout = (sc, isLocal) =>
+  Number.isFinite(sc.timeout_ms) ? sc.timeout_ms : (isLocal ? 120000 : 30000);
+
+// Explicit `type` always wins. Inference exists so the legacy top-level `stt`
+// block keeps working untouched, and so a half-written hosted block still does
+// the obvious thing rather than failing on a missing field.
+function inferSpeechType(sc, kind) {
+  if (sc.type) return sc.type;
+  if (sc.token_env || sc.token) return kind === "stt" ? "openai_whisper" : "openai_tts";
+  return kind === "stt" ? "whisper_local" : "moss_local";
+}
+
+function resolveSpeechSide(sc, kind, validTypes, legacy) {
+  const type = inferSpeechType(sc, kind);
+  if (!validTypes.includes(type)) {
+    console.error(`speech.${kind}.type "${type}" is not a known provider.`);
+    console.error(`Valid ${kind} types: ${validTypes.join(", ")}`);
+    console.error("Refusing to run: a box with no voice is worse than a clear error.");
+    process.exit(1);
+  }
+  const isLocal = type.endsWith("_local");
+  const token = sc.token_env
+    ? envToken(sc.token_env, `speech.${kind}.token_env`, `${type} calls will fail with an auth error`)
+    : (sc.token || null);
+  if (!isLocal && !token) {
+    // Not fatal — a self-hosted OpenAI-compatible endpoint legitimately needs
+    // no key — but silence here turns into a 401 mid-conversation.
+    console.warn(`speech.${kind}: "${type}" has no token_env set. Fine for an open endpoint, ` +
+                 `an auth failure against a real provider.`);
+  }
+  return {
+    type,
+    url: sc.url || SPEECH_DEFAULT_URL[type] || null,
+    // Local whisper takes a filesystem path; hosted takes a model NAME. Only
+    // resolve against the project root when it looks like a path, or a hosted
+    // config naming "whisper-1" would be rewritten into a bogus absolute path.
+    model: isLocal ? resolvePath(sc.model ?? legacy.model) : (sc.model || null),
+    voice: sc.voice || null,
+    language: sc.language || legacy.language || "auto",
+    promptFile: resolvePath(sc.prompt_file ?? legacy.prompt_file),
+    token,
+    timeoutMs: speechTimeout(sc, isLocal)
+  };
+}
+
+// The `speech` block, with the pre-speech-block config shape as the fallback.
+// An existing config.json that only has a top-level `stt` section resolves to
+// exactly the engines it used before this existed — no migration, no edit.
+function resolveSpeech(cfg, legacyStt) {
+  const speech = cfg.speech || {};
+  const stt = resolveSpeechSide(speech.stt || {}, "stt", STT_TYPES, legacyStt);
+  const tts = resolveSpeechSide(speech.tts || {}, "tts", TTS_TYPES, {});
+  // Bias prompt is a file path in config but a string on the wire for hosted
+  // providers, which have no access to this filesystem. Read it once here.
+  if (stt.promptFile && !stt.type.endsWith("_local")) {
+    try {
+      stt.prompt = readFileSync(stt.promptFile, "utf8").trim();
+    } catch (err) {
+      console.warn(`speech.stt.prompt_file "${stt.promptFile}" could not be read (${err.message}) — ` +
+                   "continuing without accent/vocabulary bias.");
+    }
+  }
+  return { stt, tts };
+}
+
 export function loadConfig() {
   const cfg = loadRawConfig();
 
@@ -157,6 +244,7 @@ export function loadConfig() {
       promptFile: resolvePath(stt.prompt_file),
       model: resolvePath(stt.model)
     },
+    speech: resolveSpeech(cfg, stt),
     listenPort: cfg.listen_port || 8000,
     // Spoken once, cached, and replayed on every wake tap — see server.js's
     // getGreetingAudio(). null lets the caller apply its own default text.

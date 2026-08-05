@@ -19,6 +19,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "esp_websocket_client.h"
 #include "esp_crt_bundle.h"
 #include "box_actions.h"
@@ -55,48 +56,59 @@ static char  s_body[WS_BODY_MAX];
 static int   s_body_len;
 static uint32_t s_body_expected;   // bytes of body still to come (play only)
 
-// play_after() must NOT run on the websocket event task.
-//
-// For a greeting it calls run_auto_listen(), which blocks until the customer's
-// whole turn is done — up to MAX_RECORD_SECONDS of recording plus upload and
-// STT. This task is the ONLY one servicing the socket, so blocking it here
-// stops pongs AND stops every incoming push from being read. The server then
-// sees a missed heartbeat, terminates the channel, and the mid-clip drop trips
-// play_abort() — audible as chopped-up speech, with pushes timing out and
-// falling back to LAN behind it.
-//
-// The HTTP path never hit this because httpd gives each request its own task.
-// On the socket there is only one, so the long work is handed off here instead.
-static volatile bool s_after_busy = false;
-
-static void play_after_task(void *arg)
-{
-    play_after(&s_play);
-    s_after_busy = false;
-    vTaskDelete(NULL);
-}
-
-// Non-blocking: the ack has already gone out by the time this is called, so
-// nothing on the server is waiting for it.
-static void play_after_async(void)
-{
-    if (s_after_busy) {   // previous turn still running — don't stack them
-        ESP_LOGW(TAG, "play_after still busy — skipping post-playback policy");
-        return;
-    }
-    s_after_busy = true;
-    if (xTaskCreate(play_after_task, "play_after", 4096, NULL, 5, NULL) != pdPASS) {
-        ESP_LOGE(TAG, "could not spawn play_after task");
-        s_after_busy = false;
-    }
-}
-
 static void ws_ack(const char *id, int status)
 {
     if (!s_client || !id[0]) return;
     char msg[48];
     int n = snprintf(msg, sizeof(msg), "ACK %s %d", id, status);
     esp_websocket_client_send_text(s_client, msg, n, pdMS_TO_TICKS(2000));
+}
+
+// NOTHING long-running may run on the websocket event task — it is the ONLY
+// thing servicing this socket, so blocking it stops reads, stops the keepalive
+// and stops acks. The server then sees a dead channel and terminates it, the
+// mid-clip drop trips play_abort(), and the result is chopped speech with
+// pushes falling back to LAN behind it. The HTTP path never hits this because
+// httpd gives every request its own task.
+//
+// That rule was originally applied to play_after() alone, which was only half
+// the problem: play_finish_audio() waits for the speaker to drain, so it blocks
+// for most of the clip too. Over a proxied link (Tailscale Funnel) those seconds
+// of silence are exactly what gets reaped — the ROADMAP item 9 "drops around
+// large audio pushes" symptom. Both now run here, off the event task.
+//
+// The ack still goes out only when playback has actually finished: mcp-core's
+// sendAudio() treats the ack as "playback complete" and speakToBox() paces its
+// sentence chunks against it, so acking early would collapse that pacing.
+static volatile bool s_completing = false;
+static char s_complete_id[sizeof(s_req_id)];
+
+static void play_complete_task(void *arg)
+{
+    play_finish_audio(&s_play);
+    ws_ack(s_complete_id, 200);
+    play_after(&s_play);
+    s_completing = false;
+    vTaskDelete(NULL);
+}
+
+static void play_complete_async(void)
+{
+    // Copied, not read from s_req_id at ack time: now that the event task no
+    // longer blocks, the next instruction can land while this clip is still
+    // draining and would otherwise overwrite the id we still owe an ack for.
+    strlcpy(s_complete_id, s_req_id, sizeof(s_complete_id));
+    s_completing = true;
+    if (xTaskCreate(play_complete_task, "play_done", 4096, NULL, 5, NULL) == pdPASS) return;
+
+    // Falling back to inline means blocking the event task — the very thing this
+    // exists to avoid — but silently never acking would hang the server's push
+    // for its full timeout, which is worse.
+    ESP_LOGE(TAG, "could not spawn playback completion task — finishing inline");
+    s_completing = false;
+    play_finish_audio(&s_play);
+    ws_ack(s_complete_id, 200);
+    play_after(&s_play);
 }
 
 // Pull one "Name:value" out of the collected header block. Returns false if
@@ -136,6 +148,18 @@ static void begin_instruction(const char *body, int body_len, uint32_t total_bod
 
     if (strcmp(s_path, "/play") == 0) {
         if (total_body < 44) { ESP_LOGW(TAG, "/play body too short"); s_state = WS_SKIP; return; }
+        // Only reachable now that the event task no longer blocks through a
+        // clip: a second /play can arrive while the previous one is still
+        // draining. There is one s_play session and play_begin() opens the
+        // codec, so re-entering it would corrupt playback state. mcp-core paces
+        // chunks off the ack, so this should not happen in the normal flow —
+        // hence a loud log and an explicit non-200 rather than silence.
+        if (s_completing) {
+            ESP_LOGW(TAG, "/play arrived while the previous clip was still finishing — dropping it");
+            ws_ack(s_req_id, 503);
+            s_state = WS_SKIP;
+            return;
+        }
         memset(&s_opts, 0, sizeof(s_opts));
         if (!head_get(s_head, "X-Reply-Text", s_opts.reply_txt, sizeof(s_opts.reply_txt))) {
             s_opts.reply_txt[0] = 0;
@@ -150,13 +174,11 @@ static void begin_instruction(const char *body, int body_len, uint32_t total_bod
         play_begin(&s_play, (const uint8_t *)body, s_body_expected, &s_opts);
         s_state = WS_PLAY_STREAM;
         if (body_len > 44) {
-            play_feed(&s_play, body + 44, body_len - 44);
+            play_feed_nonblocking(&s_play, body + 44, body_len - 44);
             s_body_expected -= (body_len - 44);
         }
         if (s_body_expected == 0) {
-            play_finish_audio(&s_play);
-            ws_ack(s_req_id, 200);
-            play_after_async();
+            play_complete_async();
             s_state = WS_IDLE;
         }
         return;
@@ -259,12 +281,10 @@ static void on_data(const esp_websocket_event_data_t *d)
             if (s_state == WS_PLAY_STREAM) {
                 uint32_t take2 = (uint32_t)leftover;
                 if (take2 > s_body_expected) take2 = s_body_expected;
-                play_feed(&s_play, rest, take2);
+                play_feed_nonblocking(&s_play, rest, take2);
                 s_body_expected -= take2;
                 if (s_body_expected == 0) {
-                    play_finish_audio(&s_play);
-                    ws_ack(s_req_id, 200);
-                    play_after_async();
+                    play_complete_async();
                     s_state = WS_IDLE;
                 }
             } else if (s_state == WS_TEXT_BODY) {
@@ -284,12 +304,10 @@ static void on_data(const esp_websocket_event_data_t *d)
     if (s_state == WS_PLAY_STREAM) {
         uint32_t take = (uint32_t)len;
         if (take > s_body_expected) take = s_body_expected;
-        play_feed(&s_play, p, take);
+        play_feed_nonblocking(&s_play, p, take);
         s_body_expected -= take;
         if (s_body_expected == 0) {
-            play_finish_audio(&s_play);
-            ws_ack(s_req_id, 200);           // ack before the caption linger
-            play_after_async();
+            play_complete_async();
             s_state = WS_IDLE;
         }
         return;
@@ -309,7 +327,13 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     const esp_websocket_event_data_t *d = (const esp_websocket_event_data_t *)data;
     switch (id) {
     case WEBSOCKET_EVENT_CONNECTED:
-        ESP_LOGI(TAG, "reverse channel connected — server can now reach this box from anywhere");
+        // Heap is logged here because a wss:// session's TLS buffers are the
+        // biggest single consumer of internal SRAM on this box, and the last
+        // time that ran dry it was diagnosed from sdkconfig rather than a
+        // reading. Now there is a reading.
+        ESP_LOGI(TAG, "reverse channel connected — server can now reach this box "
+                      "from anywhere (internal heap free: %u B)",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
         break;
     case WEBSOCKET_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "reverse channel disconnected (auto-reconnecting)");
@@ -327,6 +351,29 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         play_abort(&s_play);   // same reasoning as DISCONNECTED
         break;
     default: break;
+    }
+}
+
+// Application-level keepalive, as a TEXT frame rather than a WebSocket ping.
+//
+// Tailscale Funnel appears not to relay WS control frames (MEASURED — it is why
+// ws-hub.js counts any inbound frame as proof-of-life instead of just a pong),
+// so the client's own ping_interval_sec pings can vanish in the proxy and a
+// perfectly healthy box looks dead. Text frames demonstrably survive the trip:
+// that is how acks get back. The server needs no change — it marks the socket
+// alive on every message, and its ACK regex simply won't match this.
+#define WS_KEEPALIVE_MS 15000
+static TaskHandle_t s_keepalive = NULL;
+
+static void ws_keepalive_task(void *arg)
+{
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(WS_KEEPALIVE_MS));
+        if (s_client && esp_websocket_client_is_connected(s_client)) {
+            // Sent off the event task on purpose; the client serialises sends
+            // internally, and this must keep firing even while a clip plays.
+            esp_websocket_client_send_text(s_client, "PING", 4, pdMS_TO_TICKS(2000));
+        }
     }
 }
 
@@ -364,6 +411,11 @@ bool ws_client_start(const char *url, const char *box_id, const char *fleet_toke
     if (esp_websocket_client_start(s_client) != ESP_OK) {
         ESP_LOGE(TAG, "start failed for %s", url);
         return false;
+    }
+    // One task for the life of the process — ws_client_start() can be called
+    // again to repoint the box, and that must not stack keepalive tasks.
+    if (!s_keepalive) {
+        xTaskCreate(ws_keepalive_task, "ws_keepalive", 2560, NULL, 4, &s_keepalive);
     }
     ESP_LOGI(TAG, "reverse channel dialling %s", url);
     return true;

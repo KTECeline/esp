@@ -880,8 +880,24 @@ static void start_listening(void)
 // Now the playback task drains a ring buffer that the network-receive loop
 // keeps topped up, so short stalls get absorbed instead of heard.
 // --------------------------------------------------------------------------
-#define PLAYBACK_RINGBUF_BYTES   (64 * 1024)   // ~1.45s of audio at 22050/16/mono
+// Sized so a whole sentence chunk fits WITHOUT the feeder ever having to wait.
+// That matters far beyond jitter absorption: on the WebSocket transport the
+// feeder IS the single event task servicing the socket (ws_client.c), so any
+// blocking in play_feed() stops the box reading the socket, stops its keepalive
+// and stops its acks — which is what a proxied/relayed link (Tailscale Funnel)
+// reaps as a dead connection. See ROADMAP item 9.
+//
+// In PSRAM, not internal SRAM: 512KB would never fit internally, and the 64KB
+// internal ring this replaces is exactly what ran the internal heap dry against
+// a live TLS session and crashed the box once already.
+#define PLAYBACK_RINGBUF_BYTES   (512 * 1024)  // ~11.6s of audio at 22050/16/mono
 #define PLAYBACK_PREBUFFER_BYTES (16 * 1024)   // ~0.36s prebuffer before starting
+
+// How long play_feed() will wait for ring space before giving up on the bytes it
+// was handed. Only reachable if a clip outruns the ring above; dropping audio
+// (a momentary glitch) beats starving the socket until the far end kills it.
+#define PLAY_FEED_WAIT_MS        250
+#define PLAY_FEED_GIVEUP_MS      2000
 
 // playback_task_args_t / play_opts_t / play_session_t now live in box_actions.h
 // so the WebSocket transport can drive the same playback path.
@@ -924,7 +940,12 @@ void play_begin(play_session_t *ps, const uint8_t h[44], uint32_t body_len,
     if (!is_wav || rate < 8000 || rate > 48000) { rate = 16000; ch = 1; bits = 16; }
     if (ch < 1 || ch > 2) ch = 1;
     if (bits != 16) bits = 16;
-    ESP_LOGI(TAG, "playing: %u Hz, %u ch, %u-bit", (unsigned)rate, ch, bits);
+    // Internal-SRAM reading, not a guess from sdkconfig: the crash this box hit
+    // once (TLS buffers vs the playback ring) was root-caused by reasoning about
+    // config instead of measuring, and nothing in the firmware read the heap.
+    ESP_LOGI(TAG, "playing: %u Hz, %u ch, %u-bit (internal heap free: %u B)",
+             (unsigned)rate, ch, bits,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 
     ps->opts = *opts;
     if (opts->reply_txt[0]) {
@@ -937,8 +958,10 @@ void play_begin(play_session_t *ps, const uint8_t h[44], uint32_t body_len,
     esp_codec_dev_open(s_spk, &fs);
     esp_codec_dev_set_out_vol(s_spk, 85);
 
-    ps->args.ring = xStreamBufferCreate(PLAYBACK_RINGBUF_BYTES, 1);
+    ps->args.ring = xStreamBufferCreateWithCaps(PLAYBACK_RINGBUF_BYTES, 1,
+                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     ps->args.done = xSemaphoreCreateBinary();
+    ps->args.waits = 0;
     // Under real memory pressure (e.g. a live TLS session competing for the
     // same internal-RAM pool) either allocation can come back NULL. Every
     // FreeRTOS call below trusts a non-null handle without checking — feeding
@@ -947,7 +970,7 @@ void play_begin(play_session_t *ps, const uint8_t h[44], uint32_t body_len,
     if (!ps->args.ring || !ps->args.done) {
         ESP_LOGE(TAG, "playback alloc failed (ring=%p done=%p) — dropping this clip",
                   ps->args.ring, ps->args.done);
-        if (ps->args.ring) { vStreamBufferDelete(ps->args.ring); ps->args.ring = NULL; }
+        if (ps->args.ring) { vStreamBufferDeleteWithCaps(ps->args.ring); ps->args.ring = NULL; }
         if (ps->args.done) { vSemaphoreDelete(ps->args.done); ps->args.done = NULL; }
         esp_codec_dev_close(s_spk);
         ps->active = false;
@@ -969,16 +992,56 @@ void play_feed(play_session_t *ps, const void *data, size_t len)
     }
 }
 
+// play_feed() for callers that must not block: the WebSocket event task is the
+// only thing servicing the socket, so a long wait here silently kills the
+// channel rather than just delaying audio (ROADMAP item 9). Waits in short
+// slices, counts them so we can tell whether the ring is actually big enough,
+// and drops the remainder rather than starving the transport indefinitely.
+void play_feed_nonblocking(play_session_t *ps, const void *data, size_t len)
+{
+    if (!ps->active) return;
+    const uint8_t *p = (const uint8_t *)data;
+    size_t sent = 0;
+    int waited_ms = 0;
+    while (sent < len) {
+        size_t n = xStreamBufferSend(ps->args.ring, p + sent, len - sent,
+                                     pdMS_TO_TICKS(PLAY_FEED_WAIT_MS));
+        sent += n;
+        if (sent >= len) break;
+        // Ring full: the clip is outrunning PLAYBACK_RINGBUF_BYTES. Worth
+        // knowing about — it means the sizing assumption no longer holds.
+        ps->args.waits++;
+        waited_ms += PLAY_FEED_WAIT_MS;
+        if (waited_ms >= PLAY_FEED_GIVEUP_MS) {
+            ESP_LOGW(TAG, "play_feed gave up after %dms with %u bytes unwritten — "
+                          "dropping them to keep the socket alive",
+                     waited_ms, (unsigned)(len - sent));
+            return;
+        }
+    }
+}
+
 // Blocks until the audio has actually finished coming out of the speaker.
 void play_finish_audio(play_session_t *ps)
 {
     if (!ps->active) return;   // already finished or aborted
     xSemaphoreTake(ps->args.done, portMAX_DELAY);
     vSemaphoreDelete(ps->args.done);
-    vStreamBufferDelete(ps->args.ring);
+    vStreamBufferDeleteWithCaps(ps->args.ring);
     esp_codec_dev_close(s_spk);
     ps->active = false;
-    if (!ps->args.abort_now) ESP_LOGI(TAG, "playback done");
+    if (!ps->args.abort_now) {
+        // waits>0 means a feeder had to wait on ring space. On the WebSocket
+        // path that is the failure mode from ROADMAP item 9 starting to
+        // reappear, so it is surfaced rather than absorbed silently.
+        if (ps->args.waits) {
+            ESP_LOGW(TAG, "playback done — feeder waited on ring space %u times "
+                          "(clip outran the %uKB ring)",
+                     (unsigned)ps->args.waits, PLAYBACK_RINGBUF_BYTES / 1024);
+        } else {
+            ESP_LOGI(TAG, "playback done");
+        }
+    }
     ps->end_tick = xTaskGetTickCount();
 }
 

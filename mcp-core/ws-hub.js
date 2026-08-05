@@ -97,6 +97,12 @@ function handleAck(text) {
   if (!p) return;             // late ack after timeout — ignore
   pending.delete(m[1]);
   clearTimeout(p.timer);
+  // For /play the ack means "playback finished", so this latency is dominated
+  // by the clip's own duration — what matters is that it ARRIVES. Logged with
+  // the push size because ROADMAP item 9's failure was specifically large audio
+  // pushes, and it was never root-caused partly because nothing recorded this.
+  const ms = Date.now() - p.startedAt;
+  console.log(`       WS ${p.path} -> ${p.boxId}: ${p.bytes}B, acked ${m[2]} in ${ms}ms`);
   p.resolve(parseInt(m[2], 10));
 }
 
@@ -109,12 +115,14 @@ export function wsPush(boxId, path, body, headers = {}, timeoutMs = 60000) {
     const sock = sockets.get(boxId);
     if (!sock || sock.readyState !== 1) return reject(new Error("no live websocket for " + boxId));
     const id = randomUUID().slice(0, 8);
+    const frame = encodeFrame(id, path, headers, body);
     const timer = setTimeout(() => {
       pending.delete(id);
-      reject(new Error(`websocket push to ${boxId} timed out after ${timeoutMs}ms`));
+      reject(new Error(`websocket push to ${boxId} timed out after ${timeoutMs}ms ` +
+                       `(${frame.length}B ${path})`));
     }, timeoutMs);
-    pending.set(id, { resolve, reject, timer });
-    sock.send(encodeFrame(id, path, headers, body), (err) => {
+    pending.set(id, { resolve, reject, timer, path, boxId, bytes: frame.length, startedAt: Date.now() });
+    sock.send(frame, (err) => {
       if (!err) return;
       pending.delete(id);
       clearTimeout(timer);
@@ -189,9 +197,18 @@ export function startWsHub(httpServer, { path = "/ws" } = {}) {
       alive();
       if (!isBinary) handleAck(data.toString());
     });
-    ws.on("close", () => {
+    // Close code + reason, not just "closed": through a relay the difference
+    // between a clean 1000, a 1006 abnormal close (the proxy dropped us) and a
+    // 1009 too-big is the whole diagnosis. `inflight` says whether it died
+    // mid-push, which is the ROADMAP item 9 symptom.
+    ws.on("close", (code, reason) => {
       if (sockets.get(boxId) === ws) sockets.delete(boxId);
-      console.log(`Box "${boxId}" reverse channel closed`);
+      const inflight = [...pending.values()].filter((p) => p.boxId === boxId);
+      const detail = inflight.length
+        ? ` MID-PUSH (${inflight.map((p) => `${p.path} ${p.bytes}B`).join(", ")})`
+        : "";
+      console.log(`Box "${boxId}" reverse channel closed: code=${code}` +
+                  `${reason?.length ? ` reason="${reason}"` : ""}${detail}`);
     });
     ws.on("error", (err) => console.warn(`WS error for "${boxId}": ${err.message}`));
   });

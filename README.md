@@ -4,14 +4,42 @@ Fully local voice pipeline for the ESP32-S3-BOX-3. No cloud, no API keys.
 
 > **Running a demo?** → **[`DEMO.md`](DEMO.md)** — system overview, WiFi setup,
 > Tailscale, OTA, troubleshooting and a pre-demo checklist, in order.
-~/esp/start_voice_assistant.sh 
-~/esp/check_health.sh
-~/esp/point_box_at_me.sh 192.168.68.142
+>
+> **Setting up a new machine?** → run `./check_setup.sh` first. It names every
+> missing prerequisite and the command that installs it.
 
-cd ~/esp/listen_v2 && source idfenv.sh 
-idf.py build     
+## Requirements
 
-cd ~/esp/listen_v2 && source idfenv.sh && idf.py flash
+On the machine running the brain:
+
+| Needs | Why | Install |
+|---|---|---|
+| Node.js 18+ | runs mcp-core; 18 is the floor for built-in `fetch` | [nodejs.org](https://nodejs.org) (LTS) |
+| **`sox`** | **every** recording is peak-normalized before STT, and every reply downsampled for the box's mono speaker — without it the audio path fails on the first customer | `brew install sox` (Linux: `apt install sox`) |
+| `python3` | eval tooling and the MOSS-TTS venv | preinstalled on macOS |
+| whisper.cpp | speech → text — **only for `whisper_local`** | see `docs/client-setup.html` step 7 |
+| MOSS-TTS-Nano | text → speech — **only for `moss_local`** | see `docs/client-setup.html` step 7 |
+
+The two speech engines are the genuinely hard part of a fresh install: neither
+ships in this repo and neither has a simple installer. **A hosted `speech` block
+skips both entirely** — see below. `./check_setup.sh` checks only what your
+config actually uses.
+
+The tree resolves paths from its own location, so it does **not** have to live at
+`~/esp`. Set `ESP_ROOT` to override (split code/data layouts, containers).
+
+## Quick reference
+
+```bash
+./check_setup.sh                        # is everything installed?  (new machine)
+./start_voice_assistant.sh [box_ip]     # start the whole stack
+./check_health.sh                       # is everything running?    (before a demo)
+./point_box_at_me.sh 192.168.68.142     # repoint a box at this machine
+
+cd listen_v2 && source idfenv.sh        # firmware: activate ESP-IDF first
+idf.py build
+idf.py flash                            # USB flash; over-the-air is POST /ota
+```
 
 ## Architecture
 
@@ -112,6 +140,44 @@ Claude Code, as one example client:
 ```bash
 claude mcp add --transport http mcp-core http://<mac-ip>:8000/mcp \
   --header "Authorization: Bearer $ESP_MCP_TOKEN"
+```
+
+## Speech engines — local or hosted, by config
+
+STT and TTS dispatch by **type**, the same way backends do, so swapping either
+is a config edit rather than a code change:
+
+```jsonc
+"speech": {
+  "stt": { "type": "whisper_local", "model": "whisper.cpp/models/ggml-small.bin" },
+  "tts": { "type": "moss_local" }
+}
+```
+
+| Side | Type | Runs |
+|---|---|---|
+| stt | `whisper_local` | local whisper.cpp. `model` is a **file path** |
+| stt | `openai_whisper` | any OpenAI-compatible `/v1/audio/transcriptions` (OpenAI, Groq, self-hosted). `model` is a **name** |
+| tts | `moss_local` | local MOSS-TTS server |
+| tts | `openai_tts` | any OpenAI-compatible `/v1/audio/speech` |
+
+**Why it matters: if both sides are hosted, `voice-mcp-server` is never started**,
+so that install needs neither whisper.cpp compiled nor MOSS-TTS set up — the two
+steps `docs/client-setup.html` itself calls genuinely difficult. Mixing is fine
+(local STT + hosted TTS is a real combination); either local half still starts
+the subprocess. `sox` is required either way — it formats audio for the box's
+mono speaker regardless of which engine produced it.
+
+Keys are **never** written in `config.json` — `token_env` names an environment
+variable, exactly like backends. `prompt_file` works for hosted STT too: it's
+read and sent as the bias prompt, so Manglish/menu vocabulary keeps helping
+accuracy. Omit the `speech` block entirely and the legacy top-level `stt`
+section is used, resolving to the local pair exactly as before — no migration.
+
+Startup logs the active pair (`Speech: stt=… tts=…`) and `/health` reports it.
+
+```bash
+cd mcp-core && npm test     # contract tests for the provider layer
 ```
 
 ## Security

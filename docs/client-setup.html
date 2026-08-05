@@ -474,14 +474,28 @@ cd ~/esp/voice-mcp-server &amp;&amp; npm install &amp;&amp; npm run build</pre>
       <ul class="plain">
         <li><strong>whisper.cpp</strong> — hearing. Must be compiled on your machine, then a language model downloaded (<code class="inline">ggml-small.bin</code>, about 465MB).</li>
         <li><strong>MOSS-TTS-Nano</strong> — speaking. Runs in a Python environment of its own.</li>
+        <li><strong>sox</strong> — the audio plumbing between them. One command, and unlike the other two it really is that easy.</li>
       </ul>
+      <div class="cmd">
+        <div class="cmd-head"><span>Install sox</span><button class="copy">Copy</button></div>
+        <pre>brew install sox</pre>
+      </div>
+      <div class="note warn">
+        <span class="label">Don't skip sox</span>
+        <p>
+          It runs on every single recording and every single reply. Miss it and
+          everything starts up looking healthy, then the first customer gets
+          silence — with an error that mentions neither audio nor sox. It is the
+          cheapest line on this page and the most confusing one to debug.
+        </p>
+      </div>
       <div class="note warn">
         <span class="label">Be realistic here</span>
         <p>
-          Neither ships with the project and neither has a simple installer. If you're
-          not comfortable compiling software, this is the point to ask your provider
-          for a prepared copy with both already in place. That is a normal request,
-          not a failure.
+          The other two ship with neither the project nor a simple installer. If
+          you're not comfortable compiling software, this is the point to ask your
+          provider for a prepared copy with both already in place. That is a normal
+          request, not a failure.
         </p>
       </div>
     </div>

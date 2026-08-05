@@ -25,6 +25,10 @@ typedef struct {
     // 3s starvation timeout. Needed because a dropped transport stops feeding
     // the ring without ever delivering the byte count play_begin() promised.
     volatile bool abort_now;
+    // How many times a feeder had to wait for ring space. Non-zero means a clip
+    // outran the ring, which on the WebSocket transport is the beginning of the
+    // stall that kills a proxied channel — so it gets logged, not swallowed.
+    uint32_t waits;
 } playback_task_args_t;
 
 typedef struct {
@@ -48,7 +52,15 @@ typedef struct {
 void play_begin(play_session_t *ps, const uint8_t h[44], uint32_t body_len,
                 const play_opts_t *opts);
 void play_feed(play_session_t *ps, const void *data, size_t len);
-// Blocks until the audio has finished leaving the speaker.
+// play_feed() for a caller that must not block. The HTTP path gets a task per
+// request from httpd and so can afford to wait; the WebSocket event task is the
+// ONLY thing servicing that socket, and blocking it stops reads, keepalives and
+// acks — which a proxied link (Tailscale Funnel) reaps as a dead connection.
+// Waits in short slices and drops the remainder rather than starving the
+// transport. See ROADMAP item 9.
+void play_feed_nonblocking(play_session_t *ps, const void *data, size_t len);
+// Blocks until the audio has finished leaving the speaker. MUST NOT be called
+// from the WebSocket event task — use ws_client.c's play_complete_async().
 void play_finish_audio(play_session_t *ps);
 // Give up on a clip whose transport died mid-stream. Without this the codec is
 // left open and the still-enabled I2S TX channel keeps re-clocking its last DMA

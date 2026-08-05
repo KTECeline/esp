@@ -31,6 +31,54 @@
       "system_prompt": "You are a helpful voice assistant. Keep replies to 1-2 short spoken sentences."
     }
   },
+  "_speech_help": [
+    "Which engines turn speech into text and text back into speech. Same rule as",
+    "backends: dispatch is by TYPE, so a new engine is a config edit, not a code",
+    "change. Leave this block out entirely and the legacy top-level `stt` section",
+    "below is used instead, exactly as before — no migration needed.",
+    "",
+    "  stt: whisper_local  | local whisper.cpp. `model` is a FILE PATH.",
+    "       openai_whisper | any OpenAI-compatible /v1/audio/transcriptions",
+    "                        (OpenAI, Groq, self-hosted). `model` is a NAME.",
+    "  tts: moss_local     | local MOSS-TTS server.",
+    "       openai_tts     | any OpenAI-compatible /v1/audio/speech.",
+    "",
+    "WHY IT MATTERS: if BOTH sides are hosted, voice-mcp-server is never started,",
+    "so that install needs neither whisper.cpp compiled nor MOSS-TTS set up —",
+    "the two genuinely hard steps in docs/client-setup.html disappear. `sox` is",
+    "still required either way (it formats audio for the box's speaker).",
+    "",
+    "NEVER put a real API key here — use token_env to name an environment variable.",
+    "`url` is optional and defaults to the provider's standard endpoint.",
+    "timeout_ms defaults to 30s hosted / 120s local."
+  ],
+  "speech": {
+    "stt": {
+      "type": "whisper_local",
+      "model": "whisper.cpp/models/ggml-small.bin",
+      "prompt_file": "voice-mcp-server/manglish_prompt.txt",
+      "language": "en"
+    },
+    "tts": {
+      "type": "moss_local",
+      "url": "http://localhost:8080/v1/audio/speech"
+    }
+  },
+
+  "_speech_hosted_example": [
+    "The no-compile alternative — replace the `speech` block above with this and",
+    "export OPENAI_API_KEY. prompt_file still works: it is read and sent as the",
+    "bias prompt, so Manglish/menu vocabulary keeps helping accuracy.",
+    "  \"speech\": {",
+    "    \"stt\": { \"type\": \"openai_whisper\", \"model\": \"whisper-1\",",
+    "              \"language\": \"en\", \"token_env\": \"OPENAI_API_KEY\",",
+    "              \"prompt_file\": \"voice-mcp-server/manglish_prompt.txt\" },",
+    "    \"tts\": { \"type\": \"openai_tts\", \"model\": \"tts-1\", \"voice\": \"alloy\",",
+    "              \"token_env\": \"OPENAI_API_KEY\" }",
+    "  }"
+  ],
+
+  "_stt_help": "LEGACY — superseded by `speech` above, still honored so old configs keep working. Used only when `speech` is absent.",
   "stt": {
     "language": "en",
     "prompt_file": "voice-mcp-server/manglish_prompt.txt",
