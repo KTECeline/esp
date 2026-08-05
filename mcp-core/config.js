@@ -181,6 +181,33 @@ function resolveSpeech(cfg, legacyStt) {
   return { stt, tts };
 }
 
+// The camera attached to THIS machine (not to a box — the BOX-3 has none).
+// Absent or disabled leaves the vision tools unregistered entirely, so a client
+// sees no camera rather than tools that always fail.
+function resolveVision(cfg) {
+  const v = cfg.vision || {};
+  if (v.enabled === false) return null;
+  // Requiring an explicit device is deliberate: index 0 is the built-in
+  // FaceTime camera on a Mac, so a default would silently point at the laptop
+  // lid instead of the counter camera someone plugged in on purpose.
+  if (v.device === undefined || v.device === null || v.device === "") return null;
+  return {
+    device: v.device,
+    // avfoundation (macOS), v4l2 (Linux), dshow (Windows).
+    backend: v.backend || "avfoundation",
+    width: v.width || 640,
+    height: v.height || 480,
+    framerate: v.framerate || 30,
+    // Many USB webcams offer only uyvy422; letting ffmpeg pick yuv420p makes it
+    // refuse the device outright. List a camera's modes with:
+    //   ffmpeg -f avfoundation -video_size 9999x9999 -i "<index>" -frames:v 1 -
+    pixelFormat: v.pixel_format || (v.backend === "avfoundation" || !v.backend ? "uyvy422" : null),
+    warmupFrames: Number.isFinite(v.warmup_frames) ? v.warmup_frames : 12,
+    jpegQuality: Number.isFinite(v.jpeg_quality) ? v.jpeg_quality : 4,
+    timeoutMs: Number.isFinite(v.timeout_ms) ? v.timeout_ms : 15000
+  };
+}
+
 export function loadConfig() {
   const cfg = loadRawConfig();
 
@@ -245,6 +272,9 @@ export function loadConfig() {
       model: resolvePath(stt.model)
     },
     speech: resolveSpeech(cfg, stt),
+    // null when no camera is configured — the vision tools are then not
+    // registered at all (see mcp-tools.js).
+    vision: resolveVision(cfg),
     listenPort: cfg.listen_port || 8000,
     // Spoken once, cached, and replayed on every wake tap — see server.js's
     // getGreetingAudio(). null lets the caller apply its own default text.

@@ -30,6 +30,13 @@ void display_init(void);
 // flood -- pass a palette color such as COL_OK or COL_ERR).
 void display_status(const char *line1, const char *line2, uint16_t accent);
 
+// Stamps a small state pill in the top-right corner of whatever is currently on
+// screen. Call it AFTER the screen it annotates — it composites over the
+// existing framebuffer and flushes itself.
+//   display_status("ORDER", "TAP TO START", COL_ACCENT);
+//   display_badge("FREE", COL_OK);
+void display_badge(const char *label, uint16_t color);
+
 // One row of an itemized order. name e.g. "2X NASI LEMAK", price e.g. "RM11.00".
 // Mixed case renders correctly now, so callers may send "2x Nasi Lemak".
 typedef struct {

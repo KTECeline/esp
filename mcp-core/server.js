@@ -27,6 +27,7 @@ import { BoxRegistry, asciiOneline, sendCaption, sendAudio, sendDisplay, setFlee
 import { createMcpServer } from "./mcp-tools.js";
 import { startWsHub, setWsFleetToken, wsHas } from "./ws-hub.js";
 import { createSpeechEngine, needsLocalEngine } from "./speech.js";
+import { captureJpeg, scanQr, describeDevice } from "./vision.js";
 
 const config = loadConfig();
 // The raw parsed config is kept for round-tripping: box self-registration
@@ -123,6 +124,17 @@ const speech = createSpeechEngine(config.speech, {
   get mcpClient() { return mcpClient; },
   extractStructured
 });
+
+// Bound once so the tool layer never sees camera flags — null when no camera is
+// configured, which is what keeps the vision tools unregistered.
+const visionApi = config.vision
+  ? {
+      width: config.vision.width,
+      height: config.vision.height,
+      captureJpeg: () => captureJpeg(config.vision),
+      scanQr: () => scanQr(config.vision)
+    }
+  : null;
 
 // Quiet / far-from-mic recordings transcribe as garbage unless normalized
 // first (confirmed with the ESP32-S3-BOX-3's mic). "norm -3" brings the peak
@@ -453,7 +465,7 @@ const server = http.createServer(async (req, res) => {
       if (config.mcpToken && req.headers.authorization !== `Bearer ${config.mcpToken}`) {
         return json(401, { error: "unauthorized — missing or wrong Bearer token" });
       }
-      const mcp = createMcpServer({ boxes, speakToBox });
+      const mcp = createMcpServer({ boxes, speakToBox, vision: visionApi });
       const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
       res.on("close", () => { transport.close(); mcp.close(); });
       await mcp.connect(transport);
@@ -864,6 +876,20 @@ async function main() {
     console.log(`Project root: ${ESP_ROOT}  (config: ${config.configPath})`);
     console.log(`Backends (priority order): ${config.priority.join(" -> ")}`);
     console.log(`Speech: ${speech.describe()}`);
+    if (!config.vision) {
+      console.log("Camera: none configured (vision tools not registered)");
+    } else {
+      // Resolved by NAME, not just echoed back: "device 1" tells you nothing
+      // about which lens is pointed where, and pointing at the wrong camera is
+      // a privacy problem rather than something you notice in a log later.
+      describeDevice(config.vision).then((d) => {
+        console.log(`Camera: "${d.name}" @ ${config.vision.width}x${config.vision.height}` +
+                    ` (esp_capture, esp_scan_qr)`);
+        if (d.warning) console.warn(`  WARNING: ${d.warning}`);
+      }).catch(() => {
+        console.log(`Camera: device ${config.vision.device} (could not enumerate to confirm which)`);
+      });
+    }
     console.log(`Boxes: ${boxes.boxes.map((b) => `${b.name}@${b.ip}`).join(", ")}`);
     // Logged explicitly: this is the address pushed to every box, and a wrong
     // pick (e.g. a VPN interface) is otherwise invisible until the fleet breaks.

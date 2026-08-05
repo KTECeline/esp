@@ -79,7 +79,7 @@ async function probeOnline(box) {
 // supplies the items and the total, mcp-core just encodes them.
 const orderField = (s, limit = 15) => asciiOneline(String(s ?? ""), limit).toUpperCase();
 
-export function createMcpServer({ boxes, speakToBox }) {
+export function createMcpServer({ boxes, speakToBox, vision }) {
   const server = new McpServer({ name: "mcp-core", version: "1.0.0" });
 
   // ---- esp_list_boxes ------------------------------------------------------
@@ -298,6 +298,66 @@ export function createMcpServer({ boxes, speakToBox }) {
       }
     }
   );
+
+  // ---- esp_capture / esp_scan_qr -------------------------------------------
+  // Registered ONLY when a camera is configured. A client that can see these
+  // tools can rely on them existing; one that cannot see them is not told about
+  // a camera that is not there.
+  if (vision) {
+    server.registerTool(
+      "esp_capture",
+      {
+        title: "Take a Photo from the Counter Camera",
+        description:
+          "Takes a still photo from the camera attached to THIS SERVER and returns it as an image you can look at directly.\n\nIMPORTANT: this is the server's own camera (one, at the counter) — it is NOT a camera on a voice box. The ESP32-S3-BOX-3 has no camera, so there is no per-box view and box_id does not apply here.\n\nArgs:\n  (none)\n\nReturns:\n  An image block (JPEG) plus { \"captured\": true, \"width\": number, \"height\": number }\n\nExamples:\n  - Use when: you need to see what is physically in front of the counter camera\n  - Use when: someone asks what is on the counter, or to check whether anyone is there\n  - Don't use when: you want to READ a QR code — esp_scan_qr decodes it properly instead of asking you to read pixels\n\nError Handling:\n  - Returns an error naming the fix if the camera is busy, unplugged, or the OS is withholding camera permission\n  - The first frames of a USB webcam are discarded automatically while exposure settles",
+        annotations: {
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: false,   // each call is a new moment in time
+          openWorldHint: true      // it observes the physical world
+        }
+      },
+      async () => {
+        try {
+          const jpeg = await vision.captureJpeg();
+          return {
+            content: [
+              { type: "image", data: jpeg.toString("base64"), mimeType: "image/jpeg" },
+              { type: "text", text: JSON.stringify({ captured: true, width: vision.width, height: vision.height }) }
+            ],
+            structuredContent: { captured: true, width: vision.width, height: vision.height }
+          };
+        } catch (err) {
+          return mcpError(`Could not take a photo: ${err.message}`);
+        }
+      }
+    );
+
+    server.registerTool(
+      "esp_scan_qr",
+      {
+        title: "Scan a QR Code at the Counter",
+        description:
+          "Looks for a QR code in front of the server's counter camera and returns its decoded contents as text. Tries several frames, because a code held by hand moves and blurs.\n\nIMPORTANT: this reads the camera attached to THIS SERVER, not a box — the voice boxes have no camera. Use it for a customer presenting a code (a payment app, a member card, an order slip).\n\nArgs:\n  (none)\n\nReturns:\n  { \"found\": true, \"text\": string, \"corners\": {...} } when a code is read\n  { \"found\": false } when there is no code in view — this is a NORMAL result, not a failure\n\nExamples:\n  - Use when: a customer is holding a QR code up to the camera\n  - Use when: you must verify a scan before confirming a payment\n  - Don't use when: you want to SHOW a payment QR — that is drawn on the box screen, not scanned\n\nError Handling:\n  - found=false simply means nothing was in view; ask the customer to hold it steady and closer, then call again\n  - This camera captures at 640x480, so a small or distant code will not resolve — closer is better\n  - Returns an error only when the camera itself cannot be read",
+        annotations: {
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: false,
+          openWorldHint: true
+        }
+      },
+      async () => {
+        try {
+          const found = await vision.scanQr();
+          if (!found) return mcpJson({ found: false });
+          console.log(`[camera] QR scanned: ${JSON.stringify(found.text.slice(0, 80))}`);
+          return mcpJson({ found: true, text: found.text, corners: found.corners });
+        } catch (err) {
+          return mcpError(`Could not scan: ${err.message}`);
+        }
+      }
+    );
+  }
 
   return server;
 }

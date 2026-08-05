@@ -78,6 +78,48 @@
     "  }"
   ],
 
+  "_vision_help": [
+    "A camera attached to THIS MACHINE — the counter camera. The BOX-3 has no",
+    "camera, so this is one camera for the server, not one per box.",
+    "Omit this block (or set enabled:false) and the esp_capture / esp_scan_qr",
+    "MCP tools are not registered at all, so a client is never offered a camera",
+    "that isn't there.",
+    "",
+    "`device` is required — no default on purpose, since a default would quietly",
+    "watch the laptop lid instead of the counter.",
+    "",
+    "USE THE CAMERA'S NAME, NOT ITS INDEX. Indices are assigned at enumeration",
+    "and are NOT stable: plugging or unplugging any camera reshuffles them, and",
+    "this was observed swapping mid-session on the dev machine — index 1 went",
+    "from the external webcam to the built-in one. A name either matches the",
+    "camera you meant or fails loudly; an index silently opens whatever now sits",
+    "in that slot, which is a privacy problem rather than a bug you notice.",
+    "mcp-core prints the RESOLVED camera name at startup, and warns if you used",
+    "an index. List devices with:",
+    "  macOS   ffmpeg -f avfoundation -list_devices true -i \"\"",
+    "  Linux   v4l2-ctl --list-devices        (backend: \"v4l2\", device: \"/dev/video0\")",
+    "  Windows ffmpeg -f dshow -list_devices true -i dummy   (backend: \"dshow\")",
+    "",
+    "width/height MUST be a size the device really supports or capture fails.",
+    "List a camera's modes with:",
+    "  ffmpeg -f avfoundation -video_size 9999x9999 -i \"<index>\" -frames:v 1 -",
+    "pixel_format matters too: many USB webcams offer only uyvy422, and letting",
+    "ffmpeg pick yuv420p makes it refuse the device outright.",
+    "",
+    "warmup_frames discards the first frames while exposure settles — a USB",
+    "webcam's first frame is routinely black and decodes nothing.",
+    "Needs ffmpeg on PATH."
+  ],
+  "vision": {
+    "enabled": false,
+    "device": "USB2.0 PC CAMERA",
+    "backend": "avfoundation",
+    "width": 640,
+    "height": 480,
+    "pixel_format": "uyvy422",
+    "warmup_frames": 12
+  },
+
   "_stt_help": "LEGACY — superseded by `speech` above, still honored so old configs keep working. Used only when `speech` is absent.",
   "stt": {
     "language": "en",

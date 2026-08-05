@@ -221,6 +221,44 @@ auto-detect (native only).
 `LAN_IP` must be an address a **box** can reach — same subnet as the IP shown on
 the box's own screen.
 
+## Counter camera (QR scanning)
+
+A camera on the **mcp-core machine** — roadmap items 4 and 10. The BOX-3 has no
+camera and adding one is a hardware project; this is the counter-side camera
+those items were waiting on. Configure `vision` in `config.json` and two MCP
+tools appear:
+
+| Tool | Does |
+|---|---|
+| `esp_scan_qr` | Reads a QR held up to the camera; `{found:false}` when there's none in view, which is a normal answer, not an error |
+| `esp_capture` | Returns a still as an image block, so the calling model can simply look at it — this is `esp_look` without a separate vision backend |
+
+Omit the `vision` block and neither tool is registered, so a client is never
+offered a camera that isn't there. Needs `ffmpeg` on PATH.
+
+```jsonc
+"vision": { "device": "USB2.0 PC CAMERA", "width": 640, "height": 480, "pixel_format": "uyvy422" }
+```
+
+> ⚠️ **Name the camera, never index it.** Device indices are assigned at
+> enumeration and reshuffle whenever a camera is plugged or unplugged — observed
+> swapping mid-session on the dev machine, with index `1` going from the external
+> webcam to the built-in one. A name either matches what you meant or fails
+> loudly; an index silently opens whatever now occupies that slot, which is a
+> privacy problem rather than a bug you notice. mcp-core prints the **resolved
+> camera name** at startup and warns if the config used an index.
+
+Two things that will bite you if skipped: `width`/`height` must be a mode the
+device actually supports (list them with
+`ffmpeg -f avfoundation -video_size 9999x9999 -i "<index>" -frames:v 1 -`), and
+many USB webcams offer only `uyvy422` — letting ffmpeg choose `yuv420p` makes it
+refuse the device. Capture discards the first frames while exposure settles,
+because a webcam's first frame is routinely black and decodes nothing.
+
+**Displaying** a payment QR is a separate, unbuilt job — that's drawn on the box
+screen with the `qrcodegen` already used by the provisioning screen, and needs
+no camera at all.
+
 ## Security
 
 Two independent shared secrets, both read **only** from environment variables

@@ -234,9 +234,19 @@ static esp_netif_t *s_sta_netif = NULL;
 i2c_master_bus_handle_t bsp_i2c_bus(void) { return s_i2c_bus; }
 
 // Customer-facing idle screen. Touch anywhere (or tap BOOT) starts a turn.
+//
+// The badge reports whether the box still considers a customer present. This is
+// the one screen where it earns its place: a box mid-session looks IDENTICAL to
+// a free one here, yet behaves differently — an occupied box deliberately will
+// NOT greet the next person who walks up, because re-greeting someone mid-order
+// is the bug this session model exists to prevent. Without the badge, "the
+// greeting stopped working" and "it is doing exactly what it should" are
+// indistinguishable from the front of the counter.
 static void show_ready(void)
 {
     display_status("ORDER", "TAP TO START", COL_ACCENT);
+    display_badge(s_session_active ? "BUSY" : "FREE",
+                  s_session_active ? COL_INFO : COL_OK);
 }
 
 // --------------------------------------------------------------------------
@@ -1619,12 +1629,21 @@ void app_main(void)
         vTaskDelay(pdMS_TO_TICKS(1500));
         start_provisioning_mode();   // never returns
     }
-    register_with_core();
-    // The box is on WiFi and the server answered, so if this boot is a freshly
-    // installed image it has now demonstrated the one thing OTA can break.
-    // Nothing before this point is proof — confirming earlier would keep an
-    // image that cannot phone home, which is exactly the un-fixable case.
+    // The box is on WiFi and the server answered (wait_server_reachable above),
+    // so if this boot is a freshly installed image it has now demonstrated the
+    // one thing OTA can break. Nothing before this point is proof — confirming
+    // earlier would keep an image that cannot phone home, which is exactly the
+    // un-fixable case.
+    //
+    // ORDER MATTERS, and it used to be wrong: register_with_core() reports
+    // pending_verify, and it ran BEFORE this call. The box therefore always
+    // reported "pending" and then confirmed itself a line later, with no second
+    // registration to correct the record — so the server's pending_verify read
+    // true forever after every OTA and could never distinguish a confirmed image
+    // from one still on probation. That flag is the only outward sign of a
+    // silent rollback, so a permanently-stuck value defeated the whole check.
     ota_mark_valid();
+    register_with_core();
     // Dial the reverse channel once the network is up. Non-blocking and
     // self-reconnecting, so a server that isn't listening yet costs nothing —
     // and a box with no URL stored simply keeps using LAN pushes.

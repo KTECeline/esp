@@ -322,6 +322,34 @@ void display_status(const char *line1, const char *line2, uint16_t accent)
     flush();
 }
 
+// Small state pill, top-right. Drawn OVER whatever is already on screen and
+// flushed on its own, so callers draw their screen first and then stamp this on
+// top rather than every screen function growing a status argument.
+//
+// WHY IT EXISTS: whether the box thinks a customer is present is the one piece
+// of state with no outward sign, and it silently changes behaviour — an occupied
+// box deliberately stays quiet and will not greet. Without this, "it stopped
+// greeting me" and "it is working exactly as designed" look identical from the
+// front, which is precisely when someone starts power-cycling good hardware.
+void display_badge(const char *label, uint16_t color)
+{
+    if (!s_fb || !label) return;
+    const int DOT = 7, PAD_X = 9, H = 20;
+    int tw = text_w(&F_LABEL, label);
+    int w = PAD_X + DOT + 6 + tw + PAD_X;
+    int x = LCD_W - 10 - w, y = 8;
+
+    // Filled pill in the state colour, with the label knocked out dark. Reads at
+    // a glance across a counter, which a thin outline would not.
+    round_rect(x, y, w, H, H / 2, color, shade(color, 78));
+    // The dot is redundant with the fill on purpose: colour alone fails for a
+    // colour-blind operator, and the label alone is small at arm's length.
+    rect(x + PAD_X, y + (H - DOT) / 2, DOT, DOT, C_ON_ACCENT);
+    text(x + PAD_X + DOT + 6, y + (H - F_LABEL.line_h) / 2 + 1, &F_LABEL,
+         C_ON_ACCENT, label);
+    flush();
+}
+
 void display_order(const char *title, const order_line_t *lines, int count,
                    const char *total)
 {
