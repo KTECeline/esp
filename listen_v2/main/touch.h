@@ -12,3 +12,9 @@ bool touch_init(void);
 // reports a single tap, not a stream), writing DISPLAY coordinates to x/y.
 // Call every ~20-50ms from the main loop. Always false if touch_init() failed.
 bool touch_get_tap(int *x, int *y);
+
+// Is a finger on the panel RIGHT NOW? No edge detection and no debounce — this
+// is for timing a long-press once touch_get_tap() has already reported the
+// press that began it. Deliberately does not disturb the tap edge state, so
+// polling this can never swallow a tap.
+bool touch_is_pressed(void);

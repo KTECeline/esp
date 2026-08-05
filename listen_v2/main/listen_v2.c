@@ -4,11 +4,16 @@
 // Controls:
 //   TOUCH SCREEN       — the primary control. TAP the idle screen to start a
 //                        turn (greeting, then auto-listen). On the confirm
-//                        screen, on-screen SEND / CANCEL buttons send the
-//                        transcript to the assistant or clear it and re-listen.
+//                        screen, SEND submits the transcript and CANCEL discards
+//                        it and returns to idle — it does NOT re-record, because
+//                        answering the red button by reopening the mic is the
+//                        opposite of what it promises. HOLD the BUSY badge 1.5s
+//                        to end a session by hand (staff gesture).
 //   BOOT (GPIO0, side) — physical backup. TAP = start a turn (idle) or clear+
-//                        re-listen (transcript showing). HOLD 5s = wipe WiFi
-//                        creds and re-provision.
+//                        re-listen (transcript showing) — deliberately still the
+//                        fast "you misheard me, again" path, which is why it
+//                        differs from CANCEL. HOLD 5s = wipe WiFi creds and
+//                        re-provision.
 //   MUTE (GPIO1, top)  — NOT a firmware trigger. It's the hardware mic-mute:
 //                        measured on real hardware it's a TOGGLE that flips the
 //                        actual mic on/off each press, so it can't reliably
@@ -232,6 +237,32 @@ static esp_netif_t *s_sta_netif = NULL;
 
 // Exposed to display.c so it can probe the touch chip to pick the panel type.
 i2c_master_bus_handle_t bsp_i2c_bus(void) { return s_i2c_bus; }
+
+// How long the BUSY badge must be held to end a session by hand. Long enough
+// that a customer brushing the corner cannot trigger it, short enough that a
+// waiter clearing a table does not think it is broken.
+#define BADGE_HOLD_MS 1500
+
+// Watch a finger already resting on the badge. Returns true only if it stays
+// down for the full hold. Blocking on purpose — it lasts at most 1.5s, mirrors
+// how the 5s BOOT hold is timed, and nothing else in the idle loop is urgent.
+static bool badge_hold_completed(void)
+{
+    const TickType_t start = xTaskGetTickCount();
+    bool acked = false;
+    while ((int32_t)(xTaskGetTickCount() - start) < pdMS_TO_TICKS(BADGE_HOLD_MS)) {
+        if (!touch_is_pressed()) return false;      // released early: just a tap
+        // Confirm the hold registered at the halfway mark, so a waiter is not
+        // holding a screen that gives no sign of listening. Drawn once, not per
+        // poll — repainting at 20Hz would flicker.
+        if (!acked && (int32_t)(xTaskGetTickCount() - start) >= pdMS_TO_TICKS(BADGE_HOLD_MS / 2)) {
+            acked = true;
+            display_badge("HOLD", COL_WARN);
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    return true;
+}
 
 // Customer-facing idle screen. Touch anywhere (or tap BOOT) starts a turn.
 //
@@ -1722,6 +1753,28 @@ void app_main(void)
         if (touch_get_tap(&tx, &ty)) {
             note_activity();   // someone is definitely here, whatever radar says
             if (!s_confirm_pending) {
+                // Staff gesture: HOLD the BUSY badge to end the session by hand,
+                // for when a customer walks off and the radar has not timed out
+                // yet (SESSION_ABSENT_MS is 30s, and it is fed by interaction, so
+                // a lingering group can hold a box "busy" far longer).
+                //
+                // It has to be intercepted HERE, before start_listening(), because
+                // a hold begins with an ordinary tap edge — otherwise the box
+                // would start recording the instant the finger landed and the
+                // hold could never complete.
+                //
+                // A hold, not a tap: this corner is one mis-aimed customer press
+                // away from wiping a session mid-order. Releasing early is not an
+                // error, it just falls through to the normal "tap to order".
+                if (s_session_active && display_badge_hit(tx, ty)) {
+                    if (badge_hold_completed()) {
+                        s_session_active = false;
+                        ESP_LOGI(TAG, "session cleared by staff (badge hold)");
+                        end_session_on_server();   // reset the conversation too
+                        show_ready();              // repaints the badge as FREE
+                        continue;
+                    }
+                }
                 start_listening();   // record straight away, no greeting
                 continue;
             }
@@ -1732,7 +1785,19 @@ void app_main(void)
                 post_confirm();
                 continue;
             } else if (btn == BTN_CANCEL) {
-                clear_and_relisten();
+                // CANCEL abandons the turn and returns to idle. It used to clear
+                // the transcript and immediately start recording again, which is
+                // the opposite of what the word promises: the customer pressed
+                // the red button to STOP, and the box answered by opening the mic
+                // on them. Re-listening is still one tap away, and is now their
+                // choice rather than something that happens to them.
+                s_confirm_pending = false;
+                ESP_LOGI(TAG, "transcript discarded (CANCEL) — back to idle");
+                display_status("CANCELLED", "TAP TO ORDER", COL_ERR);
+                // Same badge the idle screen carries: a cancel does not end the
+                // session, the customer is still standing there.
+                display_badge(s_session_active ? "BUSY" : "FREE",
+                              s_session_active ? COL_INFO : COL_OK);
                 continue;
             }
         }
@@ -1744,6 +1809,10 @@ void app_main(void)
             (int32_t)(xTaskGetTickCount() - s_confirm_deadline_tick) >= 0) {
             s_confirm_pending = false;
             display_status("TIMED OUT", "TAP TO ORDER", COL_ERR);
+            // Without this the badge silently disappears on the one screen where
+            // someone is already wondering what went wrong.
+            display_badge(s_session_active ? "BUSY" : "FREE",
+                          s_session_active ? COL_INFO : COL_OK);
             ESP_LOGI(TAG, "confirm window expired — transcript discarded");
         }
         // ---- Session lifecycle (one session = one customer) ----------------

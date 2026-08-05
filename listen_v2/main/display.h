@@ -4,6 +4,7 @@
 // pass so nothing flickers.
 #pragma once
 #include <stdint.h>
+#include <stdbool.h>
 
 // Native RGB565. display.c byte-swaps once per frame on the way to the panel,
 // so every color here stays in the order the blending math wants.
@@ -36,6 +37,10 @@ void display_status(const char *line1, const char *line2, uint16_t accent);
 //   display_status("ORDER", "TAP TO START", COL_ACCENT);
 //   display_badge("FREE", COL_OK);
 void display_badge(const char *label, uint16_t color);
+
+// Did (x,y) land on the badge drawn by the last display_badge() call? False
+// once any other screen has painted over it. Includes a finger-sized margin.
+bool display_badge_hit(int x, int y);
 
 // One row of an itemized order. name e.g. "2X NASI LEMAK", price e.g. "RM11.00".
 // Mixed case renders correctly now, so callers may send "2x Nasi Lemak".

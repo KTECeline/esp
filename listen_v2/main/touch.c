@@ -99,6 +99,18 @@ bool touch_init(void)
 static bool s_was_pressed = false;
 static TickType_t s_last_tap_tick = 0;
 
+bool touch_is_pressed(void)
+{
+    if (!s_touch) return false;
+    esp_lcd_touch_read_data(s_touch);
+    uint16_t tx[1], ty[1], strength[1];
+    uint8_t n = 0;
+    // s_was_pressed is deliberately NOT updated here. It belongs to
+    // touch_get_tap()'s rising-edge detection, and writing it from a second
+    // caller would make held fingers eat the next real tap.
+    return esp_lcd_touch_get_coordinates(s_touch, tx, ty, strength, &n, 1) && n > 0;
+}
+
 bool touch_get_tap(int *x, int *y)
 {
     if (!s_touch) return false;

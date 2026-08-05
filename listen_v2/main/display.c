@@ -287,9 +287,18 @@ static const ui_font_t *fit(const char *s, int max_w, const ui_font_t *big,
 // Flat, not graded: a full-screen gradient this subtle is invisible head-on and
 // turns into a hard bright/dark split when the screen is viewed off-axis, which
 // looks like half the screen failed to draw.
+// Where the badge was last drawn, recorded BY the drawing code so the hit box
+// can never drift from the pixels — the same discipline the SEND/CANCEL rects
+// use. Zero width means no badge is currently on screen.
+static int s_badge_x = 0, s_badge_y = 0, s_badge_w = 0, s_badge_h = 0;
+
 static void backdrop(void)
 {
     rect(0, 0, LCD_W, LCD_H, COL_BLACK);
+    // Every full-screen draw starts here, so this is the one place guaranteed to
+    // run when the badge is painted over. Clearing the hit box here means a
+    // long-press can never land on a badge that is no longer visible.
+    s_badge_w = 0;
 }
 
 void display_status(const char *line1, const char *line2, uint16_t accent)
@@ -331,6 +340,17 @@ void display_status(const char *line1, const char *line2, uint16_t accent)
 // box deliberately stays quiet and will not greet. Without this, "it stopped
 // greeting me" and "it is working exactly as designed" look identical from the
 // front, which is precisely when someone starts power-cycling good hardware.
+bool display_badge_hit(int x, int y)
+{
+    if (s_badge_w <= 0) return false;
+    // Generous margin: the pill is ~20px tall and a fingertip is not. Missing a
+    // deliberate press is worse than a slightly large target here, because the
+    // only thing nearby is empty background.
+    const int M = 14;
+    return x >= s_badge_x - M && x < s_badge_x + s_badge_w + M &&
+           y >= s_badge_y - M && y < s_badge_y + s_badge_h + M;
+}
+
 void display_badge(const char *label, uint16_t color)
 {
     if (!s_fb || !label) return;
@@ -338,6 +358,7 @@ void display_badge(const char *label, uint16_t color)
     int tw = text_w(&F_LABEL, label);
     int w = PAD_X + DOT + 6 + tw + PAD_X;
     int x = LCD_W - 10 - w, y = 8;
+    s_badge_x = x; s_badge_y = y; s_badge_w = w; s_badge_h = H;
 
     // Filled pill in the state colour, with the label knocked out dark. Reads at
     // a glance across a counter, which a thin outline would not.
