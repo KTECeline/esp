@@ -109,24 +109,62 @@ edit either. A box is identified by the `X-Box-Id` header it sends, never by its
 request. The agent webhook contract is `POST {session_id, text}` →
 `{reply, display, end_session}`, so a remote agent plugs in by changing one URL.
 
-## MCP tools — driving the boxes from any client
+## MCP tools — driving the fleet from any client
 
 mcp-core is itself an MCP server, so **any** MCP client can discover and drive the
 fleet. This is the "pull and use" surface — it is not Claude-specific.
 
 ```
-any MCP client  ->  http://<host>:8000/mcp  ->  ESP fleet
-                    (Streamable HTTP, stateless; Bearer token when configured)
+any MCP client  ->  http://<host>:8000/mcp  ->  esp_*  ESP32-S3-BOX-3 fleet (pushed to)
+                    (Streamable HTTP,          ->  spc_*  OrangePi devices    (called out to)
+                     stateless; Bearer
+                     token when configured)
 ```
 
-| Tool | Arguments | Does |
-|---|---|---|
-| `esp_list_boxes` | — | Lists every box with `{id, name, ip, online}`. `online` is a real 2s reachability probe. Call this first to learn valid ids. |
-| `esp_speak` | `box_id?`, `text` | Says text out loud. Sentence-chunked, so long replies start playing in ~1s. Speaks only — no screen change. |
-| `esp_display` | `box_id?`, `text?`/`speaker?` **or** `items[]`/`title?`/`total?` | Caption, or an itemized screen. Display only — no sound. |
+Every sense is its own tool, **namespaced by which machine it belongs to**. That
+split is the whole point: "say that at the counter" is only answerable if the
+model can tell the two machines apart, and a single merged `speak` tool with a
+`device_id` would make every call a guess between opaque id strings. Two
+namespaces put the choice in the tool name, where the description can explain
+what each machine actually *is*.
 
-`box_id` is optional when exactly one box is registered. Prices/totals are rendered
-verbatim — mcp-core never does arithmetic.
+| Sense | ESP32-S3-BOX-3 | OrangePi | Notes |
+|---|---|---|---|
+| discover | `esp_list_boxes` | `spc_list_devices` | Call first to learn valid ids |
+| see | `esp_look`, `esp_scan_qr` | `spc_look` | `esp_look` is the **counter camera wired to the server** — the BOX-3 has no camera of its own |
+| speak | `esp_speak` | `spc_speak` | `spc_speak` blocks until the speaker goes quiet, so two replies can't overlap |
+| listen | `esp_listen` | `spc_listen` | See the asymmetry below |
+| sense | `esp_sense` | `spc_sense` | Presence radar on a box; whatever is wired up on a Pi |
+| show | `esp_display` | — | Caption or itemized screen. Display only, no sound |
+| session | `esp_set_occupied` | — | Force a session start/end, bypassing the presence radar |
+
+**The two listen tools are not the same shape, and the difference is real
+hardware, not an inconsistency.** A Pi records **on demand** — `spc_listen`
+opens the mic right now and stops when you stop talking. A box decides for
+itself when to record (a tap, or the presence radar waking it), and there is no
+firmware command to override that, so `esp_listen` **waits** for the recording
+the box chooses to make. It takes a *copy* of the transcript as it goes past: the
+customer's own tap-to-confirm still routes the turn to the backend exactly as
+before, because an MCP client observing a live box must never swallow the turn
+out from under the person standing in front of it.
+
+Both transcribe through the **same** whisper model, normalization and Manglish
+bias prompt, so a Pi's mic and a box's mic never disagree about what was said.
+
+Tools are registered only when the hardware backing them exists: no `vision`
+block means no `esp_look`, no `devices` block means no `spc_*` at all, and a Pi
+that doesn't declare `look` gets no `spc_look`. A model is never offered a tool
+whose only possible outcome is an apology.
+
+`box_id`/`device_id` are optional when exactly one target qualifies — and for
+spc tools "qualifies" means *has that capability*, so a single Pi with a mic is
+resolved automatically even when three Pis are configured. Prices and totals are
+rendered verbatim; mcp-core never does arithmetic.
+
+Adding an OrangePi is two steps: run `spc-agent/spc_agent.py` on it (stdlib
+Python, nothing to `pip install`) and add a `devices` entry pointing at its
+Tailscale name. See [`spc-agent/README.md`](spc-agent/README.md) for the HTTP
+contract, which is small enough to reimplement if you'd rather not run ours.
 
 Raw JSON-RPC (no client needed):
 ```bash
@@ -231,7 +269,7 @@ tools appear:
 | Tool | Does |
 |---|---|
 | `esp_scan_qr` | Reads a QR held up to the camera; `{found:false}` when there's none in view, which is a normal answer, not an error |
-| `esp_capture` | Returns a still as an image block, so the calling model can simply look at it — this is `esp_look` without a separate vision backend |
+| `esp_look` | Returns a still as an image block, so the calling model can simply look at it — no separate vision backend needed |
 
 Omit the `vision` block and neither tool is registered, so a client is never
 offered a camera that isn't there. Needs `ffmpeg` on PATH.

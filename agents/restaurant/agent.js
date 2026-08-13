@@ -76,9 +76,17 @@ function textMentionsMenu(text) {
 // the model confirmed prematurely on "that's all" and reset the order mid-
 // conversation. "done"/"that's all" is deliberately NOT confirmation — it
 // should trigger a read-back, and the customer's following yes finalizes.
+//
+// The word list is deliberately wide, and specifically Malaysian. It used to be
+// yes/yeah/yep/correct/betul/sure/proceed/checkout only, which matched NOTHING
+// a real customer said: across 103 logged turns the confirm branch never fired
+// once, so no order ever reached "confirmed" and the receipt screen never
+// rendered. "ok" / "ok lah" is how people actually agree here. The
+// !textMentionsMenu() guard is what keeps a wide list safe — "ok, one more teh
+// tarik" names an item, so it stays an ordering turn, not a confirmation.
 function isConfirmation(text) {
   const t = (text || "").toLowerCase();
-  const yes = /\b(confirm|confirmed|yes|yeah|yep|correct|betul|sure|proceed|checkout|check out)\b/.test(t);
+  const yes = /\b(confirm|confirmed|yes|yeah|yep|yup|ya|correct|betul|sure|ok|okay|okey|oklah|alright|all right|boleh|sudah|proceed|checkout|check out|that'?s all|thats all|settle|bill)\b/.test(t);
   return yes && !textMentionsMenu(text);
 }
 
@@ -120,8 +128,20 @@ function priceOrder(order) {
 //     TITLE|YOUR ORDER
 //     ITEM|2X NASI LEMAK|RM11.00
 //     TOTAL|RM15.50
+//     ACTIONS|ADD ORDER|END + PAY
 // The box font is uppercase ASCII-only; names are truncated so name+price fit
 // the 320px screen at scale 2.
+//
+// ACTIONS is what makes an order finishable by touch. Finalizing used to depend
+// entirely on the customer SAYING a confirmation word, which meant the shortest
+// utterance of the whole conversation ("yes") had to survive VAD + Whisper —
+// and sub-second clips transcribe as "[BLANK_AUDIO]" most of the time, so the
+// order simply never got confirmed. A tap can't be misheard. The voice path
+// still works; this is a second, reliable way to the same place.
+//
+// Buttons only while the order is OPEN: once it's confirmed the core takes the
+// screen over with the payment prompt, and offering "END + PAY" on a paid order
+// would just re-run a finished flow.
 function orderDisplay(order) {
   const cur = order.currency || "RM";
   const title = order.status === "confirmed" ? "ORDER CONFIRMED" : "YOUR ORDER";
@@ -131,6 +151,9 @@ function orderDisplay(order) {
     lines.push(`ITEM|${name}|${cur}${it.line_total.toFixed(2)}`);
   }
   lines.push(`TOTAL|${cur}${order.total.toFixed(2)}`);
+  if (order.status !== "confirmed" && order.items.length) {
+    lines.push("ACTIONS|ADD ORDER|END + PAY");
+  }
   return { path: "/order", body: lines.join("\n") };
 }
 
@@ -225,6 +248,28 @@ const server = http.createServer(async (req, res) => {
   try {
     if (req.method === "GET" && req.url === "/health") {
       return json(200, { status: "ok", restaurant: MENU.restaurant, sessions: sessions.size });
+    }
+
+    // Finalize by TOUCH — the customer tapped END + PAY on the box. Reaches the
+    // same place a spoken "yes" does, without the STT round trip that made the
+    // spoken path unreliable (see isConfirmation). No LLM call: the order is
+    // already priced from menu truth, and asking a 3B model to re-derive it on
+    // the last step is exactly where it used to invent items.
+    //
+    // Returns the priced order so the core can put the amount owed on the
+    // payment screen. 409 when there's nothing to finalize, so a stray tap on a
+    // stale screen can't manufacture an empty confirmed order.
+    if (req.method === "POST" && req.url === "/finalize") {
+      const body = JSON.parse((await readBody(req)) || "{}");
+      const sessionId = body.session_id || "default";
+      const prior = getSession(sessionId).lastOrder;
+      if (!prior || !prior.items.length) {
+        return json(409, { error: "No open order to finalize" });
+      }
+      const order = { ...prior, status: "confirmed" };
+      console.log(`[${sessionId}] finalized by touch:`, JSON.stringify(order));
+      resetSession(sessionId, "order finalized at box");
+      return json(200, { order, display: orderDisplay(order) });
     }
 
     if (req.method === "POST" && req.url === "/agent") {

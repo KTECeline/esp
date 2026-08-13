@@ -1,0 +1,462 @@
+#!/usr/bin/env python3
+"""spc-agent — the OrangePi half of the fleet.
+
+mcp-core drives ESP boxes by pushing to firmware it controls. It cannot do that
+to a Linux box, so the Pi runs this instead: a small HTTP service exposing the
+Pi's microphone, speaker, sensors and (optionally) camera as five routes.
+
+Deliberately stdlib-only. Setting up hardware is already the hard part of this
+project, and "pip install failed on the Pi" is a genuinely bad place to lose an
+afternoon — especially on an Armbian image with a system Python that refuses
+non-venv installs. Everything here ships with Python 3. The actual hardware work
+is shelled out to the standard Linux tools (arecord, aplay, sox, espeak-ng,
+ffmpeg), which are apt-installable and already present on most images.
+
+    python3 spc_agent.py
+
+Configuration is by environment variable — see CONFIG below, or run with
+--help for the resolved values on this machine.
+"""
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+HOST = os.environ.get("SPC_HOST", "0.0.0.0")
+PORT = int(os.environ.get("SPC_PORT", "8080"))
+DEVICE_ID = os.environ.get("SPC_ID", "SPC-1")
+
+# Must match ESP_FLEET_TOKEN on the mcp-core side. Empty disables the check,
+# which is fine on a trusted tailnet and reckless anywhere else — this service
+# can open the microphone in the room it is sitting in.
+FLEET_TOKEN = os.environ.get("SPC_FLEET_TOKEN") or os.environ.get("ESP_FLEET_TOKEN") or ""
+
+# ALSA device names. "default" follows the system default; override when the Pi
+# has several cards and the default is the HDMI output nobody is listening to.
+# List them with:  arecord -l   and   aplay -l
+MIC_DEVICE = os.environ.get("SPC_MIC_DEVICE", "default")
+SPEAKER_DEVICE = os.environ.get("SPC_SPEAKER_DEVICE", "default")
+
+# Video4Linux node for the camera. Absent = no camera = /look returns 501 and
+# mcp-core is told not to expose spc_look.
+CAMERA_DEVICE = os.environ.get("SPC_CAMERA_DEVICE", "/dev/video0")
+
+# Recording format. 16kHz mono 16-bit is what whisper.cpp wants; sending
+# anything else just makes mcp-core resample it.
+SAMPLE_RATE = 16000
+
+# Sensors. Two independent mechanisms, because "what is plugged into the Pi" is
+# not something this file can know:
+#
+#   SPC_SENSE_CMD    a command printing a JSON object of readings on stdout.
+#                    This is the general escape hatch — any sensor, any library,
+#                    any language. Its keys are passed through to the model
+#                    untouched, so name them for a reader ("presence", not "d7").
+#   SPC_PRESENCE_GPIO  a sysfs GPIO number read as a presence bit. Covers the
+#                    common PIR/mmWave case with no extra script to write.
+#
+# Both may be set; the command's keys win on a collision, since someone who
+# wrote a script had a more specific intent than someone who set a pin number.
+SENSE_CMD = os.environ.get("SPC_SENSE_CMD", "")
+PRESENCE_GPIO = os.environ.get("SPC_PRESENCE_GPIO", "")
+
+# Text-to-speech. espeak-ng is the fallback because it is in every apt repo and
+# needs no model download; it also sounds like a robot from 1985. Point
+# SPC_TTS_CMD at piper (or anything else) for a real voice — the text is passed
+# on stdin and the command must write a WAV to the path in {out}.
+TTS_CMD = os.environ.get("SPC_TTS_CMD", "")
+
+TIMEOUTS = {"look": 15, "speak": 55, "sense": 5}
+
+
+def have(binary):
+    return shutil.which(binary) is not None
+
+
+# ---------------------------------------------------------------------------
+# Capability detection
+# ---------------------------------------------------------------------------
+
+def capabilities():
+    """What this Pi can actually do, right now.
+
+    Recomputed per /health call rather than cached at startup, so plugging a USB
+    webcam in is visible without restarting the service. mcp-core does not use
+    this to decide which tools to register (its config does that, deliberately)
+    — it compares the two and warns when they disagree, which is the only way a
+    mismatch ever gets noticed before a tool fails in front of a customer.
+    """
+    caps = []
+    if os.path.exists(CAMERA_DEVICE) and (have("ffmpeg") or have("fswebcam")):
+        caps.append("look")
+    if have("aplay") and (TTS_CMD or have("espeak-ng") or have("espeak")):
+        caps.append("speak")
+    if SENSE_CMD or PRESENCE_GPIO:
+        caps.append("sense")
+    if have("arecord") or have("rec"):
+        caps.append("listen")
+    return caps
+
+
+def missing_reason(cap):
+    """Why a capability is absent, in terms of the thing to install or plug in."""
+    if cap == "look":
+        if not os.path.exists(CAMERA_DEVICE):
+            return f"no camera at {CAMERA_DEVICE} (set SPC_CAMERA_DEVICE, or plug one in)"
+        return "no ffmpeg or fswebcam installed (apt install ffmpeg)"
+    if cap == "speak":
+        if not have("aplay"):
+            return "no aplay (apt install alsa-utils)"
+        return "no text-to-speech (apt install espeak-ng, or set SPC_TTS_CMD)"
+    if cap == "sense":
+        return "no sensors configured (set SPC_SENSE_CMD or SPC_PRESENCE_GPIO)"
+    if cap == "listen":
+        return "no arecord (apt install alsa-utils)"
+    return "not available"
+
+
+# ---------------------------------------------------------------------------
+# Hardware
+# ---------------------------------------------------------------------------
+
+def run(cmd, timeout, stdin=None):
+    """Run a command, raising with its stderr attached.
+
+    stderr matters more than usual here: ALSA and ffmpeg put the entire
+    diagnosis in it ("Device or resource busy", "No such file or directory"),
+    and a bare non-zero exit code sent back to a model is unactionable.
+    """
+    try:
+        proc = subprocess.run(
+            cmd, input=stdin, capture_output=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"{cmd[0]} did not finish within {timeout}s")
+    except FileNotFoundError:
+        raise RuntimeError(f"{cmd[0]} is not installed on this Pi")
+    if proc.returncode != 0:
+        err = (proc.stderr or b"").decode("utf-8", "replace").strip()
+        raise RuntimeError(f"{cmd[0]} failed: {err.splitlines()[-1] if err else 'exit ' + str(proc.returncode)}")
+    return proc.stdout
+
+
+def playback_devices():
+    """Every ALSA playback device, as reported by `aplay -l`.
+
+    Exposed through /health because "aplay exited 0" is NOT evidence anyone
+    heard anything — ALSA will cheerfully render audio into an HDMI port with
+    no cable in it, and the exit code is still 0. On a board like the OrangePi
+    5 Max the default sink is usually HDMI, so the honest default assumption is
+    that speak() is silent until a human confirms otherwise. Listing the sinks
+    is the only way to diagnose that from the other end of the network.
+    """
+    if not have("aplay"):
+        return []
+    try:
+        out = run(["aplay", "-l"], 5).decode("utf-8", "replace")
+    except Exception:
+        return []
+    devices = []
+    for line in out.splitlines():
+        if line.startswith("card "):
+            # "card 0: rockchiphdmi0 [rockchip-hdmi0], device 0: ..."
+            try:
+                card = line.split("card ")[1].split(":")[0].strip()
+                dev = line.split("device ")[1].split(":")[0].strip()
+                label = line.split("[", 1)[1].split("]")[0] if "[" in line else line
+                devices.append({"id": f"hw:{card},{dev}", "name": label,
+                                "likely_hdmi": "hdmi" in line.lower()})
+            except (IndexError, ValueError):
+                continue
+    return devices
+
+
+def capture_jpeg():
+    with tempfile.TemporaryDirectory() as tmp:
+        out = os.path.join(tmp, "frame.jpg")
+        if have("ffmpeg"):
+            # -vframes 2 then keeping the last: a USB webcam's first frame is
+            # captured before exposure settles and is routinely black. The ESP
+            # side discards 12 frames for the same reason; two is enough here
+            # because v4l2 does not have avfoundation's warm-up problem.
+            run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                 "-f", "v4l2", "-i", CAMERA_DEVICE,
+                 "-vframes", "2", "-q:v", "3", out], TIMEOUTS["look"])
+        else:
+            run(["fswebcam", "-d", CAMERA_DEVICE, "--no-banner", "-q", out], TIMEOUTS["look"])
+        with open(out, "rb") as fh:
+            return fh.read()
+
+
+def speak(text):
+    with tempfile.TemporaryDirectory() as tmp:
+        wav = os.path.join(tmp, "say.wav")
+        if TTS_CMD:
+            cmd = [part.replace("{out}", wav) for part in TTS_CMD.split()]
+            run(cmd, TIMEOUTS["speak"], stdin=text.encode("utf-8"))
+        else:
+            engine = "espeak-ng" if have("espeak-ng") else "espeak"
+            run([engine, "-w", wav, text], TIMEOUTS["speak"])
+        # Blocks until the speaker has finished. mcp-core's contract promises
+        # this, so that two replies in a row cannot overlap in the air.
+        run(["aplay", "-D", SPEAKER_DEVICE, "-q", wav], TIMEOUTS["speak"])
+        # Returned so the caller learns WHERE the sound went. A bare
+        # {"spoken": true} is close to worthless here: it is equally consistent
+        # with a speaker in the room and with an HDMI port nobody is plugged
+        # into, and the difference is the whole question when someone says they
+        # heard nothing.
+        return SPEAKER_DEVICE
+
+
+def read_gpio(number):
+    """Read one sysfs GPIO, exporting it first if needed.
+
+    Returns None rather than False on any failure. A sensor that could not be
+    read is UNKNOWN, and reporting that as "nobody is there" would have the
+    model confidently narrate an empty room it cannot actually see.
+    """
+    base = f"/sys/class/gpio/gpio{number}"
+    try:
+        if not os.path.exists(base):
+            with open("/sys/class/gpio/export", "w") as fh:
+                fh.write(str(number))
+            time.sleep(0.1)   # udev needs a moment to create the node
+        with open(f"{base}/value") as fh:
+            return fh.read().strip() == "1"
+    except Exception:
+        return None
+
+
+def sense():
+    sensors = {}
+    if PRESENCE_GPIO:
+        sensors["presence"] = read_gpio(PRESENCE_GPIO)
+    if SENSE_CMD:
+        try:
+            out = run(SENSE_CMD.split(), TIMEOUTS["sense"])
+            parsed = json.loads(out.decode("utf-8", "replace"))
+            if isinstance(parsed, dict):
+                sensors.update(parsed)
+            else:
+                sensors["_error"] = "SPC_SENSE_CMD printed JSON that is not an object"
+        except json.JSONDecodeError:
+            sensors["_error"] = "SPC_SENSE_CMD did not print valid JSON"
+        except Exception as err:
+            # One broken sensor script must not take out a working GPIO reading
+            # alongside it, so this is reported as a field rather than raised.
+            sensors["_error"] = str(err)
+    return sensors
+
+
+# Only one recording at a time. Two concurrent arecords on one card fail with a
+# busy error that reads like a hardware fault; serializing turns that into a
+# short wait, which is what the caller actually wanted.
+_mic_lock = threading.Lock()
+
+
+def listen(timeout_s, silence_s):
+    """Record until the speaker stops, or timeout_s elapses. WAV bytes or None.
+
+    Returns audio, NOT text. Transcription belongs to mcp-core, where the
+    whisper model and the Manglish bias prompt already live — see the comment on
+    device.listen() in mcp-core/spc.js.
+    """
+    with _mic_lock:
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = os.path.join(tmp, "in.wav")
+            run(["arecord", "-D", MIC_DEVICE, "-f", "S16_LE", "-r", str(SAMPLE_RATE),
+                 "-c", "1", "-d", str(int(timeout_s)), "-q", raw], timeout_s + 10)
+
+            # sox trims leading silence and stops at the first trailing pause,
+            # so a two-word answer returns in two seconds instead of always
+            # burning the full timeout. Without sox the recording still works,
+            # it just always runs the full duration.
+            if not have("sox"):
+                with open(raw, "rb") as fh:
+                    return fh.read() or None
+            trimmed = os.path.join(tmp, "trim.wav")
+            try:
+                run(["sox", raw, trimmed,
+                     "silence", "1", "0.1", "1%", "1", str(silence_s), "1%"],
+                    15)
+            except RuntimeError:
+                # sox refuses a recording that is silence end to end. That is
+                # the "nobody spoke" case, and it is a normal outcome.
+                return None
+            if not os.path.exists(trimmed) or os.path.getsize(trimmed) <= 44:
+                return None
+            with open(trimmed, "rb") as fh:
+                return fh.read()
+
+
+# ---------------------------------------------------------------------------
+# HTTP
+# ---------------------------------------------------------------------------
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "spc-agent/1.0"
+
+    def log_message(self, fmt, *args):
+        print(f"[{self.address_string()}] {fmt % args}", flush=True)
+
+    # -- helpers ------------------------------------------------------------
+
+    def _send(self, code, body=b"", content_type="application/octet-stream"):
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def _json(self, code, obj):
+        self._send(code, json.dumps(obj).encode("utf-8"), "application/json")
+
+    def _authorized(self):
+        if not FLEET_TOKEN:
+            return True
+        return self.headers.get("X-Fleet-Token") == FLEET_TOKEN
+
+    def _body(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        if not length:
+            return {}
+        try:
+            return json.loads(self.rfile.read(length).decode("utf-8", "replace"))
+        except json.JSONDecodeError:
+            return {}
+
+    def _require(self, cap):
+        """501 when the hardware is absent. Distinct from 500 on purpose: the
+        service is healthy, the part is simply not there, and the message says
+        which package or plug fixes it."""
+        if cap in capabilities():
+            return True
+        self._json(501, {"error": f"this Pi cannot '{cap}' — {missing_reason(cap)}"})
+        return False
+
+    # -- routes -------------------------------------------------------------
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        # /health stays open even with a token configured: it reports no
+        # readings and no room contents, and locking it means the first thing
+        # you reach for when debugging auth is itself behind auth.
+        if path == "/health":
+            caps = capabilities()
+            return self._json(200, {
+                "ok": True,
+                "id": DEVICE_ID,
+                "capabilities": caps,
+                "missing": {c: missing_reason(c) for c in ("look", "speak", "sense", "listen") if c not in caps},
+                "auth": bool(FLEET_TOKEN),
+                "speaker_device": SPEAKER_DEVICE,
+                "mic_device": MIC_DEVICE,
+                "audio_out": playback_devices(),
+            })
+
+        if not self._authorized():
+            return self._json(401, {"error": "missing or wrong X-Fleet-Token"})
+
+        if path == "/look":
+            if not self._require("look"):
+                return
+            try:
+                return self._send(200, capture_jpeg(), "image/jpeg")
+            except Exception as err:
+                return self._json(500, {"error": str(err)})
+
+        if path == "/sense":
+            if not self._require("sense"):
+                return
+            return self._json(200, {
+                "sensors": sense(),
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            })
+
+        return self._json(404, {"error": f"no route {path}. Try /health, /look, /sense."})
+
+    def do_POST(self):
+        path = self.path.split("?")[0]
+        if not self._authorized():
+            return self._json(401, {"error": "missing or wrong X-Fleet-Token"})
+        body = self._body()
+
+        if path == "/speak":
+            if not self._require("speak"):
+                return
+            text = (body.get("text") or "").strip()
+            if not text:
+                return self._json(400, {"error": "text is required and must not be empty"})
+            try:
+                started = time.time()
+                device = speak(text)
+                return self._json(200, {
+                    "spoken": True,
+                    "ms": int((time.time() - started) * 1000),
+                    # Named explicitly, plus the full sink list, so "I heard
+                    # nothing" is diagnosable without shelling into the Pi.
+                    "device": device,
+                    "available_outputs": playback_devices(),
+                })
+            except Exception as err:
+                return self._json(500, {"error": str(err)})
+
+        if path == "/listen":
+            if not self._require("listen"):
+                return
+            timeout_s = min(max(float(body.get("timeout_s") or 10), 1), 60)
+            silence_s = min(max(float(body.get("silence_s") or 1.2), 0.2), 5)
+            try:
+                wav = listen(timeout_s, silence_s)
+            except Exception as err:
+                return self._json(500, {"error": str(err)})
+            if not wav:
+                # 204, not an error: listening and hearing nothing is a
+                # successful answer to the question that was asked.
+                return self._send(204)
+            return self._send(200, wav, "audio/wav")
+
+        return self._json(404, {"error": f"no route {path}. Try /speak, /listen."})
+
+
+def main():
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print(__doc__)
+        print(f"  id           {DEVICE_ID}")
+        print(f"  listen on    {HOST}:{PORT}")
+        print(f"  auth         {'ON' if FLEET_TOKEN else 'OFF (set SPC_FLEET_TOKEN)'}")
+        print(f"  mic          {MIC_DEVICE}")
+        print(f"  speaker      {SPEAKER_DEVICE}")
+        print(f"  camera       {CAMERA_DEVICE}")
+        print(f"  capabilities {', '.join(capabilities()) or 'none'}")
+        for cap in ("look", "speak", "sense", "listen"):
+            if cap not in capabilities():
+                print(f"    {cap}: {missing_reason(cap)}")
+        return
+
+    caps = capabilities()
+    print(f"spc-agent {DEVICE_ID} on {HOST}:{PORT}", flush=True)
+    print(f"  capabilities: {', '.join(caps) or 'NONE — nothing is wired up'}", flush=True)
+    for cap in ("look", "speak", "sense", "listen"):
+        if cap not in caps:
+            print(f"  no {cap}: {missing_reason(cap)}", flush=True)
+    if not FLEET_TOKEN:
+        print("  WARNING: no SPC_FLEET_TOKEN — anyone who can reach this port can open the mic.", flush=True)
+    # Threading matters: /speak and /listen both block for many seconds, and a
+    # single-threaded server would make a health check queue behind them.
+    ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
+
+
+if __name__ == "__main__":
+    main()

@@ -49,22 +49,43 @@ typedef struct {
     const char *price;
 } order_line_t;
 
-// Order screen: amber header with an item-count chip, up to 5 rows separated by
-// dotted rules, and a rounded amber TOTAL card pinned to the bottom. Rows past
-// the 5th are dropped (no scrolling yet). title e.g. "YOUR ORDER".
-void display_order(const char *title, const order_line_t *lines, int count,
-                   const char *total);
+// Everything the order screen can show. Optional fields are NULL when unused,
+// which is what selects the layout — one struct rather than a five-argument
+// call that grows every time the screen gains a state.
+typedef struct {
+    const char *title;          // e.g. "YOUR ORDER", "PAY NOW"
+    const order_line_t *lines;  // itemized rows; may be NULL when count == 0
+    int count;
+    const char *total;          // e.g. "RM13.50"; NULL hides the TOTAL card
+    // Replaces the item list with a centred, wrapped message. This is how the
+    // payment prompt reuses this screen instead of needing its own.
+    const char *note;
+    // Both set = a two-button bar along the bottom, and the TOTAL card moves up
+    // to make room (which also costs two item rows — see ROW_MAX in display.c).
+    // Either one NULL = no buttons, original full-height layout.
+    const char *btn_left;       // outlined, left  (e.g. "ADD ORDER")
+    const char *btn_right;      // solid green, right (e.g. "END + PAY")
+} order_screen_t;
+
+// Order screen: amber header with an item-count chip, rows separated by dotted
+// rules, and a rounded amber TOTAL card. Rows past the limit are dropped (no
+// scrolling yet) and summarized as "+N more".
+void display_order(const order_screen_t *s);
 
 // Live-caption screen: a rounded speaker pill ("YOU"/"BOX") tinted `bar`, then
 // the text word-wrapped inside a raised card. Used to show what was heard /
 // what is being said in realtime.
 void display_caption(const char *speaker, uint16_t bar, const char *text);
 
-// On-screen buttons. Only the confirm screen has any today.
+// On-screen buttons. The confirm screen and the order screen each draw a pair,
+// in the same place — display_hit_test() reports whichever pair is actually on
+// screen, so a caller can never act on a button the customer cannot see.
 typedef enum {
     BTN_NONE = 0,
-    BTN_CANCEL,
-    BTN_SEND,
+    BTN_CANCEL,      // confirm screen, left
+    BTN_SEND,        // confirm screen, right
+    BTN_ADD_ORDER,   // order screen, left
+    BTN_END_PAY,     // order screen, right
 } display_button_t;
 
 // Confirm screen: like display_caption(), but the card is shortened to fit
@@ -73,9 +94,11 @@ typedef enum {
 void display_confirm(const char *speaker, uint16_t bar, const char *text);
 
 // Which button contains this point, in DISPLAY coordinates (touch.c converts
-// from panel coordinates). Meaningful only while a display_confirm() screen is
-// up -- the caller tracks that. Geometry lives in display.c beside the drawing
-// code so the buttons and their hit boxes can never drift apart.
+// from panel coordinates). Returns BTN_NONE unless a screen with buttons is
+// currently up, and the returned constant identifies WHICH screen's button was
+// hit -- display.c remembers what it last drew, so a tap landing where a button
+// used to be cannot be mistaken for a live one. Geometry lives in display.c
+// beside the drawing code so buttons and hit boxes can never drift apart.
 display_button_t display_hit_test(int x, int y);
 
 // Provisioning QR screen: modules is a size*size byte array (1 = black module),

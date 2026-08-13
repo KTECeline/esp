@@ -79,7 +79,33 @@ async function probeOnline(box) {
 // supplies the items and the total, mcp-core just encodes them.
 const orderField = (s, limit = 15) => asciiOneline(String(s ?? ""), limit).toUpperCase();
 
-export function createMcpServer({ boxes, speakToBox, vision }) {
+// Which spc device answers an spc_* call. Unlike resolveBox this is filtered by
+// CAPABILITY first, because "which device" and "which device can do this" are
+// different questions once a fleet is mixed. With one Pi that has a mic and one
+// that doesn't, spc_listen has exactly one valid target and should just use it
+// rather than demanding a device_id the model has no way to choose between.
+function resolveSpc(spc, cap, deviceId) {
+  const able = spc.withCapability(cap);
+  const ids = able.map((d) => d.id).join(", ");
+  if (!deviceId) {
+    if (able.length === 1) return { device: able[0] };
+    if (able.length === 0) {
+      return { error: `No configured device can "${cap}". Check the devices block in config.json.` };
+    }
+    return { error: `device_id is required — more than one device can "${cap}". Available: ${ids}` };
+  }
+  const device = spc.byId(deviceId);
+  if (!device) {
+    const all = spc.devices.map((d) => d.id).join(", ") || "(none configured)";
+    return { error: `Device "${deviceId}" not found. Configured devices: ${all}` };
+  }
+  if (!device.has(cap)) {
+    return { error: `Device "${deviceId}" cannot "${cap}" — it offers: ${device.capabilities.join(", ")}. Devices that can: ${ids || "(none)"}` };
+  }
+  return { device };
+}
+
+export function createMcpServer({ boxes, speakToBox, vision, spc, transcribe, waitForTranscript }) {
   const server = new McpServer({ name: "mcp-core", version: "1.0.0" });
 
   // ---- esp_list_boxes ------------------------------------------------------
@@ -299,13 +325,122 @@ export function createMcpServer({ boxes, speakToBox, vision }) {
     }
   );
 
-  // ---- esp_capture / esp_scan_qr -------------------------------------------
+  // ---- esp_sense -----------------------------------------------------------
+  // Reads state this server ALREADY holds rather than polling the box, and
+  // that is not a shortcut. The presence radar is sampled by the firmware
+  // itself (sensor.c, GPIO21) and pushed here the moment it changes, because
+  // the box has to act on its own presence events anyway — it greets on
+  // approach without asking permission. Adding a /sense round trip to the box
+  // would return the same bit, slower, and would fail for a box on a network
+  // we cannot dial into, which is exactly the deployment this fleet targets.
+  const SenseInput = z
+    .object({
+      box_id: z
+        .string()
+        .optional()
+        .describe("Which box to read. Optional when only one box is registered.")
+    })
+    .strict();
+
+  server.registerTool(
+    "esp_sense",
+    {
+      title: "Read an ESP Box's Sensors",
+      description:
+        "Reads the sensor dock on an ESP32-S3-BOX-3: right now that is the human-presence radar, which tells you whether somebody is standing at the box.\n\nArgs:\n  - box_id (string, optional): target box; defaults to the only box when just one is registered\n\nReturns:\n  { \"box_id\": string, \"online\": boolean, \"sensors\": { \"presence\": boolean|null, \"presence_age_s\": number|null }, \"unavailable\": string[] }\n\nExamples:\n  - Use when: you want to know if anyone is at the box before speaking to an empty room\n  - Use when: you are deciding whether to start or wind down a conversation\n  - Don't use when: you want to CHANGE the session state (use esp_set_occupied)\n\nError Handling:\n  - Returns an error naming valid ids if box_id is unknown or ambiguous\n  - presence is null when the box has not reported a session event since this server started, or runs firmware too old to send one. null means UNKNOWN, never 'nobody there'\n  - presence_age_s is how long ago that reading last changed. A presence=true that is hours old is a stuck radar or a missed departure, not a very patient customer — treat large ages with suspicion\n  - `unavailable` lists sensors the dock physically has but this firmware does not read yet (the AHT30 temperature/humidity chip at I2C 0x38). Asking for those values is not possible today",
+      inputSchema: SenseInput,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true      // it reports on the physical world
+      }
+    },
+    async ({ box_id }) => {
+      const { box, error } = resolveBox(boxes, box_id);
+      if (error) return mcpError(error);
+      const ageS =
+        box.occupiedAt === null || box.occupiedAt === undefined
+          ? null
+          : Math.round((Date.now() - box.occupiedAt) / 1000);
+      return mcpJson({
+        box_id: box.id,
+        online: await probeOnline(box),
+        sensors: { presence: box.occupied, presence_age_s: ageS },
+        // Named explicitly so a model asking "how warm is it" gets a real
+        // answer about why it cannot have one, instead of an empty object it
+        // has to guess the meaning of.
+        unavailable: ["temperature", "humidity"]
+      });
+    }
+  );
+
+  // ---- esp_listen ----------------------------------------------------------
+  // A PASSIVE observer of the flow that already exists, which is the only
+  // honest way to build this without new firmware. The box decides when to
+  // record — a tap, or the presence radar waking it — then uploads the audio
+  // and this server transcribes it. There is no box command for "start
+  // recording now", so a tool that claimed to make the box listen on demand
+  // would be lying about who is in control.
+  //
+  // Critically it does not CONSUME the transcript: the tap-to-confirm window
+  // still arms, and the customer's own confirm still routes to the backend as
+  // usual. An MCP client watching a live box must not silently swallow the
+  // turn out from under the person standing in front of it.
+  const ListenInput = z
+    .object({
+      box_id: z
+        .string()
+        .optional()
+        .describe("Which box to listen to. Optional when only one box is registered."),
+      timeout_s: z
+        .number()
+        .int()
+        .min(1)
+        .max(120)
+        .optional()
+        .describe("How long to wait for someone to speak, in seconds (default 30). Returns heard=false if nobody does.")
+    })
+    .strict();
+
+  server.registerTool(
+    "esp_listen",
+    {
+      title: "Wait for Speech at an ESP Box",
+      description:
+        "Waits until somebody speaks at an ESP box and returns what they said, as text. The box records on its own (a tap, or the presence radar waking it) and this server transcribes it with the same speech model used for every other device, so transcripts are consistent across the fleet.\n\nThis WATCHES the box's normal flow — it does not interrupt it. The customer's own tap-to-confirm still works exactly as usual while you are listening.\n\nArgs:\n  - box_id (string, optional): target box; defaults to the only box when just one is registered\n  - timeout_s (integer, optional): how long to wait, 1-120 seconds (default 30)\n\nReturns:\n  { \"heard\": true, \"box_id\": string, \"text\": string, \"waited_ms\": number }\n  { \"heard\": false, \"box_id\": string, \"waited_ms\": number } when nobody spoke in time\n\nExamples:\n  - Use when: you asked a question through esp_speak and want the answer\n  - Use when: you want to observe what customers are saying at a box\n  - Don't use when: you want the box to SAY something (use esp_speak)\n\nError Handling:\n  - Returns an error naming valid ids if box_id is unknown or ambiguous\n  - heard=false is a NORMAL result meaning silence, not a failure — call again if you are still waiting\n  - This cannot force the box to start recording; there is no firmware command for that. If nothing is ever recorded, this will always time out\n  - Speech that transcribes to nothing intelligible is treated as silence, exactly as the box's own flow treats it",
+      inputSchema: ListenInput,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: false,   // each call captures a different moment
+        openWorldHint: true
+      }
+    },
+    async ({ box_id, timeout_s }) => {
+      const { box, error } = resolveBox(boxes, box_id);
+      if (error) return mcpError(error);
+      const waitMs = (timeout_s ?? 30) * 1000;
+      const t0 = Date.now();
+      try {
+        const text = await waitForTranscript(box.id, waitMs);
+        const waited_ms = Date.now() - t0;
+        if (!text) return mcpJson({ heard: false, box_id: box.id, waited_ms });
+        console.log(`[${box.name}] esp_listen heard: ${JSON.stringify(text.slice(0, 60))}`);
+        return mcpJson({ heard: true, box_id: box.id, text, waited_ms });
+      } catch (err) {
+        return mcpError(`Could not listen on "${box.id}": ${err.message}`);
+      }
+    }
+  );
+
+  // ---- esp_look / esp_scan_qr ----------------------------------------------
   // Registered ONLY when a camera is configured. A client that can see these
   // tools can rely on them existing; one that cannot see them is not told about
   // a camera that is not there.
   if (vision) {
     server.registerTool(
-      "esp_capture",
+      "esp_look",
       {
         title: "Take a Photo from the Counter Camera",
         description:
@@ -357,6 +492,226 @@ export function createMcpServer({ boxes, speakToBox, vision }) {
         }
       }
     );
+  }
+
+  // ---- spc_* : the OrangePi namespace --------------------------------------
+  // Every tool here is registered only when some configured device declares the
+  // matching capability, the same rule the camera tools follow. A fleet with no
+  // Pi shows a model no spc tools at all; a Pi with no camera shows no
+  // spc_look. The model never sees a tool whose only possible outcome is an
+  // apology.
+  //
+  // The namespace split (esp_ vs spc_) is what makes "say that at the counter"
+  // answerable. One merged speak tool with a device_id would make every call a
+  // guess about which id refers to which piece of hardware, and the model would
+  // be picking between opaque strings. Two namespaces put the choice in the
+  // tool name, where the description can explain what each machine IS.
+  if (spc && spc.devices.length > 0) {
+    server.registerTool(
+      "spc_list_devices",
+      {
+        title: "List OrangePi Devices",
+        description:
+          "Lists every OrangePi (single-board computer) attached to this fleet, what each can do, and whether each is answering right now. Call this first to discover valid device_id values for the other spc tools.\n\nThese are NOT the ESP voice boxes — those are separate hardware with their own esp_* tools. A Pi is a small Linux machine that can have a microphone, a speaker, sensors and optionally a camera.\n\nArgs:\n  (none)\n\nReturns:\n  { \"devices\": [{ \"id\": string, \"name\": string, \"base_url\": string, \"capabilities\": string[], \"online\": boolean, \"reports\": string[]|null }] }\n\nExamples:\n  - Use when: you need to know which Pi to talk through, or whether one is reachable\n  - Use when: an spc tool failed and you want to know if the device is simply off\n  - Don't use when: you want the ESP boxes (use esp_list_boxes)\n\nError Handling:\n  - Never errors; an empty list means no Pi is configured in this deployment\n  - online=false means the Pi did not answer — powered off, spc-agent not running, or its Tailscale name no longer resolves\n  - `capabilities` is what this server is configured to expose; `reports` is what the Pi itself says it has. If they disagree, the hardware and the config are out of sync and the extra tools will fail\n  - reports is null for an offline device, since it could not be asked",
+        annotations: {
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false
+        }
+      },
+      async () => {
+        const list = await Promise.all(
+          spc.devices.map(async (d) => {
+            const health = await d.health();
+            return {
+              id: d.id,
+              name: d.name,
+              base_url: d.baseUrl,
+              capabilities: d.capabilities,
+              online: health.online,
+              reports: health.online ? (health.capabilities ?? []) : null
+            };
+          })
+        );
+        return mcpJson({ devices: list });
+      }
+    );
+
+    const DeviceIdInput = (verb) =>
+      z
+        .object({
+          device_id: z
+            .string()
+            .optional()
+            .describe(`Which OrangePi should ${verb}. Optional when only one configured device can; use spc_list_devices to find valid ids.`)
+        })
+        .strict();
+
+    if (spc.any("look")) {
+      server.registerTool(
+        "spc_look",
+        {
+          title: "Take a Photo from an OrangePi Camera",
+          description:
+            "Takes a still photo from the camera attached to an OrangePi and returns it as an image you can look at directly.\n\nThis is the Pi's own camera, somewhere out in the room. It is NOT the counter camera wired to this server — that one is esp_look — and the two see different things.\n\nArgs:\n  - device_id (string, optional): target Pi; defaults to the only camera-equipped device\n\nReturns:\n  An image block (JPEG) plus { \"captured\": true, \"device_id\": string, \"bytes\": number }\n\nExamples:\n  - Use when: you need to see what is in front of a specific Pi\n  - Don't use when: you want the counter view (use esp_look)\n\nError Handling:\n  - Returns an error naming valid ids if device_id is unknown, ambiguous, or has no camera\n  - Returns an error explaining what to check if the Pi is unreachable\n  - A Pi whose camera was unplugged after startup answers with a clear hardware error rather than a blank frame",
+          inputSchema: DeviceIdInput("take the photo"),
+          annotations: {
+            readOnlyHint: true,
+            destructiveHint: false,
+            idempotentHint: false,
+            openWorldHint: true
+          }
+        },
+        async ({ device_id }) => {
+          const { device, error } = resolveSpc(spc, "look", device_id);
+          if (error) return mcpError(error);
+          try {
+            const jpeg = await device.look();
+            return {
+              content: [
+                { type: "image", data: jpeg.toString("base64"), mimeType: "image/jpeg" },
+                { type: "text", text: JSON.stringify({ captured: true, device_id: device.id, bytes: jpeg.length }) }
+              ],
+              structuredContent: { captured: true, device_id: device.id, bytes: jpeg.length }
+            };
+          } catch (err) {
+            return mcpError(`Could not take a photo on "${device.id}": ${err.message}`);
+          }
+        }
+      );
+    }
+
+    if (spc.any("speak")) {
+      const SpcSpeakInput = z
+        .object({
+          device_id: z
+            .string()
+            .optional()
+            .describe("Which OrangePi should speak. Optional when only one configured device has a speaker."),
+          text: z
+            .string()
+            .min(1)
+            .max(2000)
+            .describe("What to say out loud, in plain text.")
+        })
+        .strict();
+
+      server.registerTool(
+        "spc_speak",
+        {
+          title: "Speak Text on an OrangePi",
+          description:
+            "Says text out loud through an OrangePi's speaker. Waits until the audio has actually finished playing before returning, so two calls in a row will not talk over each other.\n\nThis is the Pi's speaker, not an ESP box's — use esp_speak for a box. Picking the right one matters: they are in different places, and a customer only hears the one they are standing next to.\n\nArgs:\n  - device_id (string, optional): target Pi; defaults to the only speaker-equipped device\n  - text (string): what to say, 1-2000 characters\n\nReturns:\n  { \"spoken\": true, \"device_id\": string, \"total_ms\": number }\n\nExamples:\n  - Use when: you want a Pi to say something out loud\n  - Use when: you asked a question through spc_speak and will follow it with spc_listen\n  - Don't use when: the person is at a voice box (use esp_speak)\n\nError Handling:\n  - Returns an error naming valid ids if device_id is unknown, ambiguous, or has no speaker\n  - Returns an error explaining what to check if the Pi is unreachable\n  - Long text takes proportionally long to speak; a very long passage may exceed the call budget even though the Pi is healthy",
+          inputSchema: SpcSpeakInput,
+          annotations: {
+            readOnlyHint: false,
+            destructiveHint: false,
+            idempotentHint: false,
+            openWorldHint: false
+          }
+        },
+        async ({ device_id, text }) => {
+          const { device, error } = resolveSpc(spc, "speak", device_id);
+          if (error) return mcpError(error);
+          if (!text.trim()) return mcpError("text is empty — nothing to say.");
+          try {
+            const t0 = Date.now();
+            await device.speak(text);
+            console.log(`[${device.id}] spc_speak: ${JSON.stringify(text.slice(0, 60))}`);
+            return mcpJson({ spoken: true, device_id: device.id, total_ms: Date.now() - t0 });
+          } catch (err) {
+            return mcpError(`Could not speak on "${device.id}": ${err.message}`);
+          }
+        }
+      );
+    }
+
+    if (spc.any("sense")) {
+      server.registerTool(
+        "spc_sense",
+        {
+          title: "Read an OrangePi's Sensors",
+          description:
+            "Reads whatever sensors are attached to an OrangePi and returns their current values.\n\nThe set of sensors is whatever is physically wired to that Pi, so it varies by device and this server does not interpret it — the values are passed through exactly as the Pi reports them. Read the key names to see what you were given; do not assume a particular sensor is present.\n\nArgs:\n  - device_id (string, optional): target Pi; defaults to the only sensor-equipped device\n\nReturns:\n  { \"device_id\": string, \"sensors\": object, \"ts\": string }\n\nExamples:\n  - Use when: you want to know if someone is near a Pi, or how warm/bright the room is\n  - Use when: deciding whether it is worth speaking through that Pi at all\n  - Don't use when: you want an ESP box's presence radar (use esp_sense)\n\nError Handling:\n  - Returns an error naming valid ids if device_id is unknown, ambiguous, or has no sensors\n  - Returns an error explaining what to check if the Pi is unreachable\n  - An empty sensors object means the Pi is running but no sensor produced a reading; that is a wiring problem on the Pi, not a fleet problem\n  - Individual sensors may report null for a failed read while others succeed — a null is UNKNOWN, never zero",
+          inputSchema: DeviceIdInput("be read"),
+          annotations: {
+            readOnlyHint: true,
+            destructiveHint: false,
+            idempotentHint: true,
+            openWorldHint: true
+          }
+        },
+        async ({ device_id }) => {
+          const { device, error } = resolveSpc(spc, "sense", device_id);
+          if (error) return mcpError(error);
+          try {
+            const body = await device.sense();
+            return mcpJson({
+              device_id: device.id,
+              sensors: body.sensors ?? {},
+              ts: body.ts ?? new Date().toISOString()
+            });
+          } catch (err) {
+            return mcpError(`Could not read sensors on "${device.id}": ${err.message}`);
+          }
+        }
+      );
+    }
+
+    if (spc.any("listen")) {
+      const SpcListenInput = z
+        .object({
+          device_id: z
+            .string()
+            .optional()
+            .describe("Which OrangePi should listen. Optional when only one configured device has a microphone."),
+          timeout_s: z
+            .number()
+            .int()
+            .min(1)
+            .max(60)
+            .optional()
+            .describe("Longest time to record while waiting for speech, in seconds (default 10). Recording stops early once the speaker goes quiet.")
+        })
+        .strict();
+
+      server.registerTool(
+        "spc_listen",
+        {
+          title: "Listen Through an OrangePi Microphone",
+          description:
+            "Records from an OrangePi's microphone and returns what was said, as text. Unlike an ESP box, a Pi records ON DEMAND — calling this actively opens the mic right now, rather than waiting for someone to press something.\n\nRecording stops as soon as the speaker falls silent, so a short answer returns quickly instead of always taking the full timeout. Transcription happens on this server with the same speech model used for the voice boxes, so a Pi and a box transcribe the same words the same way.\n\nArgs:\n  - device_id (string, optional): target Pi; defaults to the only microphone-equipped device\n  - timeout_s (integer, optional): longest recording, 1-60 seconds (default 10)\n\nReturns:\n  { \"heard\": true, \"device_id\": string, \"text\": string, \"waited_ms\": number }\n  { \"heard\": false, \"device_id\": string, \"waited_ms\": number } when nobody spoke\n\nExamples:\n  - Use when: you asked a question through spc_speak and want the reply\n  - Use when: you want to actively capture speech at a Pi without any button press\n  - Don't use when: the person is at a voice box (use esp_listen, which waits for the box's own recording)\n\nError Handling:\n  - Returns an error naming valid ids if device_id is unknown, ambiguous, or has no microphone\n  - heard=false is a NORMAL result meaning silence or nothing intelligible, not a failure\n  - Returns an error explaining what to check if the Pi is unreachable\n  - This holds the microphone for the duration; two overlapping calls to the same Pi will contend for it, so wait for one to finish",
+          inputSchema: SpcListenInput,
+          annotations: {
+            readOnlyHint: true,
+            destructiveHint: false,
+            idempotentHint: false,
+            openWorldHint: true
+          }
+        },
+        async ({ device_id, timeout_s }) => {
+          const { device, error } = resolveSpc(spc, "listen", device_id);
+          if (error) return mcpError(error);
+          const t0 = Date.now();
+          try {
+            const wav = await device.listen({ timeoutS: timeout_s ?? 10 });
+            if (!wav) return mcpJson({ heard: false, device_id: device.id, waited_ms: Date.now() - t0 });
+            const raw = await transcribe(wav);
+            // The same non-speech filter the box flow uses. Whisper writes
+            // "(upbeat music)" or "[door slams]" for room noise; if stripping
+            // the bracketed annotations leaves nothing, nobody actually spoke.
+            const text = raw.replace(/[\(\[].*?[\)\]]/g, "").replace(/^[\s.,!?]+|[\s.,!?]+$/g, "");
+            const waited_ms = Date.now() - t0;
+            if (!text) return mcpJson({ heard: false, device_id: device.id, waited_ms });
+            console.log(`[${device.id}] spc_listen heard: ${JSON.stringify(text.slice(0, 60))}`);
+            return mcpJson({ heard: true, device_id: device.id, text, waited_ms });
+          } catch (err) {
+            return mcpError(`Could not listen on "${device.id}": ${err.message}`);
+          }
+        }
+      );
+    }
   }
 
   return server;

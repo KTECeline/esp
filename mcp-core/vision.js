@@ -26,9 +26,9 @@ const jsQR = jsQRModule.default || jsQRModule;
 // capture is frequently unusable and fails to decode a QR that is plainly there.
 const DEFAULT_WARMUP = 12;
 
-function runFfmpeg(args, { timeoutMs }) {
+function runProc(cmd, args, { timeoutMs, stdin = null, missingHint, mapError }) {
   return new Promise((resolve, reject) => {
-    const proc = spawn("ffmpeg", args);
+    const proc = spawn(cmd, args);
     const out = [];
     let err = "";
     let settled = false;
@@ -44,20 +44,28 @@ function runFfmpeg(args, { timeoutMs }) {
     proc.on("error", (e) => {
       if (settled) return;
       settled = true; clearTimeout(timer);
-      reject(new Error(e.code === "ENOENT"
-        ? "ffmpeg is not installed — it is what captures from the camera (brew install ffmpeg)"
-        : e.message));
+      reject(new Error(e.code === "ENOENT" ? missingHint : e.message));
     });
     proc.on("close", (code) => {
       if (settled) return;
       settled = true; clearTimeout(timer);
       const buf = Buffer.concat(out);
-      // ffmpeg writes its normal chatter to stderr, so a non-zero exit is the
-      // only reliable failure signal — but an empty buffer means failure too.
-      if (code !== 0 && buf.length === 0) return reject(new Error(cameraError(err)));
-      if (buf.length === 0) return reject(new Error(cameraError(err)));
+      // Capture tools write their normal chatter to stderr, so a non-zero exit is
+      // the only reliable failure signal — but an empty buffer means failure too.
+      if (code !== 0 && buf.length === 0) return reject(new Error(mapError(err)));
+      if (buf.length === 0) return reject(new Error(mapError(err)));
       resolve(buf);
     });
+
+    if (stdin) proc.stdin.end(stdin);
+  });
+}
+
+function runFfmpeg(args, { timeoutMs, stdin = null }) {
+  return runProc("ffmpeg", args, {
+    timeoutMs, stdin,
+    missingHint: "ffmpeg is not installed — it is what captures from the camera (brew install ffmpeg)",
+    mapError: cameraError
   });
 }
 
@@ -112,6 +120,126 @@ function inputArgs(cfg) {
     "-i", String(cfg.device)
   ];
 }
+
+// ---------------------------------------------------------------------------
+// The "v4l2raw" backend — MIPI cameras whose ISP path does not work.
+//
+// WHY THIS EXISTS: on the OrangePi 5 Max the OV13855 is detected and streams,
+// but the Rockchip ISP node (/dev/video42) never emits a frame — it needs the
+// rkaiq 3A daemon, which is not on this image and not in apt. It fails as
+// `rkisp_stream_stop id:0 timeout` after 30s with a 0-byte file. The CIF node
+// (/dev/video11) has no such dependency and hands over the sensor's raw Bayer
+// immediately: a full 4224x3136 frame in 0.26s.
+//
+// So this path skips ffmpeg for CAPTURE and reads the sensor directly with
+// v4l2-ctl. ffmpeg is still used to ENCODE (see captureJpeg) — it just never
+// touches the device.
+//
+// The output is greyscale, which is not a compromise for the QR job: jsQR
+// converts to luminance anyway, and skipping demosaic avoids inventing colour
+// detail that was never sampled.
+const RAW10_PIXELS_PER_GROUP = 4;    // MIPI RAW10 packs 4 pixels into 5 bytes:
+const RAW10_BYTES_PER_GROUP = 5;     // 4 MSB bytes, then one byte of packed LSBs.
+
+function rawCameraError(stderr) {
+  if (/No such file or directory|Cannot open device/i.test(stderr)) {
+    return "no camera at that device node — check `vision.device` in config.json " +
+           "(list them: v4l2-ctl --list-devices). On the OrangePi the raw node is " +
+           "the rkcif one, e.g. /dev/video11, NOT /dev/video-camera0.";
+  }
+  if (/Invalid argument/i.test(stderr)) {
+    return "the camera rejected that size or pixel format — check vision.width/height " +
+           "and vision.raw_pixel_format (list them: v4l2-ctl -d <dev> --list-formats-ext)";
+  }
+  if (/Device or resource busy/i.test(stderr)) {
+    return "the camera is already in use by another process";
+  }
+  return (stderr.trim().split("\n").pop() || "raw camera capture failed").slice(0, 200);
+}
+
+// Unpack RAW10 to 8-bit greyscale, subsampling as we go.
+//
+// Two things make this cheap. Taking only the MSB byte of each pixel discards
+// the low 2 bits, which is invisible for barcode work and means no bit-shifting
+// at all. And `step` MUST be even: a Bayer mosaic repeats every 2 pixels, so an
+// even stride keeps every sampled pixel on the SAME colour plane. Sample on an
+// odd step and you alternate between green and red/blue sites, producing a
+// checkerboard that reads as texture and defeats the QR finder patterns.
+function decodeRaw10ToGray(buf, { width, height, stride, step, offset }) {
+  const outW = Math.floor(width / step);
+  const outH = Math.floor(height / step);
+  const gray = Buffer.allocUnsafe(outW * outH);
+  let o = 0;
+  for (let oy = 0; oy < outH; oy++) {
+    const rowBase = offset + oy * step * stride;
+    for (let ox = 0; ox < outW; ox++) {
+      const x = ox * step;
+      gray[o++] = buf[rowBase +
+        Math.floor(x / RAW10_PIXELS_PER_GROUP) * RAW10_BYTES_PER_GROUP +
+        (x % RAW10_PIXELS_PER_GROUP)];
+    }
+  }
+  return { data: gray, width: outW, height: outH };
+}
+
+async function captureRawGray(cfg) {
+  const frames = cfg.rawWarmupFrames;
+  const buf = await runProc("v4l2-ctl", [
+    "-d", String(cfg.device),
+    `--set-fmt-video=width=${cfg.width},height=${cfg.height},pixelformat=${cfg.rawPixelFormat}`,
+    "--stream-mmap=3",
+    "--stream-to=-",
+    `--stream-count=${frames}`
+  ], {
+    timeoutMs: cfg.timeoutMs,
+    missingHint: "v4l2-ctl is not installed — it is what reads the MIPI camera " +
+                 "(sudo apt install v4l-utils)",
+    mapError: rawCameraError
+  });
+
+  if (buf.length % frames !== 0) {
+    throw new Error(`camera returned ${buf.length} bytes, not divisible into ${frames} frames`);
+  }
+  const frameBytes = buf.length / frames;
+
+  // Derive the row stride from what actually arrived rather than trusting a
+  // formula. The hardware pads rows to an alignment boundary — here 4224 pixels
+  // is 5280 bytes of RAW10 but lands as 5376 — and that padding is not
+  // documented anywhere we can read at runtime. Getting it wrong does not throw;
+  // it shears the image diagonally and silently decodes nothing.
+  const stride = cfg.rawStride || frameBytes / cfg.height;
+  if (!Number.isInteger(stride)) {
+    throw new Error(`frame of ${frameBytes} bytes does not divide by height ${cfg.height} — ` +
+                    `set vision.raw_stride explicitly`);
+  }
+  const minStride = Math.ceil(cfg.width * RAW10_BYTES_PER_GROUP / RAW10_PIXELS_PER_GROUP);
+  if (stride < minStride) {
+    throw new Error(`stride ${stride} is too small for ${cfg.width} RAW10 pixels ` +
+                    `(need at least ${minStride}) — check vision.width`);
+  }
+
+  // Keep the LAST frame: the sensor's first frame after start is often still
+  // settling. Unlike the ffmpeg path this defaults to 2, not 12 — each frame
+  // here is ~16 MB, so a 12-frame warmup would buffer 200 MB to throw away.
+  return decodeRaw10ToGray(buf, {
+    width: cfg.width,
+    height: cfg.height,
+    stride,
+    step: cfg.rawDownsample,
+    offset: buf.length - frameBytes
+  });
+}
+
+function grayToRgba({ data, width, height }) {
+  const rgba = Buffer.allocUnsafe(width * height * 4);
+  for (let i = 0, o = 0; i < data.length; i++) {
+    const v = data[i];
+    rgba[o++] = v; rgba[o++] = v; rgba[o++] = v; rgba[o++] = 255;
+  }
+  return { data: rgba, width, height };
+}
+
+// ---------------------------------------------------------------------------
 
 // Enumerate cameras so a human (and the startup log) can see what is actually
 // attached. avfoundation only — v4l2 and dshow enumerate differently, and
@@ -168,6 +296,10 @@ export async function describeDevice(cfg) {
 
 // A frame as raw RGBA — the shape jsQR consumes directly.
 export async function captureRgba(cfg) {
+  // The raw path already produces exactly one settled frame; there is no ffmpeg
+  // stream to slice up, so it returns straight away.
+  if (cfg.backend === "v4l2raw") return grayToRgba(await captureRawGray(cfg));
+
   const frames = cfg.warmupFrames ?? DEFAULT_WARMUP;
   const buf = await runFfmpeg([
     "-hide_banner", "-loglevel", "error",
@@ -200,6 +332,20 @@ export async function captureRgba(cfg) {
 
 // A frame as JPEG, for handing to a model that can actually look at it.
 export async function captureJpeg(cfg) {
+  // Raw path: ffmpeg still encodes, it just never opens the device. Feeding it
+  // the already-decoded greyscale keeps one JPEG encoder for both backends
+  // rather than hand-rolling a second one.
+  if (cfg.backend === "v4l2raw") {
+    const gray = await captureRawGray(cfg);
+    return await runFfmpeg([
+      "-hide_banner", "-loglevel", "error",
+      "-f", "rawvideo", "-pix_fmt", "gray",
+      "-s", `${gray.width}x${gray.height}`, "-i", "-",
+      "-q:v", String(cfg.jpegQuality ?? 4),
+      "-frames:v", "1", "-f", "image2", "-"
+    ], { timeoutMs: cfg.timeoutMs, stdin: gray.data });
+  }
+
   return await runFfmpeg([
     "-hide_banner", "-loglevel", "error",
     ...inputArgs(cfg),

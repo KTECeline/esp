@@ -127,6 +127,7 @@ static char s_register_url[112];
 static char s_wake_url[112];
 static char s_session_end_url[112];
 static char s_session_start_url[112];
+static char s_order_action_url[112];
 // Shared secret with our server. Empty = not yet adopted, in which case the box
 // accepts unauthenticated requests so it can be bootstrapped (see
 // prov_load_fleet_token). Once set, every inbound request must carry it and
@@ -1314,14 +1315,38 @@ static void post_confirm(void)
     }
 }
 
+// The customer pressed one of the order-screen buttons. The server owns what
+// happens next (finalizing the order, showing the payment prompt) and pushes
+// the resulting screen back — the box just reports the press.
+static void post_order_action(const char *action)
+{
+    esp_http_client_config_t cfg = { .url = s_order_action_url, .method = HTTP_METHOD_POST,
+                                     .timeout_ms = 8000 };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    set_box_headers(client);
+    esp_http_client_set_post_field(client, action, strlen(action));
+    esp_err_t err = esp_http_client_perform(client);
+    int status = (err == ESP_OK) ? esp_http_client_get_status_code(client) : -1;
+    esp_http_client_cleanup(client);
+    ESP_LOGI(TAG, "order-action \"%s\" -> %s (%d)", action, s_order_action_url, status);
+    if (status != 200) {
+        // Includes 409 (server has no open order for us — e.g. it restarted
+        // mid-session). Say so rather than leaving a dead-looking screen.
+        display_status("NOT NOW", "TAP TO ORDER", COL_ERR);
+    }
+}
+
 // Render an itemized order. Body is a line protocol (built by the Mac so the
 // firmware needs no JSON parsing):
 //   TITLE|YOUR ORDER
 //   ITEM|2X NASI LEMAK|RM11.00     (up to 5 ITEM lines)
 //   TOTAL|RM15.50
+//   NOTE|POINT YOUR PAYMENT QR AT THE CAMERA   (optional; replaces the items)
+//   ACTIONS|ADD ORDER|END + PAY               (optional; draws the button bar)
 void do_order(char *body)
 {
     const char *title = "YOUR ORDER";
+    const char *note = NULL, *btn_l = NULL, *btn_r = NULL;
     static char total[20];
     order_line_t lines[5];
     int count = 0;
@@ -1343,12 +1368,23 @@ void do_order(char *body)
             count++;
         } else if (strcmp(ln, "TOTAL") == 0) {
             strlcpy(total, p1, sizeof(total));
+        } else if (strcmp(ln, "NOTE") == 0) {
+            note = p1;
+        } else if (strcmp(ln, "ACTIONS") == 0) {
+            // ACTIONS|<left>|<right> — both labels required, since one button
+            // alone would leave half the bar hit-testable but unpainted.
+            char *p2 = strchr(p1, '|');
+            if (p2) { *p2++ = 0; btn_l = p1; btn_r = p2; }
         }
     }
 
     s_caption_at_tick = xTaskGetTickCount();   // order owns the screen now
-    display_order(title, lines, count, total[0] ? total : NULL);
-    ESP_LOGI(TAG, "order screen: %d items, total %s", count, total);
+    order_screen_t scr = { .title = title, .lines = lines, .count = count,
+                           .total = total[0] ? total : NULL, .note = note,
+                           .btn_left = btn_l, .btn_right = btn_r };
+    display_order(&scr);
+    ESP_LOGI(TAG, "order screen: %d items, total %s%s", count, total,
+             btn_l ? " (+buttons)" : "");
 }
 
 static esp_err_t order_handler(httpd_req_t *req)
@@ -1397,6 +1433,7 @@ static void derive_server_urls(void)
     derive_one_url(s_wake_url,        sizeof(s_wake_url),        "/wake",        base_len);
     derive_one_url(s_session_end_url, sizeof(s_session_end_url), "/session-end", base_len);
     derive_one_url(s_session_start_url, sizeof(s_session_start_url), "/session-start", base_len);
+    derive_one_url(s_order_action_url, sizeof(s_order_action_url), "/order-action", base_len);
 }
 
 // Repoint this box at a different server, live, over the network:
@@ -1774,6 +1811,26 @@ void app_main(void)
                         show_ready();              // repaints the badge as FREE
                         continue;
                     }
+                }
+                // Order-screen buttons. Checked BEFORE start_listening(),
+                // because otherwise the tap that presses a button would also be
+                // the tap that opens the mic. display_hit_test() only reports
+                // these while that screen is actually up, so this cannot fire
+                // on the idle screen.
+                display_button_t ob = display_hit_test(tx, ty);
+                if (ob == BTN_ADD_ORDER) {
+                    // Deliberately back to idle rather than straight into
+                    // recording: the customer is often still deciding, and
+                    // opening the mic on them captures the room, not an order.
+                    ESP_LOGI(TAG, "ADD ORDER — back to idle");
+                    show_ready();
+                    continue;
+                }
+                if (ob == BTN_END_PAY) {
+                    ESP_LOGI(TAG, "END + PAY — finalizing with server");
+                    display_status("FINISHING", "ONE MOMENT", COL_INFO);
+                    post_order_action("end");   // server pushes the pay screen
+                    continue;
                 }
                 start_listening();   // record straight away, no greeting
                 continue;

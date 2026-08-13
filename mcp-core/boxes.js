@@ -67,6 +67,12 @@ export class BoxRegistry {
       // written to config.json — a customer being at the box right now isn't
       // fleet-registry data.
       occupied: null,
+      // When `occupied` last changed, as epoch ms. Read by esp_sense: presence
+      // with no timestamp is not a sensor reading, it's a rumour. A box that
+      // says "occupied" and last said so four hours ago has a stuck radar or a
+      // missed departure, and only the age distinguishes that from a customer
+      // who is genuinely standing there right now.
+      occupiedAt: null,
       // Which firmware the box reported at its last /register. Live-only for
       // the same reason as `occupied`, and null until it registers — boxes on
       // pre-OTA firmware never send it, so null means "unknown", not "stale".
@@ -99,7 +105,13 @@ export class BoxRegistry {
   // few seconds would be pure churn.
   setOccupied(id, occupied) {
     const b = this.byId(id);
-    if (b) b.occupied = occupied;
+    if (!b) return;
+    // Only a real transition restamps the clock. Re-reporting the same state
+    // must not, or a box that repeats "still occupied" every few seconds would
+    // keep looking freshly changed and the staleness check above would never
+    // fire — which is the one case the timestamp exists to catch.
+    if (b.occupied !== occupied) b.occupiedAt = Date.now();
+    b.occupied = occupied;
   }
 
   // Add or update a box, keyed by its immutable id — a DHCP-renewed IP updates

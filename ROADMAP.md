@@ -266,14 +266,31 @@ event task** — any future instruction handler needs the same treatment.
 - Until then `ws_url` stays empty (LAN-derived). LAN reverse channel is stable
   and measurably faster (`total_ms` 6100 vs 7433 through Funnel).
 
-## 10. Vision Tool (esp-see) — *todo, blocked on item 4 hardware*
+## 10. Vision Tool (esp-see) — *done*
 
-MCP tools `esp_look`, `esp_scan_qr`, `esp_capture`; observe environment, scan
-QR, recognise objects on request.
+`esp_look` and `esp_scan_qr` ship, backed by the counter camera on the mcp-core
+machine. `esp_look` returns the frame as an image block, so the calling model
+looks at it directly rather than needing a separate vision backend.
 
-> Naturally fits the existing MCP tool surface (`esp_speak` / `esp_display` /
-> `esp_list_boxes`) — the pattern is proven, so this is mostly gated on the
-> camera hardware, not on architecture.
+> The prediction held: this fit the existing tool surface with no architectural
+> change, and the work was almost entirely camera hardware (naming devices
+> instead of indexing them, pixel formats, discarding unexposed first frames).
+
+The fleet has since grown a second namespace. Every sense is now a tool on both
+machine kinds — `esp_*` for the boxes, `spc_*` for OrangePi devices running
+`spc-agent/` — so a model can choose *where* to look, speak, listen or sense:
+
+| | see | speak | listen | sense |
+|---|---|---|---|---|
+| **ESP box** | `esp_look`¹ | `esp_speak` | `esp_listen`² | `esp_sense`³ |
+| **OrangePi** | `spc_look` | `spc_speak` | `spc_listen` | `spc_sense` |
+
+¹ the counter camera on the server; the BOX-3 has no camera of its own.
+² *waits* for the box's own recording — there is no firmware command to make a
+box record on demand, whereas `spc_listen` opens the Pi's mic immediately.
+³ presence radar only. The sensor dock's AHT30 temp/humidity chip (I2C 0x38) is
+still unread by the firmware, and `esp_sense` names it in `unavailable` rather
+than pretending it isn't there.
 
 ## 11. Remote Fleet Control — *the LAN-only limit is gone*
 

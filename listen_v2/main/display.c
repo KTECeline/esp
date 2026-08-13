@@ -292,6 +292,12 @@ static const ui_font_t *fit(const char *s, int max_w, const ui_font_t *big,
 // use. Zero width means no badge is currently on screen.
 static int s_badge_x = 0, s_badge_y = 0, s_badge_w = 0, s_badge_h = 0;
 
+// Which pair of bottom buttons is on screen right now, so display_hit_test()
+// can name the button that was actually hit. Declared up here because
+// backdrop() clears it — see the note there.
+typedef enum { BTNS_NONE = 0, BTNS_CONFIRM, BTNS_ORDER } btn_kind_t;
+static btn_kind_t s_btns = BTNS_NONE;
+
 static void backdrop(void)
 {
     rect(0, 0, LCD_W, LCD_H, COL_BLACK);
@@ -299,6 +305,10 @@ static void backdrop(void)
     // run when the badge is painted over. Clearing the hit box here means a
     // long-press can never land on a badge that is no longer visible.
     s_badge_w = 0;
+    // Same reasoning for the button bar: a screen that draws buttons re-arms
+    // this on its way out, so anything else that repaints leaves it disarmed
+    // and a tap over a vanished button does nothing.
+    s_btns = BTNS_NONE;
 }
 
 void display_status(const char *line1, const char *line2, uint16_t accent)
@@ -371,12 +381,54 @@ void display_badge(const char *label, uint16_t color)
     flush();
 }
 
-void display_order(const char *title, const order_line_t *lines, int count,
-                   const char *total)
+// ---- Bottom button bar -----------------------------------------------------
+// One definition of the geometry, shared by the confirm screen, the order
+// screen and the hit test, so a button can never be drawn somewhere its hit box
+// isn't. Defined here because display_order() below needs BTN_Y to know how far
+// up to lift its TOTAL card.
+#define BTN_H         46
+#define BTN_W         140
+#define BTN_Y         (LCD_H - BTN_H - 6)     // 188
+#define BTN_LEFT_X    8
+#define BTN_RIGHT_X   (LCD_W - BTN_W - 8)     // 172
+
+// Defined below, next to the caption screens that also wrap text.
+static int wrap_text(const char *s, int x0, int y0, int w, int max_lines, bool draw);
+static int wrap_height(int n);
+
+// Draws the shared two-button bar: `left` outlined, `right` solid green.
+static void button_bar(const char *left, const char *right, uint16_t left_edge,
+                       uint16_t left_text)
 {
-    if (!s_fb) return;
-    const int HEAD_H = 44, ROW_H = 26, ROW_MAX = 5;
-    const int CARD_H = 42, CARD_Y = LCD_H - CARD_H - 8;   // 190
+    int ly = BTN_Y + (BTN_H - F_HEAD.line_h) / 2;
+    // The left action is outlined rather than a solid slab: it keeps its
+    // meaning without competing with the primary action for attention.
+    round_border(BTN_LEFT_X, BTN_Y, BTN_W, BTN_H, 12, left_edge, C_SURFACE_HI);
+    text_center(BTN_LEFT_X, BTN_W, ly, &F_HEAD, left_text, left);
+    round_rect(BTN_RIGHT_X, BTN_Y, BTN_W, BTN_H, 12, COL_OK, shade(COL_OK, 62));
+    text_center(BTN_RIGHT_X, BTN_W, ly, &F_HEAD, C_TEXT, right);
+}
+
+void display_order(const order_screen_t *s)
+{
+    if (!s_fb || !s) return;
+    const char *title = s->title;
+    const order_line_t *lines = s->lines;
+    int count = s->count;
+    const char *total = s->total;
+    // Buttons need both labels; one alone would leave a lopsided bar and an
+    // unreachable hit box.
+    const bool has_btns = s->btn_left && s->btn_right;
+
+    const int HEAD_H = 44, ROW_H = 26;
+    // Buttons eat the bottom 52px, which the TOTAL card has to clear — and the
+    // card in turn pushes the rows up. Five rows would collide with the raised
+    // card, so the list gets shorter rather than overlapping; the "+N more"
+    // note below already handles saying what was dropped.
+    const int ROW_MAX = has_btns ? 3 : 5;
+    const int CARD_H = 42;
+    const int CARD_Y = has_btns ? BTN_Y - CARD_H - 6      // 140
+                                : LCD_H - CARD_H - 8;     // 190
     const uint16_t accent = COL_ACCENT, accent_dk = shade(COL_ACCENT, 68);
 
     backdrop();
@@ -408,7 +460,15 @@ void display_order(const char *title, const order_line_t *lines, int count,
         if (overflow || i < shown - 1) dots(16, y + ROW_H - 2, LCD_W - 32, C_LINE, 2, 3);
         y += ROW_H;
     }
-    if (count == 0) {
+    if (s->note) {
+        // A note replaces the list entirely (the payment prompt uses this).
+        // Wrapped and centred in the space between the header and the TOTAL
+        // card, so it stays readable whether or not buttons are stealing room.
+        int box_y = HEAD_H + 14, box_h = CARD_Y - box_y - 10;
+        int n = wrap_text(s->note, 20, 0, LCD_W - 40, 4, false);
+        wrap_text(s->note, 20, box_y + (box_h - wrap_height(n)) / 2,
+                  LCD_W - 40, 4, true);
+    } else if (count == 0) {
         text_center(0, LCD_W, HEAD_H + 40, &F_BODY, C_MUTED, "No items yet");
     } else if (overflow) {
         char more[24];
@@ -416,11 +476,22 @@ void display_order(const char *title, const order_line_t *lines, int count,
         text(16, y + 3, &F_LABEL, C_MUTED, more);
     }
 
-    // Rounded amber TOTAL card, pinned to the bottom.
-    round_rect(8, CARD_Y, LCD_W - 16, CARD_H, 12, accent, accent_dk);
-    int ty = CARD_Y + (CARD_H - F_HEAD.line_h) / 2;
-    text(22, ty, &F_HEAD, C_ON_ACCENT, "TOTAL");
-    if (total) text_right(LCD_W - 22, ty, &F_HEAD, C_ON_ACCENT, total);
+    // Rounded amber TOTAL card. Sits at the bottom, or one button-bar higher.
+    if (total) {
+        round_rect(8, CARD_Y, LCD_W - 16, CARD_H, 12, accent, accent_dk);
+        int ty = CARD_Y + (CARD_H - F_HEAD.line_h) / 2;
+        text(22, ty, &F_HEAD, C_ON_ACCENT, "TOTAL");
+        text_right(LCD_W - 22, ty, &F_HEAD, C_ON_ACCENT, total);
+    }
+
+    if (has_btns) {
+        // Amber edge, not red: neither of these is a destructive action the way
+        // CANCEL is, and a red outline here would read as "don't press this".
+        button_bar(s->btn_left, s->btn_right, shade(COL_ACCENT, 60), COL_ACCENT);
+        s_btns = BTNS_ORDER;
+    } else {
+        s_btns = BTNS_NONE;
+    }
     flush();
 }
 
@@ -541,35 +612,26 @@ void display_caption(const char *speaker, uint16_t bar, const char *s)
     flush();
 }
 
-// ---- Confirm screen buttons -----------------------------------------------
-// One definition of the geometry, used by both the renderer and the hit test.
-#define BTN_H         46
-#define BTN_W         140
-#define BTN_Y         (LCD_H - BTN_H - 6)     // 188
-#define BTN_CANCEL_X  8
-#define BTN_SEND_X    (LCD_W - BTN_W - 8)     // 172
-
 void display_confirm(const char *speaker, uint16_t bar, const char *s)
 {
     if (!s_fb) return;
     caption_frame(speaker, bar, s, BTN_Y - 10);
-
-    int ly = BTN_Y + (BTN_H - F_HEAD.line_h) / 2;
-    // Cancel is outlined rather than a solid red slab: it keeps the red warning
-    // without competing with SEND for attention.
-    round_border(BTN_CANCEL_X, BTN_Y, BTN_W, BTN_H, 12, C_ERR_EDGE, C_SURFACE_HI);
-    text_center(BTN_CANCEL_X, BTN_W, ly, &F_HEAD, C_ERR_SOFT, "CANCEL");
-    round_rect(BTN_SEND_X, BTN_Y, BTN_W, BTN_H, 12, COL_OK, shade(COL_OK, 62));
-    text_center(BTN_SEND_X, BTN_W, ly, &F_HEAD, C_TEXT, "SEND");
+    // Red edge: CANCEL genuinely discards the customer's words, which the order
+    // screen's pair never does.
+    button_bar("CANCEL", "SEND", C_ERR_EDGE, C_ERR_SOFT);
+    s_btns = BTNS_CONFIRM;
     flush();
 }
 
 display_button_t display_hit_test(int x, int y)
 {
+    if (s_btns == BTNS_NONE) return BTN_NONE;
     if (y < BTN_Y || y > BTN_Y + BTN_H) return BTN_NONE;
-    if (x >= BTN_CANCEL_X && x <= BTN_CANCEL_X + BTN_W) return BTN_CANCEL;
-    if (x >= BTN_SEND_X && x <= BTN_SEND_X + BTN_W) return BTN_SEND;
-    return BTN_NONE;
+    bool left  = x >= BTN_LEFT_X  && x <= BTN_LEFT_X + BTN_W;
+    bool right = x >= BTN_RIGHT_X && x <= BTN_RIGHT_X + BTN_W;
+    if (!left && !right) return BTN_NONE;
+    if (s_btns == BTNS_CONFIRM) return left ? BTN_CANCEL : BTN_SEND;
+    return left ? BTN_ADD_ORDER : BTN_END_PAY;
 }
 
 void display_qr(const uint8_t *modules, int size, const char *ssid, const char *psk)

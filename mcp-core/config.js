@@ -7,6 +7,7 @@ import { writeFile, rename } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { STT_TYPES, TTS_TYPES } from "./speech.js";
+import { SPC_CAPABILITIES } from "./spc.js";
 
 // The project root. config.json, whisper.cpp, the firmware image and
 // voice-mcp-server are all resolved relative to it.
@@ -191,12 +192,31 @@ function resolveVision(cfg) {
   // FaceTime camera on a Mac, so a default would silently point at the laptop
   // lid instead of the counter camera someone plugged in on purpose.
   if (v.device === undefined || v.device === null || v.device === "") return null;
+  const backend = v.backend || "avfoundation";
+  // A MIPI sensor has one native size and no scaler on the raw path, so 640x480
+  // — a sane default for a USB webcam — would simply be rejected. Default to the
+  // OV13855's full frame instead of failing on a size nothing supports.
+  const isRaw = backend === "v4l2raw";
+  // Must be even, or subsampling walks across Bayer colour planes and produces a
+  // checkerboard that no QR decoder will read. See decodeRaw10ToGray.
+  const downsample = Number.isFinite(v.raw_downsample) ? v.raw_downsample : 4;
+  if (isRaw && (downsample < 1 || downsample % 2 !== 0)) {
+    throw new Error(`vision.raw_downsample must be a positive even number, got ${downsample}`);
+  }
   return {
     device: v.device,
-    // avfoundation (macOS), v4l2 (Linux), dshow (Windows).
-    backend: v.backend || "avfoundation",
-    width: v.width || 640,
-    height: v.height || 480,
+    // avfoundation (macOS), v4l2 (Linux), dshow (Windows), v4l2raw (MIPI sensor
+    // read straight off the rkcif node, bypassing a non-working ISP).
+    backend,
+    width: v.width || (isRaw ? 4224 : 640),
+    height: v.height || (isRaw ? 3136 : 480),
+    // v4l2raw only. Bayer order as the CIF node reports it; raw_stride overrides
+    // the row padding when it cannot be derived from the frame size.
+    rawPixelFormat: v.raw_pixel_format || "BG10",
+    rawDownsample: downsample,
+    rawStride: Number.isFinite(v.raw_stride) ? v.raw_stride : null,
+    // Deliberately far below the ffmpeg path's 12: raw frames are ~16 MB each.
+    rawWarmupFrames: Number.isFinite(v.raw_warmup_frames) ? v.raw_warmup_frames : 2,
     framerate: v.framerate || 30,
     // Many USB webcams offer only uyvy422; letting ffmpeg pick yuv420p makes it
     // refuse the device outright. List a camera's modes with:
@@ -206,6 +226,50 @@ function resolveVision(cfg) {
     jpegQuality: Number.isFinite(v.jpeg_quality) ? v.jpeg_quality : 4,
     timeoutMs: Number.isFinite(v.timeout_ms) ? v.timeout_ms : 15000
   };
+}
+
+// OrangePi / single-board-computer devices, from the `devices` block.
+//
+// Capabilities are DECLARED here rather than discovered from the Pi's /health,
+// and that is a deliberate trade. Discovery sounds better until the Pi is
+// simply switched off at startup — then mcp-core registers no spc tools, and a
+// model connecting later is told, with total confidence, that this restaurant
+// has no speaker. Declaring them means the tool surface is a property of the
+// configuration and identical on every boot, so an offline Pi produces an
+// honest "could not reach it" instead of silently rewriting what the fleet is.
+// spc.js still probes /health at startup and prints any disagreement.
+function resolveDevices(cfg, fleetToken) {
+  const list = Array.isArray(cfg.devices) ? cfg.devices : [];
+  const out = [];
+  for (const d of list) {
+    if (!d || d.enabled === false) continue;
+    // kind is what routes a device to a namespace. Only "spc" exists today;
+    // rejecting unknown kinds by name beats treating a typo as an OrangePi.
+    const kind = d.kind || "spc";
+    if (kind !== "spc") {
+      console.warn(`Device "${d.id || "(no id)"}" has unsupported kind "${kind}" — skipped. Known kinds: spc.`);
+      continue;
+    }
+    if (!d.id || !d.base_url) {
+      console.warn(`Device "${d.id || "(no id)"}" needs both id and base_url — skipped.`);
+      continue;
+    }
+    // A trailing slash would produce "http://pi:8080//look". Harmless on most
+    // servers, a 404 on some, and confusing in every log either way.
+    const baseUrl = String(d.base_url).replace(/\/+$/, "");
+    const declared = Array.isArray(d.capabilities) ? d.capabilities : SPC_CAPABILITIES;
+    const capabilities = declared.filter((c) => {
+      if (SPC_CAPABILITIES.includes(c)) return true;
+      console.warn(`Device "${d.id}" lists unknown capability "${c}" — ignored. Known: ${SPC_CAPABILITIES.join(", ")}.`);
+      return false;
+    });
+    if (capabilities.length === 0) {
+      console.warn(`Device "${d.id}" has no usable capabilities — skipped (it would expose no tools).`);
+      continue;
+    }
+    out.push({ id: d.id, name: d.name || d.id, baseUrl, capabilities, fleetToken });
+  }
+  return out;
 }
 
 export function loadConfig() {
@@ -262,8 +326,16 @@ export function loadConfig() {
   }
 
   const stt = cfg.stt || {};
+  // Hoisted out of the object literal below because resolveDevices needs it:
+  // the Pi authenticates with the same X-Fleet-Token as the boxes. It is fleet
+  // hardware, and giving it a second secret would mean two things to rotate.
+  const fleetToken = envToken(cfg.fleet_token_env, "fleet_token_env",
+                              "boxes and box-facing routes will run WITHOUT auth");
   return {
     boxes,
+    // OrangePi and friends. Empty list = no spc_* tools are registered at all,
+    // so a fleet with no Pi shows a model nothing about one.
+    devices: resolveDevices(cfg, fleetToken),
     priority,
     backends: resolved,
     stt: {
@@ -287,8 +359,7 @@ export function loadConfig() {
     // DIFFERENT audience from mcpToken on purpose: mcpToken authenticates your
     // MCP *clients* (Claude, agents), fleetToken authenticates your *hardware*.
     // One leaking must not grant the other.
-    fleetToken: envToken(cfg.fleet_token_env, "fleet_token_env",
-                         "boxes and box-facing routes will run WITHOUT auth"),
+    fleetToken,
     // Explicit override for which local address boxes should be told to reach
     // us on. Normally auto-detected (see lanIp() in server.js) — set this when
     // the machine has several interfaces and the guess is wrong.

@@ -23,11 +23,12 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { Bonjour } from "bonjour-service";
 import { loadConfig, loadRawConfig, writeConfig, ESP_ROOT } from "./config.js";
-import { BoxRegistry, asciiOneline, sendCaption, sendAudio, sendDisplay, setFleetToken, isCgnat } from "./boxes.js";
+import { BoxRegistry, asciiOneline, sendCaption, sendAudio, sendDisplay, sendSessionOverride, setFleetToken, isCgnat } from "./boxes.js";
 import { createMcpServer } from "./mcp-tools.js";
 import { startWsHub, setWsFleetToken, wsHas } from "./ws-hub.js";
 import { createSpeechEngine, needsLocalEngine } from "./speech.js";
 import { captureJpeg, scanQr, describeDevice } from "./vision.js";
+import { createSpcRegistry, probeSpcDevices } from "./spc.js";
 
 const config = loadConfig();
 // The raw parsed config is kept for round-tripping: box self-registration
@@ -44,6 +45,11 @@ function persistBoxes() {
     .catch((err) => console.warn("(config.json write failed: " + err.message + ")"));
 }
 const boxes = new BoxRegistry(config.boxes, persistBoxes);
+// The OrangePi side of the fleet. Deliberately NOT merged into BoxRegistry —
+// see the header of spc.js for why a box and a Pi stay separate transports.
+// Empty unless config.json has a `devices` block, and an empty registry
+// registers no spc_* tools at all.
+const spc = createSpcRegistry(config.devices);
 const MCP_SERVER_PATH = path.join(ESP_ROOT, "voice-mcp-server", "dist", "index.js");
 const LOG_PATH = process.env.INTERACTION_LOG || path.join(ESP_ROOT, "mcp-core", "interaction_log.jsonl");
 
@@ -53,6 +59,49 @@ const LOG_PATH = process.env.INTERACTION_LOG || path.join(ESP_ROOT, "mcp-core", 
 // window (~8s), this longer window just garbage-collects stale turns.
 const PENDING_WINDOW_S = 25;
 const pendingByBox = new Map();   // box.id -> { transcript, expires, stages }
+
+// esp_listen's plumbing. There is no firmware command for "start recording
+// now" — the box decides, on a tap or a presence wake — so listening from the
+// outside means waiting for the recording the box chooses to make, and taking
+// a copy of the transcript as it goes past.
+//
+// A copy, not a handoff: the tap-to-confirm flow below is completely unaware
+// this exists and still routes the turn to the backend exactly as before. An
+// MCP client observing a live box must never swallow the turn out from under
+// the customer standing in front of it.
+const transcriptWaiters = new Map();   // box.id -> Set of resolve callbacks
+
+// Resolves with the next transcript from this box, or null if the timeout wins.
+// Never rejects: a timeout is silence, which is an ANSWER, not a failure.
+function waitForTranscript(boxId, timeoutMs) {
+  return new Promise((resolve) => {
+    let waiters = transcriptWaiters.get(boxId);
+    if (!waiters) {
+      waiters = new Set();
+      transcriptWaiters.set(boxId, waiters);
+    }
+    const deliver = (text) => { cleanup(); resolve(text); };
+    const timer = setTimeout(() => { cleanup(); resolve(null); }, timeoutMs);
+    // Every exit path unregisters. Without this the set grows by one entry per
+    // timed-out esp_listen call, and a long-running server slowly leaks a
+    // closure for every question anyone ever asked and nobody answered.
+    function cleanup() {
+      clearTimeout(timer);
+      waiters.delete(deliver);
+      if (waiters.size === 0) transcriptWaiters.delete(boxId);
+    }
+    waiters.add(deliver);
+  });
+}
+
+// Broadcast, not first-come: two clients both listening to the same box should
+// both hear what was said. Iterated over a copy because each callback removes
+// itself from the live set.
+function notifyTranscript(boxId, text) {
+  const waiters = transcriptWaiters.get(boxId);
+  if (!waiters) return;
+  for (const deliver of [...waiters]) deliver(text);
+}
 
 // Plain-chat history for the local_llm backend only (the agent keeps its own
 // session state behind the webhook). Capped so a long chat can't grow the
@@ -309,7 +358,22 @@ async function speakToBox(box, text, { sinceMs } = {}) {
       // overlap playback and don't delay anything).
       ttsEnd = nowMs();
     }
-    await sendAudio(box, wav, { quiet: true, final: i + 1 === sentences.length });
+    // The status is checked, not discarded. The box has a real reason to refuse
+    // a clip — ws_client.c acks 503 when /play arrives while the previous one is
+    // still finishing, and drops the audio on the floor. Ignoring that reported
+    // "spoken: true" for speech nobody heard, which is the worst possible
+    // failure for a voice tool: the model believes it has been understood and
+    // keeps going. A box stuck in that state refuses every clip, so bail on the
+    // first refusal instead of pushing the rest into a device discarding them.
+    const status = await sendAudio(box, wav, { quiet: true, final: i + 1 === sentences.length });
+    if (typeof status === "number" && (status < 200 || status > 299)) {
+      throw new Error(
+        `box refused audio chunk ${i + 1}/${sentences.length} with status ${status}` +
+        (status === 503
+          ? " — it was still finishing the previous clip. A box that refuses every clip is stuck; reboot it (tap RST)."
+          : "")
+      );
+    }
   }
   return { chunks: sentences.length, firstAudioMs, ttsStart, ttsEnd, playbackStart, playbackEnd: nowMs() };
 }
@@ -343,6 +407,15 @@ async function handleUpload(box, audioBuffer) {
       record.outcome = "no_speech";
       return;
     }
+
+    // Hand a copy to anyone waiting on esp_listen. Placed after the non-speech
+    // filter so an MCP client sees the same "real speech" the box does, and
+    // before the caption so a listening client is not held up by the box's
+    // display round trip. Nothing is notified on the silence path above: a
+    // caller waiting to hear something wants to keep waiting through a cough,
+    // not be told "heard nothing" and give up while the customer is still
+    // clearing their throat.
+    notifyTranscript(box.id, transcript);
 
     // Show what was heard and arm the box's tap-to-confirm window. No backend
     // is called until /confirm arrives.
@@ -422,6 +495,139 @@ async function handleConfirm(box) {
   return { status: 200 };
 }
 
+// ---- Pay flow ---------------------------------------------------------------
+// Reached when the customer taps END + PAY on the order screen. This is the
+// touch equivalent of speaking a confirmation, and it exists because the spoken
+// path could not be made reliable: "yes" is the shortest utterance of the whole
+// conversation, and sub-second clips come back from Whisper as "[BLANK_AUDIO]".
+// A tap cannot be misheard.
+
+// How long to watch the counter camera for a payment QR before giving up. Long
+// enough to fish a phone out of a pocket, short enough that a walk-off doesn't
+// hold the box forever.
+const PAY_SCAN_TIMEOUT_MS = 90_000;
+const PAY_SCAN_INTERVAL_MS = 1500;
+const PAID_LINGER_MS = 4000;
+
+// The payment prompt reuses the order screen's line protocol — NOTE replaces
+// the itemized rows, so no new firmware screen was needed for this.
+function payScreen(title, note, total) {
+  const lines = [`TITLE|${title}`, `NOTE|${note}`];
+  if (total) lines.push(`TOTAL|${total}`);
+  return { path: "/order", body: lines.join("\n") };
+}
+
+// Webhook backends keep their own per-session state keyed by the box id we pass
+// as session_id. Used by both /session-end and the end of the pay flow.
+async function resetBackendSessions(box) {
+  for (const name of config.priority) {
+    const bc = config.backends[name];
+    if (bc.type !== "webhook") continue;
+    try {
+      await fetch(new URL("/reset", bc.webhook_url), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: box.id }),
+        signal: AbortSignal.timeout(3000)
+      });
+    } catch { /* backend may be down; local state is cleared regardless */ }
+  }
+}
+
+// Watch the counter camera until a QR decodes or we run out of patience. Errors
+// from a single frame are non-fatal (the webcam can be transiently busy) —
+// scanQr already retries internally, and giving up on one bad frame would end
+// the flow for no reason.
+async function waitForPaymentQr(box) {
+  const deadline = nowMs() + PAY_SCAN_TIMEOUT_MS;
+  while (nowMs() < deadline) {
+    try {
+      const found = await scanQr(config.vision);
+      if (found) return found;
+    } catch (err) {
+      console.warn(`       (QR scan frame failed: ${err.message})`);
+    }
+    await new Promise((r) => setTimeout(r, PAY_SCAN_INTERVAL_MS));
+  }
+  return null;
+}
+
+async function handleOrderAction(box, action) {
+  if (action !== "end") return { status: 400 };
+
+  // Finalize against the first webhook backend that has an open order. The
+  // order is already priced from menu truth there; the core deliberately does
+  // not compute or re-derive it.
+  let finalized = null;
+  for (const name of config.priority) {
+    const bc = config.backends[name];
+    if (bc.type !== "webhook") continue;
+    try {
+      const res = await fetch(new URL("/finalize", bc.webhook_url), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: box.id }),
+        signal: AbortSignal.timeout(5000)
+      });
+      if (res.status === 409) continue;          // nothing open on this backend
+      if (res.ok) { finalized = await res.json(); break; }
+    } catch (err) {
+      console.warn(`[${box.name}] finalize via ${name} failed: ${err.message}`);
+    }
+  }
+  if (!finalized) {
+    console.log(`[${box.name}] END + PAY but no open order to finalize`);
+    return { status: 409 };
+  }
+
+  const total = finalized.order?.total != null
+    ? `${finalized.order.currency || "RM"}${finalized.order.total.toFixed(2)}`
+    : null;
+  console.log(`[${box.name}] order finalized by touch, total ${total} — payment prompt up`);
+
+  // Ack the box first, then run the payment watch in the background: the scan
+  // can take a minute and a half, and the box's HTTP client times out in 8s.
+  (async () => {
+    const record = { timestamp: new Date().toISOString(), box: box.name,
+                     outcome: "awaiting_payment", total };
+    try {
+      if (!config.vision) {
+        // No camera configured: show the prompt and leave it to staff. Still a
+        // complete flow, just without the automatic PAID confirmation.
+        await sendDisplay(box, payScreen("PAY NOW", "PAY AT THE COUNTER", total));
+        record.outcome = "awaiting_payment_no_camera";
+        return;
+      }
+      await sendDisplay(box, payScreen("PAY NOW", "POINT YOUR PAYMENT QR CODE TO THE CAMERA", total));
+      const qr = await waitForPaymentQr(box);
+      if (qr) {
+        console.log(`[${box.name}] payment QR read (${qr.slice(0, 40)}) — marking paid`);
+        await sendDisplay(box, payScreen("PAID", "THANK YOU - SEE YOU AGAIN", total));
+        record.outcome = "paid";
+        record.qr = qr.slice(0, 200);
+      } else {
+        console.log(`[${box.name}] no payment QR within ${PAY_SCAN_TIMEOUT_MS / 1000}s`);
+        await sendDisplay(box, payScreen("PAY AT COUNTER", "SORRY - NO QR DETECTED", total));
+        record.outcome = "payment_timeout";
+      }
+      // Either way the customer is done at this box. Let the closing screen sit
+      // long enough to read, then hand the box to the next person.
+      await new Promise((r) => setTimeout(r, PAID_LINGER_MS));
+      llmHistoryByBox.delete(box.id);
+      pendingByBox.delete(box.id);
+      await resetBackendSessions(box);
+      await sendSessionOverride(box, false);
+    } catch (err) {
+      console.error(`[${box.name}] pay flow failed: ${err.message}`);
+      record.error = err.message;
+    } finally {
+      await logInteraction(record);
+    }
+  })();
+
+  return { status: 200 };
+}
+
 // ---- HTTP surface -----------------------------------------------------------
 
 async function readBody(req) {
@@ -465,7 +671,16 @@ const server = http.createServer(async (req, res) => {
       if (config.mcpToken && req.headers.authorization !== `Bearer ${config.mcpToken}`) {
         return json(401, { error: "unauthorized — missing or wrong Bearer token" });
       }
-      const mcp = createMcpServer({ boxes, speakToBox, vision: visionApi });
+      const mcp = createMcpServer({
+        boxes, speakToBox, vision: visionApi, spc,
+        // Both listen tools transcribe through the SAME function the box flow
+        // uses, so a Pi's microphone and a box's microphone get the identical
+        // model, the identical normalization and the identical Manglish bias
+        // prompt. Two devices in one restaurant disagreeing about what a
+        // customer said would be a bug nobody could reproduce.
+        transcribe: sttFromBuffer,
+        waitForTranscript
+      });
       const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
       res.on("close", () => { transport.close(); mcp.close(); });
       await mcp.connect(transport);
@@ -600,6 +815,20 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // Order-screen button press. Body is the action ("end"); ADD ORDER is
+    // handled entirely on the box, since "keep the order open and go back to
+    // idle" needs nothing from the server.
+    if (req.method === "POST" && req.url === "/order-action") {
+      if (!fleetAuthed()) return denyFleet();
+      const box = boxes.fromId(req);
+      if (!box) {
+        return json(400, { error: "missing X-Box-Id header — flash current firmware" });
+      }
+      const action = (await readBody(req)).toString("utf8").trim();
+      const { status } = await handleOrderAction(box, action);
+      return json(status, status === 200 ? { ok: true } : { error: "no open order" });
+    }
+
     // Box self-registration: fired by the firmware right after it gets an IP,
     // so config.json learns/refreshes the box without manual editing.
     if (req.method === "POST" && req.url === "/register") {
@@ -646,18 +875,7 @@ const server = http.createServer(async (req, res) => {
       pendingByBox.delete(box.id);
       // Webhook backends keep their own per-session state, keyed by the same
       // box id we pass as session_id. Ask them to drop just this one.
-      for (const name of config.priority) {
-        const bc = config.backends[name];
-        if (bc.type !== "webhook") continue;
-        try {
-          await fetch(new URL("/reset", bc.webhook_url), {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ session_id: box.id }),
-            signal: AbortSignal.timeout(3000)
-          });
-        } catch { /* backend may be down; local state is cleared regardless */ }
-      }
+      await resetBackendSessions(box);
       console.log(`[${box.name}] session ended (customer left) — conversation reset`);
       return json(200, { ok: true });
     }
@@ -884,13 +1102,20 @@ async function main() {
       // a privacy problem rather than something you notice in a log later.
       describeDevice(config.vision).then((d) => {
         console.log(`Camera: "${d.name}" @ ${config.vision.width}x${config.vision.height}` +
-                    ` (esp_capture, esp_scan_qr)`);
+                    ` (esp_look, esp_scan_qr)`);
         if (d.warning) console.warn(`  WARNING: ${d.warning}`);
       }).catch(() => {
         console.log(`Camera: device ${config.vision.device} (could not enumerate to confirm which)`);
       });
     }
     console.log(`Boxes: ${boxes.boxes.map((b) => `${b.name}@${b.ip}`).join(", ")}`);
+    if (spc.devices.length === 0) {
+      console.log("SPC devices: none configured (no spc_* tools registered)");
+    } else {
+      // Fire-and-forget: a Pi that is powered off must not hold up the server
+      // that the boxes are already trying to reach. The probe only prints.
+      probeSpcDevices(spc).catch((err) => console.warn(`SPC probe failed: ${err.message}`));
+    }
     // Logged explicitly: this is the address pushed to every box, and a wrong
     // pick (e.g. a VPN interface) is otherwise invisible until the fleet breaks.
     console.log(`LAN address boxes are told to use: ${lanIp() || "(none found)"}`);

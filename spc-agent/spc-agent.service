@@ -1,0 +1,44 @@
+# systemd USER unit — install to ~/.config/systemd/user/spc-agent.service
+#
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now spc-agent.service
+#
+# User units survive reboot on this box because lingering is already enabled
+# (loginctl enable-linger orangepi). There is no passwordless sudo here, which
+# is why this is a user unit and not a system one.
+
+[Unit]
+Description=SPC agent - the OrangePi's own speaker, mic and camera
+# Piper is what gives it a real voice; without it spc_speak still works but
+# falls back to espeak-ng.
+After=network-online.target piper-tts.service
+Wants=piper-tts.service
+
+[Service]
+Type=simple
+# Supplies ESP_FLEET_TOKEN, which spc_agent.py accepts in place of
+# SPC_FLEET_TOKEN. This service can open the microphone in the room it sits in,
+# so it must not run unauthenticated.
+EnvironmentFile=/home/orangepi/esp/.env
+Environment=SPC_PORT=8080
+
+# Card NAME, not number. ALSA numbering follows probe order and can shift on
+# reboot; "Lite" is the ReSpeaker's stable card id. Getting this wrong is not
+# loud — audio goes to the onboard codec that nobody is plugged into and aplay
+# still exits 0, which is exactly the failure spc_agent.py:156 warns about.
+Environment=SPC_SPEAKER_DEVICE=plughw:CARD=Lite,DEV=0
+Environment=SPC_MIC_DEVICE=plughw:CARD=Lite,DEV=0
+
+# The rkcif raw node. /dev/video0 exists on this board but is an ISP node that
+# never yields a frame without the rkaiq 3A daemon — see mcp-core/vision.js.
+Environment=SPC_CAMERA_DEVICE=/dev/video11
+
+# Text arrives on stdin; the command writes a WAV to {out}.
+Environment="SPC_TTS_CMD=/usr/bin/python3 /home/orangepi/esp-fleet/spc-agent/spc_tts.py {out}"
+
+ExecStart=/usr/bin/python3 /home/orangepi/esp-fleet/spc-agent/spc_agent.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

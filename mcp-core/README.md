@@ -43,16 +43,33 @@ restaurant/kiosk assumptions baked in anywhere.
 the "pull and use" surface — it's not tied to any specific client.
 
 ```
-any MCP client  ->  http://<host>:8000/mcp  ->  ESP box fleet
+any MCP client  ->  http://<host>:8000/mcp  ->  esp_*  ESP box fleet    (pushed to)
+                                            ->  spc_*  OrangePi devices (called out to)
 ```
+
+Each sense is its own tool, namespaced by the machine it lives on, so a model
+can pick *where* to speak or look rather than guessing between id strings.
 
 | Tool | Arguments | Does |
 |---|---|---|
 | `esp_list_boxes` | — | Lists every registered box with `{id, name, ip, online}`. `online` is a live 2s reachability probe. Call this first to learn valid ids. |
 | `esp_speak` | `box_id?`, `text` | Speaks text out loud. Sentence-chunked, so long replies start playing in ~1s instead of waiting for the whole thing to synthesize. Speaks only — no screen change. |
 | `esp_display` | `box_id?`, `text?`/`speaker?` **or** `items[]`/`title?`/`total?` | Shows a caption, or an itemized list screen. Display only — no sound. |
+| `esp_listen` | `box_id?`, `timeout_s?` | Waits for the box's next recording and returns the transcript. Passive — the customer's tap-to-confirm flow is untouched. |
+| `esp_sense` | `box_id?` | Presence radar, with the age of the reading so a stuck sensor is visible. |
+| `esp_set_occupied` | `box_id?`, `occupied` | Forces a session start (greets) or end (resets), bypassing the radar. |
+| `esp_look` / `esp_scan_qr` | — | Counter camera on **this server** — registered only when `vision` is configured. |
+| `spc_list_devices` | — | Lists OrangePis with their capabilities, whether each answers, and what it reports it has. |
+| `spc_speak` | `device_id?`, `text` | Speaks through a Pi's speaker; returns once the audio has finished playing. |
+| `spc_listen` | `device_id?`, `timeout_s?` | Opens the Pi's mic **now**, stops when you stop talking, transcribes here. |
+| `spc_sense` | `device_id?` | Passthrough of whatever sensors that Pi reports. |
+| `spc_look` | `device_id?` | A frame from the Pi's camera. |
 
-`box_id` is optional when exactly one box is registered.
+Every tool is registered only when the hardware behind it exists — see
+[`../spc-agent/README.md`](../spc-agent/README.md) for the Pi-side contract.
+
+`box_id` is optional when exactly one box is registered; `device_id` is optional
+when exactly one configured device has the capability being asked for.
 
 Raw JSON-RPC, no client library needed:
 ```bash
