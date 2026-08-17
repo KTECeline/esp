@@ -254,10 +254,21 @@ async function handleWake(box) {
 // Both take their own config, so any number of backends of the same type can
 // coexist (agent + cloud_llm + local_llm + ...). Nothing is keyed by name.
 
+// A webhook backend is a service on a port, and "it's only on localhost" stops
+// being true the moment the host joins a tailnet — so it gets the same shared
+// secret treatment as everything else. Configured exactly like an LLM backend's
+// credential (token_env in config.json), and omitted entirely when none is set
+// so existing installs keep working.
+function webhookHeaders(bc) {
+  const headers = { "Content-Type": "application/json" };
+  if (bc.token) headers["Authorization"] = "Bearer " + bc.token;
+  return headers;
+}
+
 async function askWebhook(name, bc, box, text) {
   const res = await fetch(bc.webhook_url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: webhookHeaders(bc),
     body: JSON.stringify({ session_id: box.id, text }),
     signal: AbortSignal.timeout(bc.timeoutMs)
   });
@@ -526,7 +537,7 @@ async function resetBackendSessions(box) {
     try {
       await fetch(new URL("/reset", bc.webhook_url), {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: webhookHeaders(bc),
         body: JSON.stringify({ session_id: box.id }),
         signal: AbortSignal.timeout(3000)
       });
@@ -565,7 +576,7 @@ async function handleOrderAction(box, action) {
     try {
       const res = await fetch(new URL("/finalize", bc.webhook_url), {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: webhookHeaders(bc),
         body: JSON.stringify({ session_id: box.id }),
         signal: AbortSignal.timeout(5000)
       });
@@ -890,7 +901,10 @@ const server = http.createServer(async (req, res) => {
         const bc = config.backends[name];
         if (bc.type !== "webhook") continue;
         try {
-          await fetch(new URL("/reset", bc.webhook_url), { method: "POST" });
+          await fetch(new URL("/reset", bc.webhook_url), {
+            method: "POST",
+            headers: webhookHeaders(bc)
+          });
         } catch { /* backend may be down; local state is cleared regardless */ }
       }
       return json(200, { ok: true });

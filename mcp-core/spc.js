@@ -14,7 +14,7 @@
 // service is a convenience, not a requirement.
 
 // Every capability a Pi may declare. Order matters only for log output.
-export const SPC_CAPABILITIES = ["look", "speak", "sense", "listen"];
+export const SPC_CAPABILITIES = ["look", "speak", "sense", "listen", "screen"];
 
 // Per-call budgets. These differ by an order of magnitude on purpose:
 // /speak blocks until the audio has finished playing out of the speaker, so a
@@ -26,7 +26,8 @@ const TIMEOUTS = {
   health: 4000,
   look: 20000,
   speak: 60000,
-  sense: 6000
+  sense: 6000,
+  screen: 6000
 };
 
 // /listen is the exception: its duration is an argument, not a constant. The Pi
@@ -148,6 +149,22 @@ export function createSpcDevice(cfg) {
     });
 
   device.sense = async () => await requestJson(device, "/sense", { timeoutMs: TIMEOUTS.sense });
+
+  // Changes what is on the Pi's screen. The opposite of speak: it returns as
+  // soon as the Pi has stored the new state, NOT when the glass has repainted.
+  // Waiting for a browser to finish an animation would turn every face change
+  // into a pause in the conversation, and the panel is meant to keep up with
+  // the talking, not the other way round.
+  //
+  // Keys left out are left alone — the Pi merges. That is what lets a caller
+  // change the eyes without blanking a QR code someone is mid-scan of.
+  device.display = async (patch) =>
+    await requestJson(device, "/display", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(patch),
+      timeoutMs: TIMEOUTS.screen
+    });
 
   // Returns raw WAV bytes, NOT a transcript, and that is the important part of
   // this whole file. Speech-to-text stays on mcp-core, where whisper.cpp and

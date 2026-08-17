@@ -3,7 +3,8 @@
 
 mcp-core drives ESP boxes by pushing to firmware it controls. It cannot do that
 to a Linux box, so the Pi runs this instead: a small HTTP service exposing the
-Pi's microphone, speaker, sensors and (optionally) camera as five routes.
+Pi's microphone, speaker, sensors and (optionally) camera and screen as a
+handful of routes.
 
 Deliberately stdlib-only. Setting up hardware is already the hard part of this
 project, and "pip install failed on the Pi" is a genuinely bad place to lose an
@@ -18,6 +19,7 @@ Configuration is by environment variable — see CONFIG below, or run with
 --help for the resolved values on this machine.
 """
 
+import glob
 import json
 import os
 import shutil
@@ -26,7 +28,17 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# The kiosk page is ~500 lines of HTML/CSS/SVG/JS and lives in its own module so
+# it does not bury this one. Imported defensively: a Pi part-way through a deploy
+# (new spc_agent.py, spc_face.py not copied yet) must keep its microphone and
+# speaker rather than refuse to start over a screen it may not even have.
+try:
+    from spc_face import FACE_HTML
+except ImportError:
+    FACE_HTML = None
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -76,11 +88,32 @@ PRESENCE_GPIO = os.environ.get("SPC_PRESENCE_GPIO", "")
 # on stdin and the command must write a WAV to the path in {out}.
 TTS_CMD = os.environ.get("SPC_TTS_CMD", "")
 
+# The panel. Unlike a camera or a mic there is no reliable "is a screen plugged
+# in" test — a Pi with HDMI unplugged still has /dev/dri/card0, and a panel on
+# SPI/DSI may present as neither. So detection is a best guess and SPC_SCREEN is
+# the override that always wins, in both directions: "1" forces the capability
+# on (which is how you develop the face before the panel arrives), "0" forces it
+# off.
+SCREEN_ENV = os.environ.get("SPC_SCREEN", "")
+
 TIMEOUTS = {"look": 15, "speak": 55, "sense": 5}
 
 
 def have(binary):
     return shutil.which(binary) is not None
+
+
+def have_screen():
+    """Whether this Pi should claim the `screen` capability.
+
+    SPC_SCREEN wins outright when set, because the guess below is genuinely
+    unreliable and being wrong in either direction is annoying: a declared-but-
+    absent screen registers a tool that draws to nothing, and an undeclared-but-
+    present one leaves the face unreachable with no obvious reason why.
+    """
+    if SCREEN_ENV:
+        return SCREEN_ENV.strip().lower() not in ("0", "false", "no", "off")
+    return bool(glob.glob("/dev/dri/card*")) or os.path.exists("/dev/fb0")
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +138,8 @@ def capabilities():
         caps.append("sense")
     if have("arecord") or have("rec"):
         caps.append("listen")
+    if have_screen():
+        caps.append("screen")
     return caps
 
 
@@ -122,6 +157,8 @@ def missing_reason(cap):
         return "no sensors configured (set SPC_SENSE_CMD or SPC_PRESENCE_GPIO)"
     if cap == "listen":
         return "no arecord (apt install alsa-utils)"
+    if cap == "screen":
+        return "no display detected (/dev/dri/card*, /dev/fb0) — set SPC_SCREEN=1 if a panel is attached"
     return "not available"
 
 
@@ -300,6 +337,106 @@ def listen(timeout_s, silence_s):
 
 
 # ---------------------------------------------------------------------------
+# Screen
+# ---------------------------------------------------------------------------
+#
+# The panel is the one piece of hardware this file does not drive directly. It
+# holds a state object; a browser in kiosk mode renders it (GET /face) and
+# follows changes (GET /display/state). That split is what lets the whole face
+# be built and demoed with no monitor attached — the same page opens on a
+# laptop — and it means the drawing code is CSS and SVG rather than a framebuffer
+# library this stdlib-only service is in no position to import.
+#
+# The state is deliberately last-write-wins with a per-key merge: a caller that
+# sends only an expression must not blank the QR code someone is mid-scan of.
+
+PANEL_MODES = ("message", "qr", "choices", "order", "blank")
+
+EXPRESSIONS = ("neutral", "happy", "listening", "thinking", "speaking",
+               "confused", "sad", "wink", "sleeping", "error")
+
+GAZES = ("center", "left", "right", "up", "down")
+
+SCREEN = {
+    "expression": "neutral",
+    "gaze": "center",
+    "panel": {"mode": "blank"},
+    # Monotonic, never reset. The page passes the version it last drew back in
+    # its poll, so a page that reconnects after a nap redraws exactly once, and
+    # a page that missed three updates while unplugged skips straight to the
+    # current one instead of replaying them.
+    "version": 0,
+    "ts": 0.0,
+}
+
+# A Condition rather than a Lock: the state route parks readers here until
+# something changes, so an update reaches the panel in milliseconds without the
+# page polling in a hot loop.
+SCREEN_COND = threading.Condition()
+
+
+def screen_snapshot():
+    with SCREEN_COND:
+        return json.loads(json.dumps(SCREEN))
+
+
+def screen_update(patch):
+    """Merge a patch into the screen state and wake every waiting page.
+
+    Returns the new state. Raises ValueError with a message meant for a language
+    model — these come back through mcp-core as the tool's error text.
+    """
+    expression = patch.get("expression")
+    gaze = patch.get("gaze")
+    panel = patch.get("panel")
+
+    if expression is not None and expression not in EXPRESSIONS:
+        raise ValueError(f"unknown expression '{expression}' — use one of: {', '.join(EXPRESSIONS)}")
+    if gaze is not None and gaze not in GAZES:
+        raise ValueError(f"unknown gaze '{gaze}' — use one of: {', '.join(GAZES)}")
+    if panel is not None:
+        if not isinstance(panel, dict):
+            raise ValueError("panel must be an object")
+        mode = panel.get("mode")
+        if mode not in PANEL_MODES:
+            raise ValueError(f"unknown panel mode '{mode}' — use one of: {', '.join(PANEL_MODES)}")
+        if mode == "qr" and not (panel.get("qr_data") or "").strip():
+            raise ValueError("panel mode 'qr' needs qr_data — there is nothing to encode")
+
+    with SCREEN_COND:
+        if expression is not None:
+            SCREEN["expression"] = expression
+        if gaze is not None:
+            SCREEN["gaze"] = gaze
+        if panel is not None:
+            # Replaced wholesale, not merged: a panel is one coherent layout, and
+            # merging would leave the previous mode's fields lying around to be
+            # rendered by accident.
+            SCREEN["panel"] = panel
+        SCREEN["version"] += 1
+        SCREEN["ts"] = time.time()
+        SCREEN_COND.notify_all()
+        return json.loads(json.dumps(SCREEN))
+
+
+def screen_wait(since, timeout_s):
+    """Current state, once it differs from `since`. Long-poll for the page.
+
+    Returns the state either way when the timeout expires — an unchanged answer
+    is how the page confirms the agent is still alive, which is what drives the
+    offline indicator.
+    """
+    deadline = time.monotonic() + timeout_s
+    with SCREEN_COND:
+        while SCREEN["version"] == since:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            SCREEN_COND.wait(remaining)
+        return json.loads(json.dumps(SCREEN))
+
+
+# ---------------------------------------------------------------------------
 # HTTP
 # ---------------------------------------------------------------------------
 
@@ -311,16 +448,18 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- helpers ------------------------------------------------------------
 
-    def _send(self, code, body=b"", content_type="application/octet-stream"):
+    def _send(self, code, body=b"", content_type="application/octet-stream", headers=None):
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
         self.end_headers()
         if body:
             self.wfile.write(body)
 
-    def _json(self, code, obj):
-        self._send(code, json.dumps(obj).encode("utf-8"), "application/json")
+    def _json(self, code, obj, headers=None):
+        self._send(code, json.dumps(obj).encode("utf-8"), "application/json", headers)
 
     def _authorized(self):
         if not FLEET_TOKEN:
@@ -358,15 +497,47 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": True,
                 "id": DEVICE_ID,
                 "capabilities": caps,
-                "missing": {c: missing_reason(c) for c in ("look", "speak", "sense", "listen") if c not in caps},
+                "missing": {c: missing_reason(c) for c in ("look", "speak", "sense", "listen", "screen") if c not in caps},
                 "auth": bool(FLEET_TOKEN),
                 "speaker_device": SPEAKER_DEVICE,
                 "mic_device": MIC_DEVICE,
                 "audio_out": playback_devices(),
             })
 
+        # /face and /display/state are open for the same reason /health is: the
+        # thing asking for them is a kiosk browser started by a .desktop file,
+        # which has no way to attach a header. Neither leaks a secret — the page
+        # is static markup, and the state is whatever is already lit up on a
+        # screen anyone in the room can see.
+        if path == "/face":
+            if not self._require("screen"):
+                return
+            if FACE_HTML is None:
+                return self._send(500, b"face page not installed - copy spc_face.py next to spc_agent.py",
+                                  "text/plain; charset=utf-8")
+            return self._send(200, FACE_HTML.encode("utf-8"), "text/html; charset=utf-8",
+                              {"Cache-Control": "no-store"})
+
+        if path == "/display/state":
+            if not self._require("screen"):
+                return
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            try:
+                since = int((query.get("v") or ["-1"])[0])
+            except ValueError:
+                since = -1
+            # 25s: comfortably inside every default proxy and browser idle
+            # timeout, so a quiet screen re-polls a couple of times a minute
+            # instead of hammering the loopback.
+            return self._json(200, screen_wait(since, 25), headers={"Cache-Control": "no-store"})
+
         if not self._authorized():
             return self._json(401, {"error": "missing or wrong X-Fleet-Token"})
+
+        if path == "/display":
+            if not self._require("screen"):
+                return
+            return self._json(200, screen_snapshot())
 
         if path == "/look":
             if not self._require("look"):
@@ -384,7 +555,7 @@ class Handler(BaseHTTPRequestHandler):
                 "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             })
 
-        return self._json(404, {"error": f"no route {path}. Try /health, /look, /sense."})
+        return self._json(404, {"error": f"no route {path}. Try /health, /look, /sense, /face, /display, /display/state."})
 
     def do_POST(self):
         path = self.path.split("?")[0]
@@ -427,7 +598,27 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(204)
             return self._send(200, wav, "audio/wav")
 
-        return self._json(404, {"error": f"no route {path}. Try /speak, /listen."})
+        if path == "/display":
+            if not self._require("screen"):
+                return
+            if not any(k in body for k in ("expression", "gaze", "panel")):
+                return self._json(400, {
+                    "error": "nothing to change — send an expression, a gaze, a panel, or any combination"
+                })
+            try:
+                state = screen_update(body)
+            except ValueError as err:
+                return self._json(400, {"error": str(err)})
+            panel_mode = state["panel"].get("mode")
+            print(f"screen v{state['version']}: {state['expression']} / {panel_mode}", flush=True)
+            return self._json(200, {
+                "updated": True,
+                "version": state["version"],
+                "expression": state["expression"],
+                "panel_mode": panel_mode,
+            })
+
+        return self._json(404, {"error": f"no route {path}. Try /speak, /listen, /display."})
 
 
 def main():
@@ -439,8 +630,9 @@ def main():
         print(f"  mic          {MIC_DEVICE}")
         print(f"  speaker      {SPEAKER_DEVICE}")
         print(f"  camera       {CAMERA_DEVICE}")
+        print(f"  screen       {'yes' if have_screen() else 'no'}")
         print(f"  capabilities {', '.join(capabilities()) or 'none'}")
-        for cap in ("look", "speak", "sense", "listen"):
+        for cap in ("look", "speak", "sense", "listen", "screen"):
             if cap not in capabilities():
                 print(f"    {cap}: {missing_reason(cap)}")
         return
@@ -448,9 +640,13 @@ def main():
     caps = capabilities()
     print(f"spc-agent {DEVICE_ID} on {HOST}:{PORT}", flush=True)
     print(f"  capabilities: {', '.join(caps) or 'NONE — nothing is wired up'}", flush=True)
-    for cap in ("look", "speak", "sense", "listen"):
+    for cap in ("look", "speak", "sense", "listen", "screen"):
         if cap not in caps:
             print(f"  no {cap}: {missing_reason(cap)}", flush=True)
+    if "screen" in caps:
+        print(f"  face page: http://localhost:{PORT}/face", flush=True)
+        if FACE_HTML is None:
+            print("  WARNING: spc_face.py is missing next to this script — /face has nothing to serve.", flush=True)
     if not FLEET_TOKEN:
         print("  WARNING: no SPC_FLEET_TOKEN — anyone who can reach this port can open the mic.", flush=True)
     # Threading matters: /speak and /listen both block for many seconds, and a

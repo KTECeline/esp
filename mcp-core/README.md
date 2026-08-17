@@ -64,6 +64,7 @@ can pick *where* to speak or look rather than guessing between id strings.
 | `spc_listen` | `device_id?`, `timeout_s?` | Opens the Pi's mic **now**, stops when you stop talking, transcribes here. |
 | `spc_sense` | `device_id?` | Passthrough of whatever sensors that Pi reports. |
 | `spc_look` | `device_id?` | A frame from the Pi's camera. |
+| `spc_expression` | `device_id?`, `expression?`, `gaze?`, `panel?` | Drives the Pi's own screen: an animated face on top, and below it a message, a QR code, choice tiles or an order summary. What you leave out stays as it was, so the eyes can change without disturbing a QR someone is scanning. |
 
 Every tool is registered only when the hardware behind it exists — see
 [`../spc-agent/README.md`](../spc-agent/README.md) for the Pi-side contract.

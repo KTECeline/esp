@@ -2,11 +2,14 @@
 
 mcp-core drives ESP boxes by pushing to firmware it controls. It can't do that
 to a Linux board, so the Pi runs this instead: a small HTTP service that exposes
-its microphone, speaker, sensors and camera as five routes.
+its microphone, speaker, sensors, camera and screen as a handful of routes.
 
-Anything that answers those five routes is a valid `spc` device. This
-implementation is a convenience, not a requirement — swap it for your own agent
-and mcp-core won't notice.
+Anything that answers those routes is a valid `spc` device. This implementation
+is a convenience, not a requirement — swap it for your own agent and mcp-core
+won't notice.
+
+Two files, and they travel together: `spc_agent.py` is the service,
+`spc_face.py` is the page it serves on an attached panel.
 
 ## Install on the Pi
 
@@ -23,8 +26,10 @@ sudo apt install alsa-utils sox espeak-ng ffmpeg   # drop what you don't need
 | `sox` | `listen` | still records, but always for the full timeout instead of stopping when you stop talking |
 | `espeak-ng` | `speak` | no voice unless you set `SPC_TTS_CMD` |
 | `ffmpeg` | `look` | no camera (`fswebcam` also works) |
+| a browser (`chromium`) | `screen` | the state is still served, but nothing draws it on the panel |
 
-Copy `spc_agent.py` to the Pi and check what it found:
+Copy `spc_agent.py` **and `spc_face.py`** to the Pi, side by side, then check
+what it found:
 
 ```bash
 python3 spc_agent.py --help     # prints resolved config + detected capabilities
@@ -37,7 +42,7 @@ Then point mcp-core at it in `config.json`:
 "devices": [
   { "id": "SPC-1", "name": "OrangePi", "kind": "spc",
     "base_url": "http://orangepi:8080",
-    "capabilities": ["speak", "sense", "listen"] }
+    "capabilities": ["speak", "sense", "listen", "screen"] }
 ]
 ```
 
@@ -51,6 +56,11 @@ came from `/health`, a Pi that happened to be switched off at boot would tell
 the model this restaurant has no speaker at all. mcp-core probes `/health`
 anyway and prints a warning when the two disagree. Add `"look"` and restart once
 a camera is plugged in.
+
+`"screen"` is the exception worth declaring early: there is no honest test for
+"is a monitor attached" (an unplugged HDMI port still leaves `/dev/dri/card0`),
+so set `SPC_SCREEN=1` and the whole face works over the network before any glass
+is involved.
 
 ## Configuration
 
@@ -67,6 +77,7 @@ All environment variables, all optional.
 | `SPC_TTS_CMD` | *(espeak-ng)* | Real voice, e.g. piper. Text arrives on stdin; write a WAV to the path substituted into `{out}` |
 | `SPC_PRESENCE_GPIO` | *(unset)* | sysfs GPIO number read as a `presence` bit |
 | `SPC_SENSE_CMD` | *(unset)* | Command printing a JSON object of readings on stdout |
+| `SPC_SCREEN` | *(auto)* | `1` forces the `screen` capability on, `0` off. Auto-detection looks for `/dev/dri/card*` or `/dev/fb0` and is a guess — HDMI unplugged still leaves a card node. Force it on to build the face before a panel arrives |
 
 ### Sensors
 
@@ -95,6 +106,7 @@ After=network-online.target sound.target
 ExecStart=/usr/bin/python3 /opt/spc-agent/spc_agent.py
 Environment=SPC_ID=SPC-1
 Environment=SPC_FLEET_TOKEN=<same value as ESP_FLEET_TOKEN on mcp-core>
+Environment=SPC_SCREEN=1
 Restart=always
 RestartSec=5
 User=orangepi
@@ -163,6 +175,64 @@ transcribed by the identical model with the identical prompt. Moving STT onto
 the Pi would give two devices in one restaurant two different accents' worth of
 accuracy, and would strand the Manglish tuning on one of them.
 
+### `POST /display` → 200
+
+```json
+{ "expression": "happy",
+  "gaze": "center",
+  "panel": { "mode": "message", "title": "Welcome!", "subtitle": "How can I help you?" } }
+```
+
+Sets what the attached panel shows. All three keys are optional and **anything
+left out is left alone** — sending only `expression` changes the eyes without
+disturbing a QR code someone is halfway through scanning. `panel`, when given,
+replaces the previous panel wholesale, because a panel is one coherent layout
+and merging would leave the old mode's fields lying around to be drawn by
+accident.
+
+Returns `{"updated": true, "version": 7, "expression": "...", "panel_mode": "..."}`.
+The version is a monotonic counter used by the page below.
+
+Panel modes: `message` (`title`, `subtitle`), `qr` (`qr_data` required,
+`qr_caption`), `choices` (`title`, `subtitle`, `choices[{id,label,icon}]`),
+`order` (`title`, `items[{name,qty,price}]`, `total`, `note`), `blank`.
+
+Choice tiles are **shown, not tappable** — the customer still answers out loud.
+
+### `GET /face` → 200 `text/html`
+
+The page a browser renders full-screen on the panel: the face on top, the panel
+below. Self-contained — no CDN, no fonts, no network of any kind, including the
+QR encoder, because this Pi may have no route off the tailnet.
+
+Open on the panel:
+
+```bash
+chromium --kiosk --noerrdialogs --disable-infobars \
+         --disable-session-crashed-bubble http://localhost:8080/face
+```
+
+Portrait: `xrandr --output HDMI-1 --rotate left` under X, or append
+`video=HDMI-A-1:1080x1920@60,rotate=90` to the kernel command line for a panel
+driven straight from DRM with no desktop.
+
+The same URL works from any machine that can reach the Pi, which is how the face
+is developed and demoed with no panel attached at all.
+
+### `GET /display/state?v=N` → 200
+
+Long poll. Returns the current state immediately if its `version` differs from
+`N`, otherwise holds the request for up to 25 s and answers anyway. That
+heartbeat is what tells the page the agent is still alive — the offline dot in
+the corner appears when it stops arriving, so a dead service looks different
+from an empty panel.
+
+`/face` and `/display/state` are **not** behind `X-Fleet-Token`: a kiosk browser
+started by a `.desktop` file has no way to send a header, and neither route
+reveals anything that is not already lit up on a screen in the room. `POST
+/display` and `GET /display` (which returns the current state as JSON, for
+debugging) are behind it as usual.
+
 ### Status codes
 
 | Code | Means |
@@ -190,3 +260,15 @@ nothing detecting the pause. `apt install sox`.
 **mcp-core says "offline" but `curl` from the Pi works** — check it from the
 *mcp-core machine*: `curl http://<host>:8080/health`. Almost always the
 Tailscale name, a firewall, or `SPC_HOST` bound to localhost.
+
+**`/face` answers "face page not installed"** — `spc_face.py` has to sit in the
+same directory as `spc_agent.py`; Python imports it by module name from beside
+the running script. `deploy_spc_agent.sh` copies both.
+
+**`spc_expression` exists in mcp-core but the Pi answers 501** — the config
+declares `screen` but the Pi did not detect a panel. Expected before the monitor
+is plugged in: set `SPC_SCREEN=1` in the unit and restart.
+
+**The face is frozen** — that is a stopped page, not a stopped service; the
+eyes blink and breathe on their own with no traffic at all. Reload the kiosk
+tab. The red dot in the corner means the page has lost the agent.

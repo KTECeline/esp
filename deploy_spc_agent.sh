@@ -24,10 +24,18 @@ TARGET="${1:-orangepi@orangepi5max}"
 HOST="${TARGET#*@}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SRC="$HERE/spc-agent/spc_agent.py"
+# The face page ships beside the agent. It is a separate file only so the HTTP
+# service stays readable; both must land together, or /face serves an apology.
+FACE_SRC="$HERE/spc-agent/spc_face.py"
 PORT=8080
 
 if [ ! -f "$SRC" ]; then
   echo "Cannot find $SRC"
+  echo "Run this from the laptop that holds the repo — not from the Pi."
+  exit 1
+fi
+if [ ! -f "$FACE_SRC" ]; then
+  echo "Cannot find $FACE_SRC"
   echo "Run this from the laptop that holds the repo — not from the Pi."
   exit 1
 fi
@@ -62,6 +70,10 @@ trap 'rm -f "$INSTALLER"' EXIT
   echo '#!/bin/bash'
   echo "REMOTE_TOKEN=\$(printf '%s' '$TOKEN_B64' | base64 -d)"
   echo "SKIP_APT='${SPC_SKIP_APT:-0}'"
+  # Empty means "work it out from /dev/dri and /dev/fb0". Deploy with
+  # SPC_SCREEN=1 to force the screen capability on before a panel is plugged in
+  # — the face can then be driven and watched from a browser on any machine.
+  echo "SCREEN='${SPC_SCREEN:-}'"
   # Quoted heredoc: everything below is expanded ON THE PI, not here.
   cat <<'BODY'
 set -u
@@ -79,6 +91,12 @@ echo "--> Placing /opt/spc-agent/spc_agent.py"
 sudo mkdir -p /opt/spc-agent
 sudo mv /tmp/spc_agent.py /opt/spc-agent/spc_agent.py
 sudo chmod 755 /opt/spc-agent/spc_agent.py
+
+# Must sit in the same directory: spc_agent.py imports it by module name, and
+# Python looks beside the script it is running.
+echo "--> Placing /opt/spc-agent/spc_face.py"
+sudo mv /tmp/spc_face.py /opt/spc-agent/spc_face.py
+sudo chmod 644 /opt/spc-agent/spc_face.py
 
 echo "--> Packages"
 if [ "${SKIP_APT}" = "1" ]; then
@@ -145,6 +163,7 @@ After=network-online.target sound.target
 ExecStart=/usr/bin/python3 /opt/spc-agent/spc_agent.py
 Environment=SPC_ID=SPC-1
 Environment=SPC_FLEET_TOKEN=${REMOTE_TOKEN}
+Environment=SPC_SCREEN=${SCREEN}
 Restart=always
 RestartSec=5
 User=${USER}
@@ -163,6 +182,9 @@ if systemctl is-active --quiet spc-agent; then
   echo "--> localhost check:"
   curl -s -m 5 "http://127.0.0.1:8080/health" || echo "    (no answer on localhost)"
   echo
+  if curl -s -m 5 "http://127.0.0.1:8080/health" | grep -q '"screen"'; then
+    echo "--> face page: http://$(hostname):8080/face  (open it anywhere to watch this Pi)"
+  fi
 else
   echo "--> FAILED to start:"
   sudo journalctl -u spc-agent -n 20 --no-pager
@@ -186,6 +208,7 @@ ssh -M -S "$CTL" -o ControlPersist=180 -o StrictHostKeyChecking=accept-new -fN "
 
 echo "==> Copying files"
 scp -o ControlPath="$CTL" -q "$SRC" "$TARGET:/tmp/spc_agent.py" || exit 1
+scp -o ControlPath="$CTL" -q "$FACE_SRC" "$TARGET:/tmp/spc_face.py" || exit 1
 scp -o ControlPath="$CTL" -q "$INSTALLER" "$TARGET:/tmp/spc_install.sh" || exit 1
 
 echo "==> Installing (sudo password prompt follows)"

@@ -36,6 +36,13 @@ Environment=SPC_CAMERA_DEVICE=/dev/video11
 # Text arrives on stdin; the command writes a WAV to {out}.
 Environment="SPC_TTS_CMD=/usr/bin/python3 /home/orangepi/esp-fleet/spc-agent/spc_tts.py {out}"
 
+# The face. Forced on rather than detected, because the panel is not attached
+# yet and there is no honest test for one anyway — /dev/dri/card0 exists on this
+# board whether or not anything is plugged into it. With this set, spc_expression
+# works and the face can be watched at http://orangepi5max:8080/face from any
+# machine on the tailnet. Set to 0 to hide the screen tools again.
+Environment=SPC_SCREEN=1
+
 ExecStart=/usr/bin/python3 /home/orangepi/esp-fleet/spc-agent/spc_agent.py
 Restart=on-failure
 RestartSec=3

@@ -627,6 +627,124 @@ export function createMcpServer({ boxes, speakToBox, vision, spc, transcribe, wa
       );
     }
 
+    if (spc.any("screen")) {
+      // The panel's four layouts, as one object rather than four flat argument
+      // groups: `mode` decides which other fields are read, and nesting them
+      // makes that dependency visible to the model instead of leaving it to be
+      // discovered by having fields quietly ignored.
+      const SpcPanelInput = z
+        .object({
+          mode: z
+            .enum(["message", "qr", "choices", "order", "blank"])
+            .describe("Which layout to draw: message (a line of text), qr (a scannable code), choices (large tiles), order (itemized list), blank (clear the panel, leaving only the face)."),
+          title: z.string().max(60).optional().describe("The large line. Used by message, choices and order."),
+          subtitle: z
+            .string()
+            .max(200)
+            .optional()
+            .describe("The smaller line under the title. This is where to put what you are saying out loud, so a customer who mishears can read it."),
+          qr_data: z
+            .string()
+            .max(400)
+            .optional()
+            .describe("Required for mode=qr: the exact text or URL the phone should receive. Encoded verbatim."),
+          qr_caption: z.string().max(60).optional().describe("Words shown beside the QR, e.g. 'Scan QR to Order'."),
+          choices: z
+            .array(
+              z
+                .object({
+                  id: z.string().max(32).describe("Stable identifier for this choice."),
+                  label: z.string().max(24).describe("The words on the tile."),
+                  icon: z.string().max(8).optional().describe("A single emoji shown above the label.")
+                })
+                .strict()
+            )
+            .max(4)
+            .optional()
+            .describe("For mode=choices: up to 4 tiles. These are shown, not tappable — the customer still answers out loud."),
+          items: z
+            .array(
+              z
+                .object({
+                  name: z.string().max(40).describe("Item name."),
+                  qty: z.number().int().min(1).max(99).optional().describe("How many."),
+                  price: z.string().max(12).optional().describe("Pre-formatted line price, e.g. 'RM9.00'. Shown verbatim.")
+                })
+                .strict()
+            )
+            .max(6)
+            .optional()
+            .describe("For mode=order: the lines of the order, at most 6."),
+          total: z.string().max(16).optional().describe("Pre-formatted total, e.g. 'RM18.50'. Shown verbatim; never computed here."),
+          note: z.string().max(160).optional().describe("A small line under the order, e.g. what to do next.")
+        })
+        .strict();
+
+      const SpcExpressionInput = z
+        .object({
+          device_id: z
+            .string()
+            .optional()
+            .describe("Which OrangePi's screen to change. Optional when only one configured device has one."),
+          expression: z
+            .enum(["neutral", "happy", "listening", "thinking", "speaking", "confused", "sad", "wink", "sleeping", "error"])
+            .optional()
+            .describe("The face in the upper half. Omit to leave the current face alone."),
+          gaze: z
+            .enum(["center", "left", "right", "up", "down"])
+            .optional()
+            .describe("Where the eyes look. Omit for the expression's own default."),
+          panel: SpcPanelInput.optional().describe("The lower half. Omit to leave whatever is already shown.")
+        })
+        .strict();
+
+      server.registerTool(
+        "spc_expression",
+        {
+          title: "Set an OrangePi's Face and Screen",
+          description:
+            "Drives the screen attached to an OrangePi. The screen has two halves and this one tool sets either or both: an animated FACE on top (eyes, brows, mouth) and a PANEL below (a message, a QR code, choice tiles, or an order summary).\n\nWhatever you leave out stays as it is. Send only `expression` to change the face while a QR code stays up for scanning; send only `panel` to change what is written without changing the mood. The face keeps blinking and breathing on its own between calls — you never need to call this to keep it alive.\n\nThis is the Pi's screen, not an ESP box's small LCD (that is esp_display), and it makes no sound (that is spc_speak). A natural turn is: set a listening face, listen, set a thinking face, then speak and show what you said.\n\nArgs:\n  - device_id (string, optional): target Pi; defaults to the only screen-equipped device\n  - expression (string, optional): neutral, happy, listening, thinking, speaking, confused, sad, wink, sleeping, error\n  - gaze (string, optional): center, left, right, up, down\n  - panel (object, optional): { mode } plus the fields that mode uses:\n      mode=message  title, subtitle\n      mode=qr       qr_data (required), qr_caption\n      mode=choices  title, subtitle, choices[{id,label,icon}]\n      mode=order    title, items[{name,qty,price}], total, note\n      mode=blank    clears the panel, leaving the face alone\n\nReturns:\n  { \"updated\": true, \"device_id\": string, \"expression\": string, \"panel_mode\": string, \"version\": number }\n\nExamples:\n  - Use when: you are about to listen and want the face to show it (expression=listening)\n  - Use when: showing a payment or menu QR the customer scans with their phone\n  - Use when: mirroring the sentence you are speaking, as panel.subtitle, so it can be read as well as heard\n  - Don't use when: you want the ESP box's screen (use esp_display), or you want sound (use spc_speak)\n\nError Handling:\n  - Returns an error naming valid ids if device_id is unknown, ambiguous, or has no screen\n  - Returns an error if neither expression, gaze nor panel is given — there would be nothing to change\n  - Returns an error if mode=qr arrives without qr_data, since there would be nothing to encode\n  - Returns an error explaining what to check if the Pi is unreachable\n  - Succeeds even if nobody is looking at the screen and even if no browser is currently showing it: the state is stored on the Pi and the panel picks it up when it next connects\n  - Prices and totals are shown exactly as given; this server never computes them",
+          inputSchema: SpcExpressionInput,
+          annotations: {
+            readOnlyHint: false,
+            destructiveHint: false,
+            idempotentHint: true,
+            openWorldHint: false
+          }
+        },
+        async ({ device_id, expression, gaze, panel }) => {
+          const { device, error } = resolveSpc(spc, "screen", device_id);
+          if (error) return mcpError(error);
+          if (expression === undefined && gaze === undefined && panel === undefined) {
+            return mcpError(
+              "Nothing to change — give an expression, a gaze, a panel, or any combination. " +
+              "Use panel { mode: \"blank\" } if the intent was to clear the lower half."
+            );
+          }
+          if (panel?.mode === "qr" && !panel.qr_data?.trim()) {
+            return mcpError("panel.mode is \"qr\" but qr_data is missing — there is nothing to encode.");
+          }
+          try {
+            const patch = {};
+            if (expression !== undefined) patch.expression = expression;
+            if (gaze !== undefined) patch.gaze = gaze;
+            if (panel !== undefined) patch.panel = panel;
+            const result = await device.display(patch);
+            console.log(`[${device.id}] spc_expression: ${result.expression} / ${result.panel_mode}`);
+            return mcpJson({
+              updated: true,
+              device_id: device.id,
+              expression: result.expression,
+              panel_mode: result.panel_mode,
+              version: result.version
+            });
+          } catch (err) {
+            return mcpError(`Could not update the screen on "${device.id}": ${err.message}`);
+          }
+        }
+      );
+    }
+
     if (spc.any("sense")) {
       server.registerTool(
         "spc_sense",

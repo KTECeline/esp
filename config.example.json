@@ -12,8 +12,9 @@
     "DECLARED rather than probed: if it were read from the Pi's /health, a Pi that",
     "happened to be switched off at startup would silently produce a fleet with no",
     "speaker at all. mcp-core still probes /health on boot and prints any mismatch.",
-    "Known capabilities: look (camera), speak (speaker), sense (sensors), listen (mic).",
-    "Omit `capabilities` to expose all four; set \"enabled\": false to keep an entry",
+    "Known capabilities: look (camera), speak (speaker), sense (sensors), listen (mic),",
+    "screen (an attached panel showing the face + QR/message, via spc_expression).",
+    "Omit `capabilities` to expose all five; set \"enabled\": false to keep an entry",
     "on file without registering its tools."
   ],
   "devices": [
@@ -22,7 +23,7 @@
       "name": "OrangePi Counter",
       "kind": "spc",
       "base_url": "http://orangepi:8080",
-      "capabilities": ["look", "speak", "sense", "listen"]
+      "capabilities": ["look", "speak", "sense", "listen", "screen"]
     }
   ],
   "_backends_help": [

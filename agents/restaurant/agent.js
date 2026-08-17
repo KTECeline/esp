@@ -15,6 +15,14 @@ import { fileURLToPath } from "node:url";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.AGENT_PORT || 4000;
+// Shared secret with mcp-core, sent as a bearer token. Set AGENT_TOKEN here and
+// backends.<name>.token_env in mcp-core's config.json to the same variable.
+//
+// This is not belt-and-braces: this process binds every interface, so once its
+// host joins a tailnet "only reachable locally" quietly stops being true, and an
+// unauthenticated /finalize lets anyone who can route to the port close out a
+// stranger's order. Empty disables the check, for a genuinely isolated host.
+const AGENT_TOKEN = process.env.AGENT_TOKEN || "";
 // The agent picks its own LLM — this is deliberately NOT in the core's config.
 const LLM_URL = process.env.AGENT_LLM_URL || "http://localhost:11434/v1/chat/completions";
 const LLM_MODEL = process.env.AGENT_LLM_MODEL || "llama3.2:3b";
@@ -239,6 +247,14 @@ async function readBody(req) {
   return Buffer.concat(chunks).toString("utf8");
 }
 
+// /health stays open so a monitor can prove the process is alive without
+// holding a credential; it exposes nothing but the restaurant name and a count.
+// Everything that reads or changes an order is gated.
+function authed(req) {
+  if (!AGENT_TOKEN) return true;
+  return (req.headers.authorization || "") === `Bearer ${AGENT_TOKEN}`;
+}
+
 const server = http.createServer(async (req, res) => {
   const json = (status, obj) => {
     res.writeHead(status, { "Content-Type": "application/json" });
@@ -248,6 +264,11 @@ const server = http.createServer(async (req, res) => {
   try {
     if (req.method === "GET" && req.url === "/health") {
       return json(200, { status: "ok", restaurant: MENU.restaurant, sessions: sessions.size });
+    }
+
+    if (!authed(req)) {
+      console.warn(`refused unauthenticated ${req.method} ${req.url}`);
+      return json(401, { error: "missing or wrong Authorization: Bearer <AGENT_TOKEN>" });
     }
 
     // Finalize by TOUCH — the customer tapped END + PAY on the box. Reaches the
@@ -318,4 +339,11 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, () => {
   console.log(`restaurant agent for "${MENU.restaurant}" listening on port ${PORT}`);
   console.log(`LLM: ${LLM_MODEL} @ ${LLM_URL}`);
+  if (AGENT_TOKEN) {
+    console.log("auth: ON (Authorization: Bearer, from AGENT_TOKEN)");
+  } else {
+    console.warn("auth: OFF — no AGENT_TOKEN set. Anyone who can reach this port " +
+                 "can create, finalize or wipe orders. Set AGENT_TOKEN here and " +
+                 "token_env on the matching backend in mcp-core's config.json.");
+  }
 });
