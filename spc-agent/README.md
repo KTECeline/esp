@@ -8,8 +8,9 @@ Anything that answers those routes is a valid `spc` device. This implementation
 is a convenience, not a requirement — swap it for your own agent and mcp-core
 won't notice.
 
-Two files, and they travel together: `spc_agent.py` is the service,
-`spc_face.py` is the page it serves on an attached panel.
+Three files: `spc_agent.py` is the service, `spc_face.py` is the page it serves
+to a browser on an attached panel, and `spc_fb.py` draws that same screen
+straight to the framebuffer when there is no browser to serve it to.
 
 ## Install on the Pi
 
@@ -26,7 +27,7 @@ sudo apt install alsa-utils sox espeak-ng ffmpeg   # drop what you don't need
 | `sox` | `listen` | still records, but always for the full timeout instead of stopping when you stop talking |
 | `espeak-ng` | `speak` | no voice unless you set `SPC_TTS_CMD` |
 | `ffmpeg` | `look` | no camera (`fswebcam` also works) |
-| a browser (`chromium`) | `screen` | the state is still served, but nothing draws it on the panel |
+| a browser (`chromium`) | `screen` | only for `GET /face`; `spc_fb.py` needs nothing at all |
 
 Copy `spc_agent.py` **and `spc_face.py`** to the Pi, side by side, then check
 what it found:
@@ -232,6 +233,51 @@ started by a `.desktop` file has no way to send a header, and neither route
 reveals anything that is not already lit up on a screen in the room. `POST
 /display` and `GET /display` (which returns the current state as JSON, for
 debugging) are behind it as usual.
+
+## Drawing the face without a browser
+
+`GET /face` assumes something can render HTML. On a server image there may be
+nothing that can — this OrangePi has no X, no Wayland, and the only chromium and
+firefox packages in its repos are snap stubs. So `spc_fb.py` draws the same
+screen straight to `/dev/fb0`:
+
+```bash
+python3 spc_fb.py            # follows SPC_FB_URL, default http://127.0.0.1:8080
+```
+
+No display server, no packages, and **no root** — `/dev/fb0` is `root:video` and
+the login user is already in `video`. Text comes from the Terminus PSF console
+fonts that ship with `console-setup`. A full repaint is about 75&nbsp;ms, so it
+still blinks on its own.
+
+It follows the same `/display/state` long poll the browser page uses, so
+`spc_expression` drives whichever renderer is running and the tool never has to
+know which one that is.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `SPC_FB_URL` | `http://127.0.0.1:8080` | Agent to follow |
+| `SPC_FB_ROTATE` | `270` | The panel is mounted a quarter turn from the framebuffer's idea of it |
+| `SPC_FB_DEVICE` | `/dev/fb0` | |
+| `SPC_FB_FONT` | *(largest Terminus found)* | Any `.psf`/`.psf.gz` |
+
+Rotation is done here rather than in the kernel or a compositor on purpose:
+everything is composed in portrait content coordinates and mapped on the way
+out, so a landscape framebuffer on a portrait panel needs no boot parameters and
+no reboot to get right. Content columns become framebuffer rows, which is also
+what keeps a pure-Python renderer fast enough to be worth having.
+
+**Not yet drawn:** `mode: "qr"` shows the link as text. The browser page has a
+real encoder; an unscannable square would be worse than a readable URL.
+
+Both halves run as **user** units, so they come back after a reboot without root
+(lingering is already enabled on this box):
+
+```bash
+install -m 644 spc-screen.service spc-face.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now spc-screen.service spc-face.service
+```
 
 ### Status codes
 

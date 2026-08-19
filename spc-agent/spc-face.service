@@ -1,0 +1,38 @@
+# systemd USER unit — draws the face on the panel's framebuffer.
+#
+#   install to ~/.config/systemd/user/spc-face.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now spc-face.service
+#
+# No display server involved: this writes to /dev/fb0 directly, which works
+# because /dev/fb0 is root:video and the login user is in the video group.
+# That is deliberate — this Armbian image has no X, no Wayland, and the only
+# chromium/firefox packages in its repos are snap stubs.
+#
+# It follows the SAME /display state the browser page follows, so whichever
+# renderer is running, spc_expression drives it identically.
+
+[Unit]
+Description=spc-fb — the OrangePi's face, drawn straight to /dev/fb0
+After=spc-screen.service
+Wants=spc-screen.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/orangepi/esp-fleet/spc-agent
+
+# The agent this follows. Its own retry loop covers the agent being slow to
+# start, so the ordering above is a preference, not a requirement.
+Environment=SPC_FB_URL=http://127.0.0.1:8081
+
+# The panel is mounted a quarter turn from the way the framebuffer sees it:
+# the frame is 1920x1080 landscape, the glass is portrait. 270 puts content's
+# top-left at the panel's top-left. Verified against the hardware 2026-08-19.
+Environment=SPC_FB_ROTATE=270
+
+ExecStart=/usr/bin/python3 /home/orangepi/esp-fleet/spc-agent/spc_fb.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,64 @@
+# systemd USER unit — the agent that owns the panel's state.
+#
+#   install to ~/.config/systemd/user/spc-screen.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now spc-screen.service
+#
+# Why a SECOND agent instead of just updating the one already running: the
+# installed agent lives in /opt, which is root-owned, and this box has no
+# passwordless sudo. This one runs from the repo checkout in $HOME on port 8081,
+# adds the /display + /face routes the panel needs, and leaves the /opt service
+# on 8080 completely alone. Once /opt is updated (one sudo, deploy_spc_agent.sh)
+# this unit and the 8081 port both go away, and mcp-core points back at 8080.
+#
+# User units survive reboot on this box because lingering is enabled
+# (loginctl enable-linger orangepi) — which is the whole reason this works
+# without root.
+
+[Unit]
+Description=spc-agent (screen) — holds the face + panel state on :8081
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/orangepi/esp-fleet/spc-agent
+
+# Supplies ESP_FLEET_TOKEN, which spc_agent.py accepts in place of
+# SPC_FLEET_TOKEN. Not optional: mcp-core now routes speak and listen here too,
+# and this service can open the microphone in the room it is sitting in.
+EnvironmentFile=/home/orangepi/esp/.env
+
+Environment=SPC_ID=SPC-SCREEN
+Environment=SPC_PORT=8081
+
+# FULL PARITY WITH THE /opt AGENT BELOW THIS LINE.
+#
+# Once mcp-core points at this instance it is not "the screen agent" any more —
+# it is the whole device, and it inherits every job the /opt one had. Leaving
+# these out is not a missing feature, it is a silent one: ALSA's "default" sink
+# on this board is card 0, rockchip-hdmi0, so speech goes out the HDMI cable
+# into a panel with no speakers and the Pi looks mute while reporting success.
+#
+# Card NAME, not number — ALSA numbering follows probe order and shifts on
+# reboot. "Lite" is the ReSpeaker's stable id.
+Environment=SPC_SPEAKER_DEVICE=plughw:CARD=Lite,DEV=0
+Environment=SPC_MIC_DEVICE=plughw:CARD=Lite,DEV=0
+
+# Piper, via the shim that takes text on stdin and writes a WAV to {out}.
+# Without it spc_speak still works, in espeak-ng's 1985 robot voice.
+Environment="SPC_TTS_CMD=/usr/bin/python3 /home/orangepi/esp-fleet/spc-agent/spc_tts.py {out}"
+
+# The rkcif raw node; /dev/video0 is an ISP node that never yields a frame.
+Environment=SPC_CAMERA_DEVICE=/dev/video11
+
+# Forced on rather than detected: /dev/dri/card0 exists on this board whether or
+# not a panel is plugged into the HDMI port, so autodetection cannot tell the
+# truth either way. See have_screen() in spc_agent.py.
+Environment=SPC_SCREEN=1
+
+ExecStart=/usr/bin/python3 /home/orangepi/esp-fleet/spc-agent/spc_agent.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
