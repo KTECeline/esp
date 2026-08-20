@@ -48,8 +48,19 @@ Environment=SPC_MIC_DEVICE=plughw:CARD=Lite,DEV=0
 # Without it spc_speak still works, in espeak-ng's 1985 robot voice.
 Environment="SPC_TTS_CMD=/usr/bin/python3 /home/orangepi/esp-fleet/spc-agent/spc_tts.py {out}"
 
-# The rkcif raw node; /dev/video0 is an ISP node that never yields a frame.
+# The rkcif RAW node. /dev/video0 and the /dev/video-camera0 ISP node never
+# yield a frame on this board: the ISP wants an rkaiq 3A daemon that does not
+# exist in these repos, so it accepts a stream request and times out.
+#
+# Which node this is depends on WHICH CAM SOCKET the ribbon is in — it was
+# video11 (i2c bus 6) when the camera sat in CAM0. Re-check after moving it:
+#   dmesg | grep -i ov13855      <- find the bus that detects
+#   v4l2-ctl --list-devices      <- find its rkcif node
 Environment=SPC_CAMERA_DEVICE=/dev/video11
+Environment=SPC_CAMERA_BACKEND=v4l2raw
+Environment=SPC_CAMERA_WIDTH=4224
+Environment=SPC_CAMERA_HEIGHT=3136
+Environment=SPC_CAMERA_RAW_FORMAT=BG10
 
 # Forced on rather than detected: /dev/dri/card0 exists on this board whether or
 # not a panel is plugged into the HDMI port, so autodetection cannot tell the

@@ -19,6 +19,7 @@ Configuration is by environment variable — see CONFIG below, or run with
 --help for the resolved values on this machine.
 """
 
+import errno
 import glob
 import json
 import os
@@ -62,6 +63,32 @@ SPEAKER_DEVICE = os.environ.get("SPC_SPEAKER_DEVICE", "default")
 # Video4Linux node for the camera. Absent = no camera = /look returns 501 and
 # mcp-core is told not to expose spc_look.
 CAMERA_DEVICE = os.environ.get("SPC_CAMERA_DEVICE", "/dev/video0")
+
+# How to read that node.
+#
+#   ffmpeg    a normal webcam that yields a decodable format. The default.
+#   v4l2raw   a MIPI sensor whose ISP path does not work, so the only node that
+#             produces frames hands over raw Bayer that ffmpeg cannot read.
+#
+# The second is not exotic: it is the OrangePi 5 Max's own OV13855 kit. Its ISP
+# path needs an rkaiq 3A daemon that does not exist in these repos, so the ISP
+# node accepts a stream request and then times out with a 0-byte file, while
+# /dev/video11 quietly delivers 10-bit Bayer. mcp-core solved this once in
+# vision.js; this is the same solution on the agent side, so a Pi whose camera
+# is not on the mcp-core machine still answers /look.
+CAMERA_BACKEND = os.environ.get("SPC_CAMERA_BACKEND", "ffmpeg")
+CAMERA_WIDTH = int(os.environ.get("SPC_CAMERA_WIDTH", "4224"))
+CAMERA_HEIGHT = int(os.environ.get("SPC_CAMERA_HEIGHT", "3136"))
+CAMERA_RAW_FORMAT = os.environ.get("SPC_CAMERA_RAW_FORMAT", "BG10")
+# MUST be even, and is fastest as a multiple of 4. A Bayer mosaic repeats every
+# 2 pixels, so an odd step alternates colour planes and produces a checkerboard
+# that reads as texture — which defeats exactly the QR finder patterns this is
+# most often pointed at.
+CAMERA_RAW_DOWNSAMPLE = int(os.environ.get("SPC_CAMERA_RAW_DOWNSAMPLE", "4"))
+CAMERA_RAW_WARMUP = int(os.environ.get("SPC_CAMERA_RAW_WARMUP", "2"))
+
+RAW10_PIXELS_PER_GROUP = 4
+RAW10_BYTES_PER_GROUP = 5
 
 # Recording format. 16kHz mono 16-bit is what whisper.cpp wants; sending
 # anything else just makes mcp-core resample it.
@@ -120,6 +147,37 @@ def have_screen():
 # Capability detection
 # ---------------------------------------------------------------------------
 
+def camera_ready():
+    """Whether /look can actually produce a frame — not just whether a node exists.
+
+    The distinction matters: the old check passed on this board (node present,
+    ffmpeg installed) while every /look returned HTTP 500, because ffmpeg cannot
+    read the raw Bayer node. A capability that is advertised but cannot work is
+    worse than one that is absent, since mcp-core registers a tool for it.
+    """
+    if not os.path.exists(CAMERA_DEVICE):
+        return False
+    if CAMERA_BACKEND == "v4l2raw":
+        if not (have("v4l2-ctl") and have("ffmpeg")):
+            return False
+    elif not (have("ffmpeg") or have("fswebcam")):
+        return False
+
+    # The node existing is not the same as the sensor being there. On a MIPI
+    # board every /dev/videoN is created whether or not a camera is attached, so
+    # a dead or unseated sensor still passes an exists() check and /look then
+    # fails with "No such device". Opening it costs nothing and is the cheapest
+    # question that distinguishes the two.
+    try:
+        fd = os.open(CAMERA_DEVICE, os.O_RDWR | os.O_NONBLOCK)
+    except OSError as err:
+        # EBUSY means something else is streaming from it — which proves it
+        # works, so that one counts as ready.
+        return getattr(err, "errno", None) == errno.EBUSY
+    os.close(fd)
+    return True
+
+
 def capabilities():
     """What this Pi can actually do, right now.
 
@@ -130,7 +188,7 @@ def capabilities():
     mismatch ever gets noticed before a tool fails in front of a customer.
     """
     caps = []
-    if os.path.exists(CAMERA_DEVICE) and (have("ffmpeg") or have("fswebcam")):
+    if camera_ready():
         caps.append("look")
     if have("aplay") and (TTS_CMD or have("espeak-ng") or have("espeak")):
         caps.append("speak")
@@ -148,7 +206,13 @@ def missing_reason(cap):
     if cap == "look":
         if not os.path.exists(CAMERA_DEVICE):
             return f"no camera at {CAMERA_DEVICE} (set SPC_CAMERA_DEVICE, or plug one in)"
-        return "no ffmpeg or fswebcam installed (apt install ffmpeg)"
+        if CAMERA_BACKEND == "v4l2raw" and not have("v4l2-ctl"):
+            return "no v4l2-ctl, which is what reads a raw MIPI camera (apt install v4l-utils)"
+        if not (have("ffmpeg") or have("fswebcam")):
+            return "no ffmpeg or fswebcam installed (apt install ffmpeg)"
+        return (f"{CAMERA_DEVICE} exists but will not open — on a MIPI board that means the "
+                f"sensor was not detected at boot. Check: dmesg | grep -i ov13855. A ribbon "
+                f"that is not fully seated does exactly this; re-seat both ends and reboot")
     if cap == "speak":
         if not have("aplay"):
             return "no aplay (apt install alsa-utils)"
@@ -218,7 +282,91 @@ def playback_devices():
     return devices
 
 
+def capture_raw_gray():
+    """One frame off a raw-Bayer MIPI node, unpacked to 8-bit greyscale.
+
+    Returns (bytes, width, height). Colour is discarded on purpose: this camera
+    exists to read QR codes and see what is on the counter, and demosaicing in
+    pure Python would cost far more than it is worth.
+    """
+    out = run([
+        "v4l2-ctl", "-d", CAMERA_DEVICE,
+        f"--set-fmt-video=width={CAMERA_WIDTH},height={CAMERA_HEIGHT},"
+        f"pixelformat={CAMERA_RAW_FORMAT}",
+        "--stream-mmap=3", "--stream-to=-",
+        f"--stream-count={CAMERA_RAW_WARMUP}",
+    ], TIMEOUTS["look"])
+
+    if not out:
+        raise RuntimeError(
+            f"{CAMERA_DEVICE} produced no data. On this board that usually means the "
+            f"sensor was not detected at boot — check dmesg for 'Unexpected sensor id'."
+        )
+    if len(out) % CAMERA_RAW_WARMUP != 0:
+        raise RuntimeError(f"camera returned {len(out)} bytes, not divisible into "
+                           f"{CAMERA_RAW_WARMUP} frames")
+    frame_bytes = len(out) // CAMERA_RAW_WARMUP
+
+    # Derive the stride from what actually arrived rather than from a formula.
+    # The hardware pads rows to an alignment boundary — 4224 RAW10 pixels is
+    # 5280 bytes but lands as 5376 — and getting it wrong does not raise, it
+    # shears the picture diagonally and silently decodes nothing.
+    stride, rem = divmod(frame_bytes, CAMERA_HEIGHT)
+    if rem:
+        raise RuntimeError(f"frame of {frame_bytes} bytes does not divide by height "
+                           f"{CAMERA_HEIGHT} — check SPC_CAMERA_HEIGHT")
+    min_stride = -(-CAMERA_WIDTH * RAW10_BYTES_PER_GROUP // RAW10_PIXELS_PER_GROUP)
+    if stride < min_stride:
+        raise RuntimeError(f"stride {stride} is too small for {CAMERA_WIDTH} RAW10 pixels "
+                           f"(need {min_stride}) — check SPC_CAMERA_WIDTH")
+
+    step = max(2, CAMERA_RAW_DOWNSAMPLE)
+    if step % 2:
+        step += 1                                  # odd steps cross Bayer planes
+    # Keep the LAST frame: the first one after stream start is still settling.
+    base = len(out) - frame_bytes
+    out_w = CAMERA_WIDTH // step
+    out_h = CAMERA_HEIGHT // step
+    gray = bytearray()
+
+    # In RAW10, 4 pixels share 5 bytes and the first 4 are their high bytes, so
+    # pixel x lives at (x//4)*5 + (x%4). When step is a multiple of 4 that lands
+    # on a fixed byte stride, and the whole row becomes one slice — which is the
+    # difference between milliseconds and half a minute in pure Python.
+    if step % RAW10_PIXELS_PER_GROUP == 0:
+        byte_step = (step // RAW10_PIXELS_PER_GROUP) * RAW10_BYTES_PER_GROUP
+        for oy in range(out_h):
+            row = base + oy * step * stride
+            gray += out[row : row + out_w * byte_step : byte_step]
+    else:
+        for oy in range(out_h):
+            row = base + oy * step * stride
+            for ox in range(out_w):
+                x = ox * step
+                gray.append(out[row + (x // RAW10_PIXELS_PER_GROUP) * RAW10_BYTES_PER_GROUP
+                                + (x % RAW10_PIXELS_PER_GROUP)])
+
+    if len(gray) != out_w * out_h:
+        raise RuntimeError(f"unpacked {len(gray)} bytes, expected {out_w * out_h}")
+    return bytes(gray), out_w, out_h
+
+
+def encode_jpeg(gray, width, height):
+    """Greyscale bytes -> JPEG. ffmpeg only ever encodes here; it never captures."""
+    return run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-f", "rawvideo", "-pix_fmt", "gray", "-s", f"{width}x{height}",
+        "-i", "-", "-frames:v", "1", "-f", "mjpeg", "-"
+    ], TIMEOUTS["look"], stdin=gray)
+
+
 def capture_jpeg():
+    # A sensor with no working ISP path never reaches ffmpeg's v4l2 input at all,
+    # so the backend is chosen before anything else happens.
+    if CAMERA_BACKEND == "v4l2raw":
+        gray, w, h = capture_raw_gray()
+        return encode_jpeg(gray, w, h)
+
     with tempfile.TemporaryDirectory() as tmp:
         out = os.path.join(tmp, "frame.jpg")
         if have("ffmpeg"):

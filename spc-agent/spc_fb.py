@@ -46,6 +46,49 @@ import urllib.request
 AGENT = os.environ.get("SPC_FB_URL", "http://127.0.0.1:8080").rstrip("/")
 FB_DEVICE = os.environ.get("SPC_FB_DEVICE", "/dev/fb0")
 ROTATE = int(os.environ.get("SPC_FB_ROTATE", "270"))
+
+# How much of the picture the panel actually shows, as a fraction of the content
+# height. 1.0 for a monitor that displays what it is sent.
+#
+# Cheap HDMI panels that publish no EDID often do not: the driver has to guess a
+# timing, the panel's scaler locks onto a different active area, and the bottom
+# of every frame falls off the glass while the rest is stretched to fill it. The
+# panel this was built against shows content rows 0..725 of 1024 — measured by
+# drawing labelled marks and photographing which was the last one visible.
+#
+# Layout uses this height; drawing is still clipped to the real buffer, so
+# nothing overruns memory. Set it to 1.0 once the mode is right (forcing
+# 1920x1080 in armbianEnv.txt made this panel behave) and the whole screen
+# comes back.
+USABLE = max(0.2, min(1.0, float(os.environ.get("SPC_FB_USABLE", "1.0"))))
+
+# THE FRAME: which part of the picture this particular panel actually puts on
+# glass, as content-space insets "left,top,right,bottom".
+#
+# Two separate faults, both from the same missing EDID:
+#   - the bottom of every frame falls off the glass (hence the bottom inset)
+#   - the picture sits off-centre, with a strip cut on one side and unreachable
+#     black on the other (hence the left inset, which re-centres what is left)
+#
+# Measured against the hardware, not guessed: draw labelled marks, photograph
+# the panel, read off the last one visible. The numbers below are for the 7"
+# 1024x600 panel on this kiosk as of 2026-08-19. Any other panel needs its own,
+# and a panel whose mode is correct needs none at all.
+def _insets():
+    raw = os.environ.get("SPC_FB_INSET", "").strip()
+    if not raw:
+        return (0, 0, 0, 0)
+    try:
+        parts = [int(v) for v in raw.split(",")]
+    except ValueError:
+        print(f"SPC_FB_INSET={raw!r} is not four numbers — ignoring", flush=True)
+        return (0, 0, 0, 0)
+    if len(parts) != 4:
+        print(f"SPC_FB_INSET wants left,top,right,bottom — got {len(parts)} — ignoring", flush=True)
+        return (0, 0, 0, 0)
+    return tuple(max(0, v) for v in parts)
+
+INSET_L, INSET_T, INSET_R, INSET_B = _insets()
 FONT_PATH = os.environ.get("SPC_FB_FONT", "")
 
 # Same palette as the browser page, so the two renderers are recognisably the
@@ -92,6 +135,16 @@ class Screen:
         self.fw, self.fh, self.stride = fb_geometry()
         self.rot = rotate % 360
         self.w, self.h = (self.fh, self.fw) if self.rot in (90, 270) else (self.fw, self.fh)
+        # h stays the LAYOUT height so every proportional decision below lands
+        # on glass the viewer can actually see; h_raw is the real buffer, used
+        # for clipping so drawing can never overrun memory.
+        self.w_raw, self.h_raw = self.w, self.h
+        # The drawable frame: everything Face and Panel lay out lands inside it,
+        # so they stay ignorant of the panel's quirks and the same code drives a
+        # screen that behaves.
+        self.x0, self.y0 = INSET_L, INSET_T
+        self.w = self.w_raw - INSET_L - INSET_R
+        self.h = int(self.h_raw * USABLE) - INSET_T - INSET_B
         self.fd = os.open(path, os.O_RDWR)
         self.mem = mmap.mmap(self.fd, self.stride * self.fh, mmap.MAP_SHARED,
                              mmap.PROT_READ | mmap.PROT_WRITE)
@@ -101,22 +154,26 @@ class Screen:
         os.close(self.fd)
 
     def vspan(self, x, y0, y1, color):
-        """Fill content column x from row y0 up to (not including) y1."""
-        if x < 0 or x >= self.w:
+        """Fill column x of the FRAME, from row y0 up to (not including) y1."""
+        self.vspan_raw(x + self.x0, y0 + self.y0, y1 + self.y0, color)
+
+    def vspan_raw(self, x, y0, y1, color):
+        """The same, in real buffer coordinates, ignoring the frame."""
+        if x < 0 or x >= self.w_raw:
             return
         y0 = 0 if y0 < 0 else int(y0)
-        y1 = self.h if y1 > self.h else int(y1)
+        y1 = self.h_raw if y1 > self.h_raw else int(y1)
         if y1 <= y0:
             return
         pixel = bytes((color[2], color[1], color[0], 0xFF))   # BGRA
 
         if self.rot == 270:
-            fy = self.w - 1 - x
+            fy = self.w_raw - 1 - x
             start = fy * self.stride + y0 * 4
             self.mem[start:start + (y1 - y0) * 4] = pixel * (y1 - y0)
         elif self.rot == 90:
             fy = x
-            fx0 = self.h - y1
+            fx0 = self.h_raw - y1
             start = fy * self.stride + fx0 * 4
             self.mem[start:start + (y1 - y0) * 4] = pixel * (y1 - y0)
         else:
@@ -124,13 +181,15 @@ class Screen:
             # this is the slow path. Supported for completeness — the kiosk runs
             # rotated, and that is the case worth optimising.
             for y in range(y0, y1):
-                fx, fy = (x, y) if self.rot == 0 else (self.w - 1 - x, self.h - 1 - y)
+                fx, fy = (x, y) if self.rot == 0 else (self.w_raw - 1 - x, self.h_raw - 1 - y)
                 off = fy * self.stride + fx * 4
                 self.mem[off:off + 4] = pixel
 
     def fill(self, color):
-        for x in range(self.w):
-            self.vspan(x, 0, self.h, color)
+        # Deliberately raw: the insets have to be painted too, or the strips the
+        # panel crops keep whatever was on screen before.
+        for x in range(self.w_raw):
+            self.vspan_raw(x, 0, self.h_raw, color)
 
     def rect(self, x, y, w, h, color):
         for cx in range(int(x), int(x + w)):
@@ -474,7 +533,7 @@ class Panel:
     def draw(self, panel):
         s = self.s
         mode = (panel or {}).get("mode", "blank")
-        s.rect(0, self.top, s.w, self.h, BG_PANEL)
+        s.rect(0, self.top, s.w, s.h - self.top, BG_PANEL)
         if mode == "blank":
             return
 
@@ -509,15 +568,22 @@ class Panel:
         title = (panel.get("title") or "").strip()
         subtitle = (panel.get("subtitle") or "").strip()
         big, small = self._scales()
+
+        # A subtitle with no title above it IS the message — that is the shape
+        # spc_speak sends when it mirrors what it is saying. Rendering it as
+        # fine print would put the spoken line in the smallest type on screen.
+        sub_scale, sub_color = (big, TEXT) if not title else (small, TEXT_DIM)
+
         t_lines = self.font.wrap(title, big, inner_w) if title else []
-        s_lines = self.font.wrap(subtitle, small, inner_w) if subtitle else []
-        total = len(t_lines) * self.font.h * big * 1.25 + len(s_lines) * self.font.h * small * 1.25
+        s_lines = self.font.wrap(subtitle, sub_scale, inner_w) if subtitle else []
+        total = (len(t_lines) * self.font.h * big * 1.25
+                 + len(s_lines) * self.font.h * sub_scale * 1.25)
         y = int(card_y + (card_h - total) / 2)
         if t_lines:
             y = self._stack(t_lines, cx, y, big, TEXT)
             y += int(self.font.h * small * 0.4)
         if s_lines:
-            self._stack(s_lines, cx, y, small, TEXT_DIM)
+            self._stack(s_lines, cx, y, sub_scale, sub_color)
 
     def _order(self, panel, x, w, card_y):
         big, small = self._scales()
@@ -659,8 +725,12 @@ def main():
 
     screen = Screen(FB_DEVICE, ROTATE)
     font = load_font()
-    print(f"spc-fb: {screen.fw}x{screen.fh} framebuffer -> {screen.w}x{screen.h} portrait "
+    print(f"spc-fb: {screen.fw}x{screen.fh} framebuffer -> {screen.w}x{screen.h_raw} portrait "
           f"(rotate {screen.rot})", flush=True)
+    if (screen.w, screen.h) != (screen.w_raw, screen.h_raw):
+        print(f"  frame {screen.w}x{screen.h} at +{screen.x0}+{screen.y0} "
+              f"(inset {INSET_L},{INSET_T},{INSET_R},{INSET_B}; usable {USABLE:.0%}) "
+              f"— the panel does not show the rest", flush=True)
     print(f"  font  {os.path.basename(font.path)} {font.w}x{font.h}", flush=True)
     print(f"  agent {AGENT}", flush=True)
 

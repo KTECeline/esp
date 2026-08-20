@@ -730,9 +730,15 @@ function renderPanel(panel) {
   if (mode === "blank") { card.innerHTML = ""; return; }
 
   if (mode === "message") {
+    // A subtitle with no title is the whole message — what spc_speak mirrors
+    // when it puts the words it is saying on screen. It gets title treatment,
+    // or the spoken line would be the smallest type on the panel.
+    const lone = !panel.title && panel.subtitle;
     card.innerHTML =
       (panel.title ? `<div class="title">${escapeHtml(panel.title)}</div>` : "") +
-      (panel.subtitle ? `<div class="subtitle">${escapeHtml(panel.subtitle)}</div>` : "");
+      (panel.subtitle
+        ? `<div class="${lone ? "title" : "subtitle"}">${escapeHtml(panel.subtitle)}</div>`
+        : "");
     return;
   }
 

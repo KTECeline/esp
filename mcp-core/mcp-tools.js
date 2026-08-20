@@ -593,7 +593,12 @@ export function createMcpServer({ boxes, speakToBox, vision, spc, transcribe, wa
             .string()
             .min(1)
             .max(2000)
-            .describe("What to say out loud, in plain text.")
+            .describe("What to say out loud, in plain text."),
+          show: z
+            .boolean()
+            .optional()
+            .default(true)
+            .describe("Also put the words on the Pi's screen while it says them, so they can be read as well as heard. Ignored on a Pi with no screen. Pass false to leave the screen alone — e.g. when a QR code is up and someone is mid-scan.")
         })
         .strict();
 
@@ -602,7 +607,7 @@ export function createMcpServer({ boxes, speakToBox, vision, spc, transcribe, wa
         {
           title: "Speak Text on an OrangePi",
           description:
-            "Says text out loud through an OrangePi's speaker. Waits until the audio has actually finished playing before returning, so two calls in a row will not talk over each other.\n\nThis is the Pi's speaker, not an ESP box's — use esp_speak for a box. Picking the right one matters: they are in different places, and a customer only hears the one they are standing next to.\n\nArgs:\n  - device_id (string, optional): target Pi; defaults to the only speaker-equipped device\n  - text (string): what to say, 1-2000 characters\n\nReturns:\n  { \"spoken\": true, \"device_id\": string, \"total_ms\": number }\n\nExamples:\n  - Use when: you want a Pi to say something out loud\n  - Use when: you asked a question through spc_speak and will follow it with spc_listen\n  - Don't use when: the person is at a voice box (use esp_speak)\n\nError Handling:\n  - Returns an error naming valid ids if device_id is unknown, ambiguous, or has no speaker\n  - Returns an error explaining what to check if the Pi is unreachable\n  - Long text takes proportionally long to speak; a very long passage may exceed the call budget even though the Pi is healthy",
+            "Says text out loud through an OrangePi's speaker AND, by default, shows the same words on its screen while it speaks them. Waits until the audio has actually finished playing before returning, so two calls in a row will not talk over each other.\n\nThis is the Pi's speaker, not an ESP box's — use esp_speak for a box. Picking the right one matters: they are in different places, and a customer only hears the one they are standing next to.\n\nArgs:\n  - device_id (string, optional): target Pi; defaults to the only speaker-equipped device\n  - text (string): what to say, 1-2000 characters\n  - show (boolean, optional): mirror the words onto the screen as you say them; default true, ignored if the Pi has no screen\n\nReturns:\n  { \"spoken\": true, \"shown\": boolean, \"device_id\": string, \"total_ms\": number }\n\nExamples:\n  - Use when: you want a Pi to say something out loud\n  - Use when: you asked a question through spc_speak and will follow it with spc_listen\n  - Use when: you want the words heard AND read — this is the normal case, and it needs no second call\n  - Don't use when: the person is at a voice box (use esp_speak)\n  - Pass show=false when: a QR code or an order summary must stay on screen while you talk\n\nError Handling:\n  - Returns an error naming valid ids if device_id is unknown, ambiguous, or has no speaker\n  - Returns an error explaining what to check if the Pi is unreachable\n  - Long text takes proportionally long to speak; a very long passage may exceed the call budget even though the Pi is healthy\n  - shown=false with spoken=true means it talked but the screen did not take the text: either the Pi has no screen, or you passed show=false. It is never a reason to retry the speech",
           inputSchema: SpcSpeakInput,
           annotations: {
             readOnlyHint: false,
@@ -611,15 +616,28 @@ export function createMcpServer({ boxes, speakToBox, vision, spc, transcribe, wa
             openWorldHint: false
           }
         },
-        async ({ device_id, text }) => {
+        async ({ device_id, text, show }) => {
           const { device, error } = resolveSpc(spc, "speak", device_id);
           if (error) return mcpError(error);
           if (!text.trim()) return mcpError("text is empty — nothing to say.");
           try {
             const t0 = Date.now();
+            // Screen first, then voice. The words have to be up BEFORE the audio
+            // starts — speak() blocks until playback finishes, so mirroring
+            // afterwards would caption a sentence that had already been said.
+            let shown = false;
+            if (show && device.has("screen")) {
+              try {
+                await device.display({ panel: { mode: "message", subtitle: text } });
+                shown = true;
+              } catch (err) {
+                // A screen that refuses is not a reason to go mute.
+                console.warn(`[${device.id}] could not mirror speech to the screen: ${err.message}`);
+              }
+            }
             await device.speak(text);
             console.log(`[${device.id}] spc_speak: ${JSON.stringify(text.slice(0, 60))}`);
-            return mcpJson({ spoken: true, device_id: device.id, total_ms: Date.now() - t0 });
+            return mcpJson({ spoken: true, shown, device_id: device.id, total_ms: Date.now() - t0 });
           } catch (err) {
             return mcpError(`Could not speak on "${device.id}": ${err.message}`);
           }

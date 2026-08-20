@@ -30,6 +30,22 @@ Environment=SPC_FB_URL=http://127.0.0.1:8081
 # top-left at the panel's top-left. Verified against the hardware 2026-08-19.
 Environment=SPC_FB_ROTATE=270
 
+# THE FRAME for this particular panel — content-space insets left,top,right,bottom.
+#
+# It publishes no EDID, so the driver guesses the 1024x600 timing and the
+# scaler both drops the bottom of every frame off the glass and shifts what is
+# left sideways. Measured against the hardware on 2026-08-19 by drawing labelled
+# marks and photographing which were visible:
+#
+#   bottom  content row 725 of 1024 is the last one on glass -> 317 inset
+#   left    ~13px is cut on the left while ~43px on the right cannot be reached
+#           at all, so 30px of left inset re-centres what remains
+#
+# Delete this line once the mode is right — forcing 1920x1080 in armbianEnv.txt
+# made this panel display correctly edge to edge, and then the whole screen is
+# usable again.
+Environment=SPC_FB_INSET=30,0,0,317
+
 ExecStart=/usr/bin/python3 /home/orangepi/esp-fleet/spc-agent/spc_fb.py
 Restart=always
 RestartSec=3
