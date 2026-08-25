@@ -11,6 +11,11 @@ sounds like a robot from 1985.
 
 Nothing hosted is involved despite the OpenAI-shaped request body: openai_tts
 is the protocol here, not the provider. No API key, no network egress.
+
+The "voice" sent here is nominal -- piper_tts_server.py picks the actual
+Piper model by inspecting the TEXT (English vs Chinese script), not this
+field, because a reply's language varies request to request while this
+script's request shape does not. See that file for why.
 """
 import json
 import sys

@@ -816,6 +816,10 @@ const ui_font_t F_BODY = {
     .glyphs = f_body_glyphs, .alpha = f_body_alpha,
     .first = 0x20, .last = 0x7E,
     .ascent = 17, .line_h = 22, .track = 0,
+    .cjk = &F_BODY_CJK,   // hand-patched: gen_ui_font.py doesn't know about
+                          // the CJK subset (see gen_cjk_font.py / ui_font_cjk.c).
+                          // Rerunning gen_ui_font.py regenerates this whole
+                          // file and drops this line -- re-add it after.
 };
 
 // F_ROW: Inter SemiBold 18px, 95 glyphs, 10324 bytes of alpha

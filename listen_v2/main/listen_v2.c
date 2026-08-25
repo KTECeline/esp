@@ -3,17 +3,13 @@
 //
 // Controls:
 //   TOUCH SCREEN       — the primary control. TAP the idle screen to start a
-//                        turn (greeting, then auto-listen). On the confirm
-//                        screen, SEND submits the transcript and CANCEL discards
-//                        it and returns to idle — it does NOT re-record, because
-//                        answering the red button by reopening the mic is the
-//                        opposite of what it promises. HOLD the BUSY badge 1.5s
-//                        to end a session by hand (staff gesture).
-//   BOOT (GPIO0, side) — physical backup. TAP = start a turn (idle) or clear+
-//                        re-listen (transcript showing) — deliberately still the
-//                        fast "you misheard me, again" path, which is why it
-//                        differs from CANCEL. HOLD 5s = wipe WiFi creds and
-//                        re-provision.
+//                        listen turn (up to MAX_RECORD_SECONDS, auto-stops on
+//                        silence or a tap while recording) and it goes
+//                        straight to the backend — no separate confirm/send
+//                        step. HOLD the BUSY badge 1.5s to end a session by
+//                        hand (staff gesture).
+//   BOOT (GPIO0, side) — physical backup. TAP = start a listen turn, same as
+//                        touch. HOLD 5s = wipe WiFi creds and re-provision.
 //   MUTE (GPIO1, top)  — NOT a firmware trigger. It's the hardware mic-mute:
 //                        measured on real hardware it's a TOGGLE that flips the
 //                        actual mic on/off each press, so it can't reliably
@@ -72,18 +68,10 @@
 static volatile TickType_t s_caption_at_tick = 0;
 static volatile TickType_t s_upload_done_tick = 0;
 
-// Confirm-before-LLM: when the Mac pushes the transcript caption with an
-// X-Confirm header, the next BOOT tap within this window means "yes, send it"
-// (POSTed to the Mac's /confirm) instead of starting a new recording. No tap
-// -> cancelled, nothing reaches the LLM. Guards against STT mishearings
-// becoming wrong orders.
-// 8s proved too tight once the screen had buttons: reading the transcript,
-// deciding, and reaching for the screen ate most of it. 15s still sits well
-// inside the Mac's 25s pending-transcript window, and CANCEL is now an
-// explicit button so waiting out the timer is no longer the only way to bail.
-#define CONFIRM_WINDOW_MS 15000
-static volatile bool s_confirm_pending = false;
-static volatile TickType_t s_confirm_deadline_tick = 0;
+// A recording now goes straight to the backend the moment it ends (VAD
+// silence, a manual tap, or the MAX_RECORD_SECONDS cap) — there is no
+// separate tap-to-confirm step any more. Mishearings are corrected
+// conversationally through the agent instead of gated by a screen tap.
 
 // ---- Session lifecycle -----------------------------------------------------
 // A "session" is one customer. It starts when the presence radar first sees
@@ -116,12 +104,11 @@ static inline void note_activity(void) { s_last_seen_tick = xTaskGetTickCount();
 static volatile bool s_radar_seen = false;
 
 // Provisioned identity + endpoints, loaded from NVS in app_main. All the
-// /confirm, /health and /register URLs are derived from s_post_url so the
+// /health and /register URLs are derived from s_post_url so the
 // portal form stays the single place addresses are entered.
 static char s_box_id[33];         // immutable, MAC-derived — X-Box-Id on every request
 static char s_box_name[33];       // human display label from the portal form
 static char s_post_url[81];       // http://<mac>:<port>/upload
-static char s_confirm_url[112];
 static char s_health_url[112];
 static char s_register_url[112];
 static char s_wake_url[112];
@@ -169,7 +156,7 @@ static char s_ws_url[120] = "";
 #define MIC_GAIN_DB     30.0f
 // Press-to-start recording, auto-stops on silence (voice-activity detection).
 // Manual tap-to-stop and this MAX cap both still work as fallbacks.
-#define MAX_RECORD_SECONDS 30   // PSRAM buffer (8MB free) — plenty of headroom now
+#define MAX_RECORD_SECONDS 20   // hard cap on a single listen turn
 
 // --- Voice-activity auto-stop tuning ---
 // VAD_SILENCE_PEAK: below this int16 peak, a chunk counts as "quiet". Raised
@@ -870,26 +857,9 @@ static void run_auto_listen(const char *rec_line2)
     vSemaphoreDelete(args.done);
 }
 
-// The "no / redo" action, shared by the SIDE button and the touch CANCEL
-// button: throw away the wrong transcript and listen again immediately (no
-// greeting — the customer is already mid-conversation). Called only from the
-// main loop, so record_toggle_and_send() runs directly on the main task's
-// stack (the httpd-handler stack-overflow trap doesn't apply here). The Mac's
-// stale pending transcript needs no explicit cancel — the fresh recording's
-// upload simply replaces it server-side.
-static void clear_and_relisten(void)
-{
-    s_confirm_pending = false;
-    ESP_LOGI(TAG, "transcript rejected — listening again");
-    record_toggle_and_send("TAP WHEN DONE");
-    if ((int32_t)(s_caption_at_tick - s_upload_done_tick) <= 0) {
-        show_ready();
-    }
-}
-
-// Start a turn immediately — record until silence, upload, transcript comes
-// back as a confirm caption. NO greeting: tapping to order goes straight to
-// listening (a greeting-on-approach can come later from a presence sensor).
+// Start a turn immediately — record until silence, upload, straight to the
+// backend. NO greeting: tapping to order goes straight to listening (a
+// greeting-on-approach can come later from a presence sensor).
 // Runs on the main-task stack (called from the main loop, not an httpd
 // handler), so record_toggle_and_send() needs no trampoline task.
 static void report_session_start(void);   // defined below, near end_session_on_server
@@ -1108,7 +1078,7 @@ void play_after(play_session_t *ps)
     if (ps->opts.auto_listen) {
         // Greeting just finished — go straight into a listen turn, no button
         // needed. Same recording+upload path BOOT uses, so everything
-        // downstream (STT, confirm screen, order) is completely unchanged.
+        // downstream (STT, backend, order) is completely unchanged.
         run_auto_listen("LISTENING...");
         if ((int32_t)(s_caption_at_tick - s_upload_done_tick) <= 0) show_ready();
         return;
@@ -1173,24 +1143,12 @@ static esp_err_t play_handler(httpd_req_t *req)
 // Show a live caption. Body = the text; optional "X-Speaker" header ("YOU"/"BOX")
 // picks the bar label + color (defaults to YOU / amber). Used by the Mac to push
 // "what was heard" the moment STT finishes, before the reply audio arrives.
-void do_caption(const char *text, const char *who, bool confirm)
+void do_caption(const char *text, const char *who)
 {
     uint16_t bar = (strcmp(who, "BOX") == 0) ? COL_OK   // green
                                              : COL_ACCENT; // amber
-
-    // Arms the tap-to-confirm window; any other caption disarms it (a new
-    // screen means the pending question is no longer on display).
-    if (confirm) {
-        s_confirm_deadline_tick = xTaskGetTickCount() + pdMS_TO_TICKS(CONFIRM_WINDOW_MS);
-        s_confirm_pending = true;
-    } else {
-        s_confirm_pending = false;
-    }
-
     s_caption_at_tick = xTaskGetTickCount();
-    // The confirm screen carries CANCEL/SEND buttons; a plain caption doesn't.
-    if (s_confirm_pending) display_confirm(who, bar, text);
-    else                   display_caption(who, bar, text);
+    display_caption(who, bar, text);
 }
 
 static esp_err_t caption_handler(httpd_req_t *req)
@@ -1210,10 +1168,8 @@ static esp_err_t caption_handler(httpd_req_t *req)
 
     char who[16] = "YOU";
     httpd_req_get_hdr_value_str(req, "X-Speaker", who, sizeof(who));
-    char cf[4] = "";
-    httpd_req_get_hdr_value_str(req, "X-Confirm", cf, sizeof(cf));
 
-    do_caption(text, who, cf[0] == '1');
+    do_caption(text, who);
     httpd_resp_sendstr(req, "ok");
     return ESP_OK;
 }
@@ -1285,7 +1241,7 @@ static void report_session_start(void)
 void do_session(bool occupied)
 {
     if (occupied) {
-        if (!s_session_active && !s_confirm_pending) {
+        if (!s_session_active) {
             s_session_active = true;
             note_activity();
             ESP_LOGI(TAG, "session start (manual override) — greeting once");
@@ -1295,23 +1251,6 @@ void do_session(bool occupied)
         s_session_active = false;
         ESP_LOGI(TAG, "session end (manual override)");
         show_ready();
-    }
-}
-
-// Tell the Mac the customer tap-confirmed the transcript on screen.
-static void post_confirm(void)
-{
-    esp_http_client_config_t cfg = { .url = s_confirm_url, .method = HTTP_METHOD_POST,
-                                     .timeout_ms = 5000 };
-    esp_http_client_handle_t client = esp_http_client_init(&cfg);
-    set_box_headers(client);
-    esp_http_client_set_post_field(client, "1", 1);
-    esp_err_t err = esp_http_client_perform(client);
-    int status = (err == ESP_OK) ? esp_http_client_get_status_code(client) : -1;
-    esp_http_client_cleanup(client);
-    ESP_LOGI(TAG, "confirm -> %s (%d)", s_confirm_url, status);
-    if (status != 200) {
-        display_status("EXPIRED", "TAP TO RETRY", COL_ERR);
     }
 }
 
@@ -1407,7 +1346,7 @@ static esp_err_t order_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-// /confirm, /health, /register and /wake all live next to /upload on the same
+// /health, /register and /wake all live next to /upload on the same
 // server, so they're derived from post_url (which carries the real host AND
 // port). Re-run whenever post_url changes so a repointed box updates every URL
 // at once instead of leaving stale ones behind.
@@ -1427,7 +1366,6 @@ static void derive_server_urls(void)
 {
     const char *slash = strrchr(s_post_url, '/');
     int base_len = slash ? (int)(slash - s_post_url) : (int)strlen(s_post_url);
-    derive_one_url(s_confirm_url,     sizeof(s_confirm_url),     "/confirm",     base_len);
     derive_one_url(s_health_url,      sizeof(s_health_url),      "/health",      base_len);
     derive_one_url(s_register_url,    sizeof(s_register_url),    "/register",    base_len);
     derive_one_url(s_wake_url,        sizeof(s_wake_url),        "/wake",        base_len);
@@ -1769,109 +1707,66 @@ void app_main(void)
                 esp_restart();
             }
 
-            // SIDE (boot) tap: while a transcript shows, clear the wrong text
-            // and listen again; idle, start a fresh turn (physical backup for
-            // the touch-screen trigger below).
-            if (s_confirm_pending &&
-                (int32_t)(s_confirm_deadline_tick - xTaskGetTickCount()) > 0) {
-                clear_and_relisten();
-                continue;
-            }
-            s_confirm_pending = false;
+            // SIDE (boot) tap: physical backup for the touch-screen trigger
+            // below — always starts a fresh listen turn.
             start_listening();
             continue;
         }
         // Touch is the PRIMARY trigger: a tap anywhere on the idle screen
-        // starts a turn; on the confirm screen the SEND/CANCEL buttons send or
-        // clear. (The top/mute button is NOT a trigger — it's the hardware
-        // mic-mute and toggles the mic on/off, so it can't reliably start a
-        // listen turn; that's why the customer uses the screen or BOOT.)
+        // starts a turn and goes straight to the backend once the customer
+        // stops talking — no separate confirm/send step. (The top/mute
+        // button is NOT a trigger — it's the hardware mic-mute and toggles
+        // the mic on/off, so it can't reliably start a listen turn; that's
+        // why the customer uses the screen or BOOT.)
         int tx, ty;
         if (touch_get_tap(&tx, &ty)) {
             note_activity();   // someone is definitely here, whatever radar says
-            if (!s_confirm_pending) {
-                // Staff gesture: HOLD the BUSY badge to end the session by hand,
-                // for when a customer walks off and the radar has not timed out
-                // yet (SESSION_ABSENT_MS is 30s, and it is fed by interaction, so
-                // a lingering group can hold a box "busy" far longer).
-                //
-                // It has to be intercepted HERE, before start_listening(), because
-                // a hold begins with an ordinary tap edge — otherwise the box
-                // would start recording the instant the finger landed and the
-                // hold could never complete.
-                //
-                // A hold, not a tap: this corner is one mis-aimed customer press
-                // away from wiping a session mid-order. Releasing early is not an
-                // error, it just falls through to the normal "tap to order".
-                if (s_session_active && display_badge_hit(tx, ty)) {
-                    if (badge_hold_completed()) {
-                        s_session_active = false;
-                        ESP_LOGI(TAG, "session cleared by staff (badge hold)");
-                        end_session_on_server();   // reset the conversation too
-                        show_ready();              // repaints the badge as FREE
-                        continue;
-                    }
-                }
-                // Order-screen buttons. Checked BEFORE start_listening(),
-                // because otherwise the tap that presses a button would also be
-                // the tap that opens the mic. display_hit_test() only reports
-                // these while that screen is actually up, so this cannot fire
-                // on the idle screen.
-                display_button_t ob = display_hit_test(tx, ty);
-                if (ob == BTN_ADD_ORDER) {
-                    // Deliberately back to idle rather than straight into
-                    // recording: the customer is often still deciding, and
-                    // opening the mic on them captures the room, not an order.
-                    ESP_LOGI(TAG, "ADD ORDER — back to idle");
-                    show_ready();
+            // Staff gesture: HOLD the BUSY badge to end the session by hand,
+            // for when a customer walks off and the radar has not timed out
+            // yet (SESSION_ABSENT_MS is 30s, and it is fed by interaction, so
+            // a lingering group can hold a box "busy" far longer).
+            //
+            // It has to be intercepted HERE, before start_listening(), because
+            // a hold begins with an ordinary tap edge — otherwise the box
+            // would start recording the instant the finger landed and the
+            // hold could never complete.
+            //
+            // A hold, not a tap: this corner is one mis-aimed customer press
+            // away from wiping a session mid-order. Releasing early is not an
+            // error, it just falls through to the normal "tap to order".
+            if (s_session_active && display_badge_hit(tx, ty)) {
+                if (badge_hold_completed()) {
+                    s_session_active = false;
+                    ESP_LOGI(TAG, "session cleared by staff (badge hold)");
+                    end_session_on_server();   // reset the conversation too
+                    show_ready();              // repaints the badge as FREE
                     continue;
                 }
-                if (ob == BTN_END_PAY) {
-                    ESP_LOGI(TAG, "END + PAY — finalizing with server");
-                    display_status("FINISHING", "ONE MOMENT", COL_INFO);
-                    post_order_action("end");   // server pushes the pay screen
-                    continue;
-                }
-                start_listening();   // record straight away, no greeting
+            }
+            // Order-screen buttons. Checked BEFORE start_listening(),
+            // because otherwise the tap that presses a button would also be
+            // the tap that opens the mic. display_hit_test() only reports
+            // these while that screen is actually up, so this cannot fire
+            // on the idle screen.
+            display_button_t ob = display_hit_test(tx, ty);
+            if (ob == BTN_ADD_ORDER) {
+                // Deliberately back to idle rather than straight into
+                // recording: the customer is often still deciding, and
+                // opening the mic on them captures the room, not an order.
+                ESP_LOGI(TAG, "ADD ORDER — back to idle");
+                show_ready();
                 continue;
             }
-            display_button_t btn = display_hit_test(tx, ty);
-            if (btn == BTN_SEND) {
-                s_confirm_pending = false;
-                display_status("SENDING", "TO ASSISTANT", COL_INFO);
-                post_confirm();
-                continue;
-            } else if (btn == BTN_CANCEL) {
-                // CANCEL abandons the turn and returns to idle. It used to clear
-                // the transcript and immediately start recording again, which is
-                // the opposite of what the word promises: the customer pressed
-                // the red button to STOP, and the box answered by opening the mic
-                // on them. Re-listening is still one tap away, and is now their
-                // choice rather than something that happens to them.
-                s_confirm_pending = false;
-                ESP_LOGI(TAG, "transcript discarded (CANCEL) — back to idle");
-                display_status("CANCELLED", "TAP TO ORDER", COL_ERR);
-                // Same badge the idle screen carries: a cancel does not end the
-                // session, the customer is still standing there.
-                display_badge(s_session_active ? "BUSY" : "FREE",
-                              s_session_active ? COL_INFO : COL_OK);
+            if (ob == BTN_END_PAY) {
+                ESP_LOGI(TAG, "END + PAY — finalizing with server");
+                display_status("FINISHING", "ONE MOMENT", COL_INFO);
+                post_order_action("end");   // server pushes the pay screen
                 continue;
             }
+            start_listening();   // record straight away, no greeting
+            continue;
         }
 
-        // Confirm window ran out with no press: discard the pending transcript
-        // (customer likely walked off or went quiet — don't auto re-listen,
-        // that would just record silence).
-        if (s_confirm_pending &&
-            (int32_t)(xTaskGetTickCount() - s_confirm_deadline_tick) >= 0) {
-            s_confirm_pending = false;
-            display_status("TIMED OUT", "TAP TO ORDER", COL_ERR);
-            // Without this the badge silently disappears on the one screen where
-            // someone is already wondering what went wrong.
-            display_badge(s_session_active ? "BUSY" : "FREE",
-                          s_session_active ? COL_INFO : COL_OK);
-            ESP_LOGI(TAG, "confirm window expired — transcript discarded");
-        }
         // ---- Session lifecycle (one session = one customer) ----------------
         // Present + no session  -> start one, greet ONCE.
         // Present + session     -> nothing; the greeting never repeats.
@@ -1882,14 +1777,12 @@ void app_main(void)
         if (present_now) {
             s_radar_seen = true;
             note_activity();               // radar sees them: session stays alive
-            // Not while a transcript is on screen: a greeting must never talk
-            // over the confirm step.
-            if (!s_session_active && !s_confirm_pending) {
+            if (!s_session_active) {
                 s_session_active = true;
                 ESP_LOGI(TAG, "session start (presence) — greeting once");
                 trigger_wake();
             }
-        } else if (s_session_active && s_radar_seen && !s_confirm_pending &&
+        } else if (s_session_active && s_radar_seen &&
                    (int32_t)(xTaskGetTickCount() - s_last_seen_tick) >=
                        pdMS_TO_TICKS(SESSION_ABSENT_MS)) {
             // No radar presence AND no interaction for the whole window.

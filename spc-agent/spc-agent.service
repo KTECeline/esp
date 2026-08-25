@@ -31,7 +31,11 @@ Environment=SPC_MIC_DEVICE=plughw:CARD=Lite,DEV=0
 
 # The rkcif raw node. /dev/video0 exists on this board but is an ISP node that
 # never yields a frame without the rkaiq 3A daemon — see mcp-core/vision.js.
+# BACKEND MUST BE v4l2raw: plain ffmpeg can't open this node (fails with a
+# misleading "No such device") — v4l2raw captures via v4l2-ctl and unpacks
+# RAW10 itself, ffmpeg only encodes the result.
 Environment=SPC_CAMERA_DEVICE=/dev/video11
+Environment=SPC_CAMERA_BACKEND=v4l2raw
 
 # Text arrives on stdin; the command writes a WAV to {out}.
 Environment="SPC_TTS_CMD=/usr/bin/python3 /home/orangepi/esp-fleet/spc-agent/spc_tts.py {out}"

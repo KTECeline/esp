@@ -14,7 +14,11 @@ changes depending on which one is running.
     python3 spc_fb.py
 
 Deliberately stdlib-only, like the rest of spc-agent: no PIL, no numpy. Text
-comes from the console PSF fonts every Linux already ships.
+comes from the console PSF fonts every Linux already ships, plus a curated
+Chinese subset baked ahead of time by gen_fb_cjk_font.py into cjk_font_data.py
+(same PIL-at-build-time, stdlib-at-runtime split as the ESP32 kiosk screen's
+ui_font_cjk.c). Missing that file is not an error -- Chinese text just draws
+as '?' per glyph, the same fallback any unknown byte already gets.
 
 Configuration is by environment variable:
 
@@ -30,6 +34,7 @@ frame's top-left lands at the panel's top-right, i.e. the panel is turned a
 quarter turn clockwise from the way the framebuffer thinks it is.
 """
 
+import bisect
 import glob
 import gzip
 import json
@@ -42,6 +47,15 @@ import threading
 import time
 import urllib.error
 import urllib.request
+
+try:
+    from cjk_font_data import GLYPHS as _CJK_GLYPHS, CELL_W as _CJK_W, CELL_H as _CJK_H
+    _CJK_CODEPOINTS = [cp for cp, _ in _CJK_GLYPHS]
+except ImportError:
+    # gen_fb_cjk_font.py hasn't been run (or its output isn't next to this
+    # file) -- Chinese text still draws, just as '?' per glyph like any other
+    # uncovered character. Everything else about the face works unaffected.
+    _CJK_GLYPHS, _CJK_W, _CJK_H, _CJK_CODEPOINTS = [], 0, 0, []
 
 AGENT = os.environ.get("SPC_FB_URL", "http://127.0.0.1:8080").rstrip("/")
 FB_DEVICE = os.environ.get("SPC_FB_DEVICE", "/dev/fb0")
@@ -279,6 +293,14 @@ FONT_PREFERENCE = [
 
 
 class Font:
+    """Console PSF glyphs, plus an optional companion CJK subset (see
+    cjk_font_data.py / gen_fb_cjk_font.py) drawn through the exact same
+    column-run machinery. A CJK glyph is baked double-width (see _CJK_W vs
+    self.w), so it advances the pen by 2 "cells" where a Latin glyph advances
+    by 1 -- the usual CJK terminal convention, and the reason every width
+    calculation below counts in cells rather than characters.
+    """
+
     def __init__(self, path):
         raw = gzip.open(path, "rb").read() if path.endswith(".gz") else open(path, "rb").read()
         if raw[:4] == PSF2_MAGIC:
@@ -300,42 +322,78 @@ class Font:
         self.glyphs = [raw[data_start + i * self.glyph_bytes:
                            data_start + (i + 1) * self.glyph_bytes]
                        for i in range(self.count)]
+        self.cjk_row_bytes = (_CJK_W + 7) // 8
         # Column runs are cached per (char, scale): the glyph bitmap is stored
         # by rows, but this renderer paints by columns, and converting on every
         # frame would be the slowest thing on the screen.
         self._cache = {}
+
+    def _cjk_glyph(self, ch):
+        """Binary search the sorted CJK table for ch's glyph bytes, or None."""
+        if not _CJK_CODEPOINTS:
+            return None
+        cp = ord(ch)
+        i = bisect.bisect_left(_CJK_CODEPOINTS, cp)
+        if i < len(_CJK_CODEPOINTS) and _CJK_CODEPOINTS[i] == cp:
+            return _CJK_GLYPHS[i][1]
+        return None
+
+    def _glyph_source(self, ch):
+        """Returns (glyph_bytes, width_px, height_px, row_bytes, cells) for
+        whichever table actually covers ch: the PSF console table first (so
+        Latin-1 stays pixel-identical to before), then the CJK subset, then
+        the console '?' glyph as the same safe fallback unknown ASCII bytes
+        already used."""
+        index = ord(ch)
+        if index < self.count:
+            return self.glyphs[index], self.w, self.h, self.row_bytes, 1
+        cjk = self._cjk_glyph(ch)
+        if cjk is not None:
+            return cjk, _CJK_W, _CJK_H, self.cjk_row_bytes, 2
+        return self.glyphs[ord("?")], self.w, self.h, self.row_bytes, 1
+
+    def _is_cjk(self, ch):
+        return self._cjk_glyph(ch) is not None
 
     def _columns(self, ch, scale):
         key = (ch, scale)
         hit = self._cache.get(key)
         if hit is not None:
             return hit
-        index = ord(ch)
-        if index >= self.count:
-            index = ord("?")
-        glyph = self.glyphs[index]
+        glyph, w, h, row_bytes, cells = self._glyph_source(ch)
         runs = []                                  # (col, y0, y1) in scaled px
-        for col in range(self.w):
+        for col in range(w):
             y = 0
-            while y < self.h:
-                byte = glyph[y * self.row_bytes + (col >> 3)]
+            while y < h:
+                byte = glyph[y * row_bytes + (col >> 3)]
                 on = (byte >> (7 - (col & 7))) & 1
                 if not on:
                     y += 1
                     continue
                 start = y
-                while y < self.h:
-                    byte = glyph[y * self.row_bytes + (col >> 3)]
+                while y < h:
+                    byte = glyph[y * row_bytes + (col >> 3)]
                     if not ((byte >> (7 - (col & 7))) & 1):
                         break
                     y += 1
                 runs.append((col, start, y))
-        scaled = [(c * scale, y0 * scale, y1 * scale) for (c, y0, y1) in runs]
+        # CJK glyphs are baked at their own pixel size (_CJK_W/_CJK_H), which
+        # generally differs from the console font's -- scale relative to the
+        # cell it fills (cells * self.w/self.h) rather than its own raw px,
+        # so a CJK glyph lines up with the Latin glyphs beside it.
+        cell_w, cell_h = cells * self.w, self.h
+        sx = (cell_w * scale) / w
+        sy = (cell_h * scale) / h
+        scaled = [(round(c * sx), round(y0 * sy), round(y1 * sy)) for (c, y0, y1) in runs]
         self._cache[key] = scaled
         return scaled
 
+    def _cells(self, ch):
+        return 2 if self._is_cjk(ch) else 1
+
     def measure(self, text, scale):
-        return len(text) * self.w * scale, self.h * scale
+        cells = sum(self._cells(ch) for ch in text)
+        return cells * self.w * scale, self.h * scale
 
     def draw(self, screen, x, y, text, scale, color):
         pen = int(x)
@@ -343,24 +401,70 @@ class Font:
             for (col, y0, y1) in self._columns(ch, scale):
                 for s in range(scale):
                     screen.vspan(pen + col + s, y + y0, y + y1, color)
-            pen += self.w * scale
+            pen += self.w * self._cells(ch) * scale
 
     def draw_centered(self, screen, cx, y, text, scale, color):
         w, _ = self.measure(text, scale)
         self.draw(screen, cx - w // 2, y, text, scale, color)
 
+    def truncate(self, text, scale, max_w):
+        """Longest prefix of text (in whole characters) that measures no
+        wider than max_w -- cell-aware, so a CJK name doesn't run over a
+        budget sized by counting characters instead of the width they draw."""
+        cells, out = 0, []
+        limit = max(1, max_w // (self.w * scale))
+        for ch in text:
+            cells += self._cells(ch)
+            if cells > limit:
+                break
+            out.append(ch)
+        return "".join(out)
+
     def wrap(self, text, scale, max_width):
-        per_char = self.w * scale
-        limit = max(1, max_width // per_char)
-        words, lines, line = text.split(), [], ""
-        for word in words:
-            candidate = f"{line} {word}".strip()
-            if len(candidate) <= limit:
-                line = candidate
-            else:
-                if line:
-                    lines.append(line)
-                line = word[:limit] if len(word) > limit else word
+        per_cell = self.w * scale
+        limit = max(1, max_width // per_cell)
+
+        # Tokenize: each CJK character is its own breakable token (Chinese
+        # has no inter-word spaces), everything else is a whitespace-split
+        # word, same as before. (text_fragment, cells, is_cjk).
+        tokens = []
+        i, n = 0, len(text)
+        while i < n:
+            ch = text[i]
+            if ch.isspace():
+                i += 1
+                continue
+            if self._is_cjk(ch):
+                tokens.append((ch, 2, True))
+                i += 1
+                continue
+            j = i
+            while j < n and not text[j].isspace() and not self._is_cjk(text[j]):
+                j += 1
+            word = text[i:j]
+            tokens.append((word, len(word), False))
+            i = j
+
+        lines, line, line_cells, prev_cjk = [], "", 0, False
+        for tok, cells, is_cjk in tokens:
+            glue = is_cjk and prev_cjk           # two adjacent CJK chars: no gap
+            sep = 0 if (glue or not line) else 1
+            if line and line_cells + sep + cells > limit:
+                lines.append(line)
+                line, line_cells, prev_cjk = "", 0, False
+                glue, sep = False, 0
+            if cells > limit and not line:
+                # A single token wider than a whole line (URL, or CJK/ASCII
+                # run-together from STT): hard-truncate it, same fallback the
+                # original ASCII-only wrap() used.
+                lines.append(tok[:limit] if not is_cjk else tok)
+                continue
+            if line and not glue:
+                line += " "
+                line_cells += 1
+            line += tok
+            line_cells += cells
+            prev_cjk = is_cjk
         if line:
             lines.append(line)
         return lines
@@ -574,14 +678,33 @@ class Panel:
         # fine print would put the spoken line in the smallest type on screen.
         sub_scale, sub_color = (big, TEXT) if not title else (small, TEXT_DIM)
 
+        t_gap = self.font.h * big * 1.25
+        s_gap = self.font.h * sub_scale * 1.25
+        title_gap = int(self.font.h * small * 0.4)   # spacer between title and subtitle
+
+        # Capped to what card_h can actually hold, title first (it's the
+        # short, load-bearing line) then as much subtitle as still fits. A
+        # message too long to fit is truncated here, not spilled past the
+        # card the way an uncapped wrap used to (a long spc_speak mirror, or
+        # any Chinese reply once every character actually renders instead of
+        # mostly '?', is routinely this long).
         t_lines = self.font.wrap(title, big, inner_w) if title else []
+        max_t = max(1, int(card_h // t_gap)) if t_lines else 0
+        t_lines = t_lines[:max_t]
+
         s_lines = self.font.wrap(subtitle, sub_scale, inner_w) if subtitle else []
-        total = (len(t_lines) * self.font.h * big * 1.25
-                 + len(s_lines) * self.font.h * sub_scale * 1.25)
+        used = len(t_lines) * t_gap + (title_gap if t_lines and s_lines else 0)
+        max_s = max(0, int((card_h - used) // s_gap)) if s_lines else 0
+        s_lines = s_lines[:max_s]
+
+        total = (len(t_lines) * t_gap
+                 + (title_gap if t_lines and s_lines else 0)
+                 + len(s_lines) * s_gap)
         y = int(card_y + (card_h - total) / 2)
         if t_lines:
             y = self._stack(t_lines, cx, y, big, TEXT)
-            y += int(self.font.h * small * 0.4)
+            if s_lines:
+                y += title_gap
         if s_lines:
             self._stack(s_lines, cx, y, sub_scale, sub_color)
 
@@ -591,7 +714,7 @@ class Panel:
         title = (panel.get("title") or "").strip()
         if title:
             self.font.draw_centered(self.s, self.s.w // 2, y,
-                                    title[:max(4, w // (self.font.w * big))], big, TEXT)
+                                    self.font.truncate(title, big, w), big, TEXT)
             y += self.font.h * big + self.pad // 2
         # An order line is a name AND a price, so it gets its own size: if the
         # longest line does not fit beside its price, the rows step down one
@@ -620,8 +743,8 @@ class Panel:
             # The price is the part you cannot fudge, so it is measured first and
             # the name takes whatever is left. Truncating blind put RM9.00 on top
             # of "Nasi Lemak" the moment the panel turned out to be 600px wide.
-            room = max(4, (w - pw - char_w) // char_w)
-            self.font.draw(self.s, x, y, name[:room], small, TEXT)
+            room = max(char_w * 4, w - pw - char_w)
+            self.font.draw(self.s, x, y, self.font.truncate(name, small, room), small, TEXT)
             if price:
                 self.font.draw(self.s, x + w - pw, y, price, small, TEXT_DIM)
             y += row_h
@@ -658,7 +781,7 @@ class Panel:
                      max(60, (card_y + card_h - self.pad - y) // max(len(choices), 1) - 12))
         for choice in choices:
             self.s.round_rect(x, y, w, tile_h, int(tile_h * 0.28), TILE)
-            label = str(choice.get("label", ""))[:max(4, w // (self.font.w * small))]
+            label = self.font.truncate(str(choice.get("label", "")), small, w)
             lw, lh = self.font.measure(label, small)
             self.font.draw(self.s, cx - lw // 2, y + (tile_h - lh) // 2, label, small, TILE_INK)
             y += tile_h + 12
@@ -731,7 +854,8 @@ def main():
         print(f"  frame {screen.w}x{screen.h} at +{screen.x0}+{screen.y0} "
               f"(inset {INSET_L},{INSET_T},{INSET_R},{INSET_B}; usable {USABLE:.0%}) "
               f"— the panel does not show the rest", flush=True)
-    print(f"  font  {os.path.basename(font.path)} {font.w}x{font.h}", flush=True)
+    cjk_note = f", CJK {len(_CJK_CODEPOINTS)} glyphs" if _CJK_CODEPOINTS else ", no CJK glyph table found"
+    print(f"  font  {os.path.basename(font.path)} {font.w}x{font.h}{cjk_note}", flush=True)
     print(f"  agent {AGENT}", flush=True)
 
     face = Face(screen, font)

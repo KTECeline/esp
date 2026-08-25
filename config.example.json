@@ -81,7 +81,7 @@
       "type": "whisper_local",
       "model": "whisper.cpp/models/ggml-small.bin",
       "prompt_file": "voice-mcp-server/manglish_prompt.txt",
-      "language": "en"
+      "language": "auto"
     },
     "tts": {
       "type": "moss_local",
@@ -158,7 +158,7 @@
 
   "_stt_help": "LEGACY — superseded by `speech` above, still honored so old configs keep working. Used only when `speech` is absent.",
   "stt": {
-    "language": "en",
+    "language": "auto",
     "prompt_file": "voice-mcp-server/manglish_prompt.txt",
     "model": "whisper.cpp/models/ggml-small.bin"
   },

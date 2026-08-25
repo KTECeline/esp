@@ -73,10 +73,7 @@ void play_after(play_session_t *ps);
 
 // ---- Screen -----------------------------------------------------------------
 // `who` picks the speaker-bar colour ("BOX" = green, anything else = amber).
-// confirm=true arms the tap-to-confirm window and draws CANCEL/SEND buttons;
-// any other caption disarms it, since a new screen means the pending question
-// is gone.
-void do_caption(const char *text, const char *who, bool confirm);
+void do_caption(const char *text, const char *who);
 
 // Pipe-delimited line protocol (TITLE|.. / ITEM|name|price / TOTAL|..).
 // NOTE: mutates `body` in place while parsing.

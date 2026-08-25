@@ -49,7 +49,6 @@ static int   s_head_len;
 static char  s_req_id[24];
 static char  s_path[32];
 static char  s_speaker[16];
-static bool  s_confirm;
 static play_opts_t s_opts;
 static play_session_t s_play;
 static char  s_body[WS_BODY_MAX];
@@ -200,7 +199,6 @@ static void begin_instruction(const char *body, int body_len, uint32_t total_bod
         if (strcmp(s_path, "/caption") == 0) {
             strlcpy(s_speaker, "YOU", sizeof(s_speaker));
             head_get(s_head, "X-Speaker", s_speaker, sizeof(s_speaker));
-            s_confirm = head_get(s_head, "X-Confirm", v, sizeof(v)) && v[0] == '1';
         }
         s_body_len = 0;
         s_state = WS_TEXT_BODY;
@@ -219,7 +217,7 @@ static void finish_text_instruction(void)
 {
     s_body[s_body_len] = 0;
     if (strcmp(s_path, "/caption") == 0) {
-        do_caption(s_body, s_speaker, s_confirm);
+        do_caption(s_body, s_speaker);
     } else if (strcmp(s_path, "/order") == 0) {
         do_order(s_body);
     }

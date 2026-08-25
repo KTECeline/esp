@@ -53,13 +53,6 @@ const spc = createSpcRegistry(config.devices);
 const MCP_SERVER_PATH = path.join(ESP_ROOT, "voice-mcp-server", "dist", "index.js");
 const LOG_PATH = process.env.INTERACTION_LOG || path.join(ESP_ROOT, "mcp-core", "interaction_log.jsonl");
 
-// Confirm-before-LLM flow: after STT, the transcript is shown on the box and
-// nothing reaches a backend until the customer tap-confirms (box POSTs
-// /confirm). One pending turn per box; the box enforces its own shorter tap
-// window (~8s), this longer window just garbage-collects stale turns.
-const PENDING_WINDOW_S = 25;
-const pendingByBox = new Map();   // box.id -> { transcript, expires, stages }
-
 // esp_listen's plumbing. There is no firmware command for "start recording
 // now" — the box decides, on a tap or a presence wake — so listening from the
 // outside means waiting for the recording the box chooses to make, and taking
@@ -350,7 +343,7 @@ function splitSentences(text) {
 // own start. Timestamps are returned rather than written to a shared object,
 // so the caller decides what to log.
 //
-// Shared by the tap-driven flow (handleConfirm) and the esp_speak MCP tool —
+// Shared by the upload-driven flow (handleUpload) and the esp_speak MCP tool —
 // one implementation, so the two paths can't drift apart.
 async function speakToBox(box, text, { sinceMs } = {}) {
   const t0 = sinceMs ?? nowMs();
@@ -389,7 +382,11 @@ async function speakToBox(box, text, { sinceMs } = {}) {
   return { chunks: sentences.length, firstAudioMs, ttsStart, ttsEnd, playbackStart, playbackEnd: nowMs() };
 }
 
-// Phase 1: recording arrives -> STT only -> show transcript, arm tap-confirm.
+// Recording arrives -> STT -> straight to backend -> caption -> chunked TTS
+// -> display. No tap-to-confirm gate any more: the box already gave the
+// customer a chance to end the turn early (a screen tap while recording), so
+// once the upload lands it goes straight through. Mishearings get corrected
+// conversationally by the agent instead of a screen tap.
 async function handleUpload(box, audioBuffer) {
   const uploadEnd = nowMs();
   // record_start is derived from the WAV's own length (16kHz mono 16-bit).
@@ -414,7 +411,6 @@ async function handleUpload(box, audioBuffer) {
     if (!transcript) {
       // Nothing intelligible — never bother a backend, just ask again.
       await sendCaption(box, "DIDN'T CATCH THAT - SPEAK AGAIN", { who: "TRY AGAIN" });
-      pendingByBox.delete(box.id);
       record.outcome = "no_speech";
       return;
     }
@@ -428,82 +424,52 @@ async function handleUpload(box, audioBuffer) {
     // clearing their throat.
     notifyTranscript(box.id, transcript);
 
-    // Show what was heard and arm the box's tap-to-confirm window. No backend
-    // is called until /confirm arrives.
-    // The box draws CANCEL/SEND buttons on any confirm caption, so the bar
-    // just poses the question — it must not say "TAP = SEND" any more.
-    await sendCaption(box, transcript, { who: "CONFIRM?", confirm: true });
-    pendingByBox.set(box.id, { transcript, expires: nowMs() + PENDING_WINDOW_S * 1000, stages });
-    record.outcome = "awaiting_confirm";
-    console.log(`[${box.name}] waiting for tap-confirm (window ${PENDING_WINDOW_S}s)...`);
+    // Show what was heard while the backend call is in flight.
+    await sendCaption(box, transcript, { who: "YOU" });
+
+    const turnAt = nowMs();
+    console.log(`[${box.name}] -> backend: ${JSON.stringify(transcript)}`);
+    stages.llm_start = nowMs();
+    const { reply, display, end_session, backend, llm_ms } = await routeText(box, transcript);
+    stages.llm_end = nowMs();
+    console.log(`[${box.name}] ${backend}: ${JSON.stringify(reply)} [${llm_ms}ms]`);
+
+    // Caption first: the customer READS the answer while the first sentence
+    // is still being synthesized.
+    await sendCaption(box, reply, { who: "BOX" });
+
+    // Chunked TTS + playback (see speakToBox).
+    const spoken = await speakToBox(box, reply, { sinceMs: turnAt });
+    const firstAudioMs = spoken.firstAudioMs;
+    const playbackEnd = spoken.playbackEnd;
+    stages.tts_start = spoken.ttsStart;
+    stages.tts_end = spoken.ttsEnd;
+    stages.playback_start = spoken.playbackStart;
+    stages.playback_end = spoken.playbackEnd;
+
+    // Backend-supplied display payloads (e.g. the order screen) take over
+    // as the resting state. Passthrough only — the core never builds these.
+    for (const entry of display || []) {
+      await sendDisplay(box, entry);
+    }
+
+    if (end_session) llmHistoryByBox.delete(box.id);
+
+    const totalMs = playbackEnd - turnAt;
+    console.log(`[${box.name}] ${spoken.chunks} chunks played. first audio at ${firstAudioMs}ms, done at ${totalMs}ms\n`);
+    record.reply = reply;
+    record.backend = backend;
+    record.display_entries = (display || []).length;
+    record.stages_epoch_ms = stages;
+    record.latency_ms = { llm: llm_ms, first_audio_after_upload: firstAudioMs, upload_to_done: totalMs };
+    record.outcome = "done";
   } catch (err) {
-    console.error(`[${box.name}] phase-1 failed: ${err.message}`);
+    console.error(`[${box.name}] turn failed: ${err.message}`);
     record.error = err.message;
+    await sendCaption(box, "SORRY - SOMETHING BROKE, TRY AGAIN", { who: "BOX" });
   } finally {
     await logInteraction(record);
   }
-}
-
-// Phase 2: box tap-confirmed -> backend -> caption -> chunked TTS -> display.
-async function handleConfirm(box) {
-  const pending = pendingByBox.get(box.id);
-  if (!pending || nowMs() > pending.expires) {
-    console.log(`[${box.name}] /confirm arrived but nothing pending (or expired)`);
-    return { status: 410 };
-  }
-  pendingByBox.delete(box.id); // consume it — one confirm per turn
-  const { transcript, stages } = pending;
-  const record = { timestamp: new Date().toISOString(), box: box.name, confirmed_transcript: transcript };
-
-  // The turn continues after we ack the box's /confirm request.
-  (async () => {
-    try {
-      const confirmAt = nowMs();
-      console.log(`[${box.name}] confirmed -> backend: ${JSON.stringify(transcript)}`);
-      stages.llm_start = nowMs();
-      const { reply, display, end_session, backend, llm_ms } = await routeText(box, transcript);
-      stages.llm_end = nowMs();
-      console.log(`[${box.name}] ${backend}: ${JSON.stringify(reply)} [${llm_ms}ms]`);
-
-      // Caption first: the customer READS the answer while the first sentence
-      // is still being synthesized.
-      await sendCaption(box, reply, { who: "BOX" });
-
-      // Chunked TTS + playback (see speakToBox). firstAudioMs is anchored to
-      // the tap-confirm so it reports what the customer actually waited.
-      const spoken = await speakToBox(box, reply, { sinceMs: confirmAt });
-      const firstAudioMs = spoken.firstAudioMs;
-      const playbackEnd = spoken.playbackEnd;
-      stages.tts_start = spoken.ttsStart;
-      stages.tts_end = spoken.ttsEnd;
-      stages.playback_start = spoken.playbackStart;
-      stages.playback_end = spoken.playbackEnd;
-
-      // Backend-supplied display payloads (e.g. the order screen) take over
-      // as the resting state. Passthrough only — the core never builds these.
-      for (const entry of display || []) {
-        await sendDisplay(box, entry);
-      }
-
-      if (end_session) llmHistoryByBox.delete(box.id);
-
-      const totalMs = playbackEnd - confirmAt;
-      console.log(`[${box.name}] ${spoken.chunks} chunks played. first audio at ${firstAudioMs}ms, done at ${totalMs}ms\n`);
-      record.reply = reply;
-      record.backend = backend;
-      record.display_entries = (display || []).length;
-      record.stages_epoch_ms = stages;
-      record.latency_ms = { llm: llm_ms, first_audio_after_confirm: firstAudioMs, confirm_to_done: totalMs };
-    } catch (err) {
-      console.error(`[${box.name}] phase-2 failed: ${err.message}`);
-      record.error = err.message;
-      await sendCaption(box, "SORRY - SOMETHING BROKE, TRY AGAIN", { who: "BOX" });
-    } finally {
-      await logInteraction(record);
-    }
-  })();
-
-  return { status: 200 };
 }
 
 // ---- Pay flow ---------------------------------------------------------------
@@ -625,7 +591,6 @@ async function handleOrderAction(box, action) {
       // long enough to read, then hand the box to the next person.
       await new Promise((r) => setTimeout(r, PAID_LINGER_MS));
       llmHistoryByBox.delete(box.id);
-      pendingByBox.delete(box.id);
       await resetBackendSessions(box);
       await sendSessionOverride(box, false);
     } catch (err) {
@@ -784,8 +749,8 @@ const server = http.createServer(async (req, res) => {
       }
       await readBody(req);
       // Ack immediately — the box is not waiting on this response for
-      // anything (unlike /confirm), it moves straight into playing the
-      // greeting once the Mac pushes it, which happens async below.
+      // anything, it moves straight into playing the greeting once the Mac
+      // pushes it, which happens async below.
       res.writeHead(200, { "Content-Length": "2" });
       res.end("ok");
       console.log(`\n[${box.name}] presence detected — greeting`);
@@ -806,24 +771,6 @@ const server = http.createServer(async (req, res) => {
       boxes.setOccupied(box.id, true);
       console.log(`[${box.name}] session started (touch/BOOT)`);
       return json(200, { ok: true });
-    }
-
-    if (req.method === "POST" && req.url === "/confirm") {
-      if (!fleetAuthed()) return denyFleet();
-      const box = boxes.fromId(req);
-      if (!box) {
-        return json(400, { error: "missing X-Box-Id header — flash current firmware" });
-      }
-      await readBody(req);
-      const { status } = await handleConfirm(box);
-      if (status === 200) {
-        res.writeHead(200, { "Content-Length": "2" });
-        res.end("ok");
-      } else {
-        res.writeHead(status);
-        res.end();
-      }
-      return;
     }
 
     // Order-screen button press. Body is the action ("end"); ADD ORDER is
@@ -883,7 +830,6 @@ const server = http.createServer(async (req, res) => {
       await readBody(req);
       boxes.setOccupied(box.id, false);
       llmHistoryByBox.delete(box.id);
-      pendingByBox.delete(box.id);
       // Webhook backends keep their own per-session state, keyed by the same
       // box id we pass as session_id. Ask them to drop just this one.
       await resetBackendSessions(box);
@@ -894,7 +840,6 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && req.url === "/reset") {
       if (!fleetAuthed()) return denyFleet();
       llmHistoryByBox.clear();
-      pendingByBox.clear();
       // Reset every webhook backend, not just one called "agent" — backends are
       // arbitrarily named now, and only webhooks hold their own session state.
       for (const name of config.priority) {

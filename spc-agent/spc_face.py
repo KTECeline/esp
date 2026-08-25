@@ -40,7 +40,9 @@ FACE_HTML = r"""<!doctype html>
     height: 100%;
     background: var(--bg-panel);
     color: #eaf4ff;
-    font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial,
+                 "Noto Sans SC", "PingFang SC", "Microsoft YaHei",
+                 "WenQuanYi Micro Hei", sans-serif;
     overflow: hidden;
     -webkit-user-select: none;
     user-select: none;

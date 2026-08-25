@@ -38,12 +38,29 @@ export function isCgnat(ip) {
 let fleetToken = null;
 export function setFleetToken(token) { fleetToken = token; }
 
-// The box font is ASCII-only (renders uppercase); HTTP headers must be latin-1
-// and single-line — strip anything else so captions don't corrupt the request.
+// For HTTP HEADER values (X-Speaker, X-Reply-Text, order fields): headers
+// must be latin-1 and single-line, and the box's title/order font is
+// ASCII-only (renders uppercase) with no CJK companion table — strip
+// anything else so these don't corrupt the request or render as mush.
 export function asciiOneline(s, limit = 200) {
   return (s || "")
     .replace(/[\n\r]/g, " ")
     .replace(/[^\x20-\x7E]/g, "")
+    .slice(0, limit);
+}
+
+// For the /caption HTTP BODY only: bodies can carry arbitrary UTF-8, unlike
+// headers, and F_BODY (the caption font) has a curated CJK glyph subset (see
+// listen_v2/main/ui_font_cjk.c) — so this keeps script instead of stripping
+// it. Still flattens newlines and drops control characters, since the
+// firmware still expects one line. A codepoint outside the ASCII+CJK glyph
+// set falls back to '?' on-device (resolve_glyph() in display.c), same
+// as any other unknown character.
+export function utf8Oneline(s, limit = 200) {
+  return (s || "")
+    .replace(/[\n\r]/g, " ")
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "")
     .slice(0, limit);
 }
 
@@ -211,12 +228,10 @@ async function postToBox(box, boxPath, body, headers = {}, timeoutMs = 60000) {
   return res.status;
 }
 
-export async function sendCaption(box, text, { who = "YOU", confirm = false } = {}) {
+export async function sendCaption(box, text, { who = "YOU" } = {}) {
   const headers = { "X-Speaker": asciiOneline(who, 40) };
-  // Tells the firmware to arm its tap-to-confirm window for this caption.
-  if (confirm) headers["X-Confirm"] = "1";
   try {
-    return await postToBox(box, "/caption", asciiOneline(text), headers, 5000);
+    return await postToBox(box, "/caption", utf8Oneline(text), headers, 5000);
   } catch (err) {
     console.warn(`       (caption to ${box.name} failed: ${err.message})`);
     return null;

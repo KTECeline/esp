@@ -213,11 +213,75 @@ static const ui_glyph_t *glyph_of(const ui_font_t *f, char c)
     return &f->glyphs[u - f->first];
 }
 
+// Decodes one UTF-8 codepoint starting at s (s must be non-empty) and writes
+// its byte length to *len. An invalid or truncated lead byte decodes as a
+// single raw byte rather than aborting, so garbage bytes (a cut-off
+// transcript, a truncated buffer) can't desync the rest of the string --
+// resolve_glyph() below falls back to '?' for whatever that byte turns out
+// to mean.
+static uint32_t utf8_decode(const char *s, int *len)
+{
+    unsigned char c0 = (unsigned char)s[0];
+    if (c0 < 0x80) { *len = 1; return c0; }
+    int n; uint32_t cp;
+    if      ((c0 & 0xE0) == 0xC0) { n = 1; cp = c0 & 0x1F; }
+    else if ((c0 & 0xF0) == 0xE0) { n = 2; cp = c0 & 0x0F; }
+    else if ((c0 & 0xF8) == 0xF0) { n = 3; cp = c0 & 0x07; }
+    else { *len = 1; return c0; }
+    for (int i = 1; i <= n; i++) {
+        unsigned char ci = (unsigned char)s[i];
+        if ((ci & 0xC0) != 0x80) { *len = 1; return c0; }   // truncated sequence
+        cp = (cp << 6) | (ci & 0x3F);
+    }
+    *len = n + 1;
+    return cp;
+}
+
+// Binary search a CJK subset for a codepoint. NULL if not covered.
+static const cjk_glyph_t *cjk_glyph_of(const cjk_font_t *cf, uint32_t cp)
+{
+    int lo = 0, hi = (int)cf->count - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        uint32_t mcp = cf->glyphs[mid].codepoint;
+        if (mcp == cp) return &cf->glyphs[mid];
+        if (mcp < cp) lo = mid + 1; else hi = mid - 1;
+    }
+    return NULL;
+}
+
+// Resolves one codepoint to its alpha blob + glyph metrics: the font's own
+// ASCII range first, then its companion CJK subset if it has one (only
+// F_BODY does -- see ui_font.h), then '?'. This is how a mixed ASCII+Chinese
+// transcript ("2 杯 teh tarik") draws through the same call as plain ASCII.
+static void resolve_glyph(const ui_font_t *f, uint32_t cp,
+                          const uint8_t **alpha_out, const ui_glyph_t **g_out)
+{
+    if (cp >= f->first && cp <= f->last) {
+        *alpha_out = f->alpha;
+        *g_out = &f->glyphs[cp - f->first];
+        return;
+    }
+    if (f->cjk) {
+        const cjk_glyph_t *cg = cjk_glyph_of(f->cjk, cp);
+        if (cg) { *alpha_out = f->cjk->alpha; *g_out = &cg->g; return; }
+    }
+    *alpha_out = f->alpha;
+    *g_out = &f->glyphs['?' - f->first];
+}
+
 static int text_w(const ui_font_t *f, const char *s)
 {
     if (!s || !*s) return 0;
     int w = 0;
-    for (const char *p = s; *p; p++) w += glyph_of(f, *p)->adv + f->track;
+    const char *p = s;
+    while (*p) {
+        int len; uint32_t cp = utf8_decode(p, &len);
+        const uint8_t *a; const ui_glyph_t *g;
+        resolve_glyph(f, cp, &a, &g);
+        w += g->adv + f->track;
+        p += len;
+    }
     return w - f->track;                      // no trailing tracking
 }
 
@@ -225,16 +289,20 @@ static int text_w(const ui_font_t *f, const char *s)
 static void text(int x, int y, const ui_font_t *f, uint16_t c, const char *s)
 {
     if (!s) return;
-    for (const char *p = s; *p; p++) {
-        const ui_glyph_t *g = glyph_of(f, *p);
-        const uint8_t *a = &f->alpha[g->off];
+    const char *p = s;
+    while (*p) {
+        int len; uint32_t cp = utf8_decode(p, &len);
+        const uint8_t *a; const ui_glyph_t *g;
+        resolve_glyph(f, cp, &a, &g);
+        const uint8_t *ga = &a[g->off];
         for (int gy = 0; gy < g->h; gy++) {
             for (int gx = 0; gx < g->w; gx++) {
-                uint8_t v = a[gy * g->w + gx];
+                uint8_t v = ga[gy * g->w + gx];
                 if (v) blend(x + g->dx + gx, y + g->dy + gy, c, v);
             }
         }
         x += g->adv + f->track;
+        p += len;
     }
 }
 
@@ -264,11 +332,15 @@ static void text_clipped(int x, int y, const ui_font_t *f, uint16_t c,
     size_t n = 0;
     int w = 0;
     while (s[n] && n < sizeof(buf) - 3) {
-        int adv = glyph_of(f, s[n])->adv + f->track;
+        int len; uint32_t cp = utf8_decode(&s[n], &len);
+        if (n + (size_t)len > sizeof(buf) - 3) break;   // never split a codepoint
+        const uint8_t *a; const ui_glyph_t *g;
+        resolve_glyph(f, cp, &a, &g);
+        int adv = g->adv + f->track;
         if (w + adv + ell > max_w) break;
         w += adv;
-        buf[n] = s[n];
-        n++;
+        for (int i = 0; i < len; i++) buf[n + i] = s[n + i];
+        n += len;
     }
     buf[n] = '.'; buf[n + 1] = '.'; buf[n + 2] = 0;
     text(x, y, f, c, buf);
@@ -295,7 +367,7 @@ static int s_badge_x = 0, s_badge_y = 0, s_badge_w = 0, s_badge_h = 0;
 // Which pair of bottom buttons is on screen right now, so display_hit_test()
 // can name the button that was actually hit. Declared up here because
 // backdrop() clears it — see the note there.
-typedef enum { BTNS_NONE = 0, BTNS_CONFIRM, BTNS_ORDER } btn_kind_t;
+typedef enum { BTNS_NONE = 0, BTNS_ORDER } btn_kind_t;
 static btn_kind_t s_btns = BTNS_NONE;
 
 static void backdrop(void)
@@ -513,13 +585,27 @@ static int wrap_text(const char *s, int x0, int y0, int w, int max_lines, bool d
 
     char line[96];
     int ll = 0, ly = y0, used = 0, lw = 0;
+    bool prev_wide = false;   // previous token was a CJK codepoint -- no
+                               // synthetic space gets inserted between two of
+                               // those, since Chinese doesn't space-separate
     const char *p = s;
     while (*p && used < max_lines) {
         while (*p == ' ') p++;
         if (!*p) break;
         const char *word = p;
         int wl = 0;
-        while (word[wl] && word[wl] != ' ') wl++;
+        bool tok_wide = false;
+        if ((unsigned char)*word >= 0x80) {
+            // CJK (or any non-ASCII) run: one codepoint is one breakable
+            // token, so a line can wrap between any two Chinese characters
+            // even with no spaces in the source text.
+            int len;
+            utf8_decode(word, &len);
+            wl = len;
+            tok_wide = true;
+        } else {
+            while (word[wl] && word[wl] != ' ' && (unsigned char)word[wl] < 0x80) wl++;
+        }
         p = word + wl;
 
         char buf[96];
@@ -531,11 +617,16 @@ static int wrap_text(const char *s, int x0, int y0, int w, int max_lines, bool d
 
         // A word too wide for a whole line (a URL, or speech-to-text running
         // words together) is hard-broken instead of spilling past the card.
-        while (bw > w && used < max_lines) {
+        // Never entered for a CJK token (tok_wide): it's a single codepoint
+        // already, and the byte-at-a-time split below assumes 1 byte = 1
+        // glyph, which is only true for the ASCII words this loop still
+        // handles the old way. A lone glyph wider than the whole card isn't
+        // realistic, so the token just draws on its own line below instead.
+        while (bw > w && used < max_lines && !tok_wide) {
             if (ll) {                               // finish the current line first
                 line[ll] = 0;
                 if (draw) text(x0, ly, f, C_TEXT, line);
-                ly += LH; used++; ll = 0; lw = 0;
+                ly += LH; used++; ll = 0; lw = 0; prev_wide = false;
                 if (used >= max_lines) break;
             }
             int take = 0, tw = 0;
@@ -556,15 +647,18 @@ static int wrap_text(const char *s, int x0, int y0, int w, int max_lines, bool d
         if (used >= max_lines) break;
         if (wl == 0) continue;
 
-        if (ll && lw + space_w + bw > w) {          // break before this word
+        bool glue = tok_wide && prev_wide;   // two adjacent CJK chars: no gap
+        if (ll && lw + (glue ? 0 : space_w) + bw > w) {   // break before this token
             line[ll] = 0;
             if (draw) text(x0, ly, f, C_TEXT, line);
-            ly += LH; used++; ll = 0; lw = 0;
+            ly += LH; used++; ll = 0; lw = 0; prev_wide = false;
+            glue = false;   // fresh line -- nothing to glue to any more
             if (used >= max_lines) break;
         }
-        if (ll && ll < (int)sizeof(line) - 1) { line[ll++] = ' '; lw += space_w; }
+        if (ll && !glue && ll < (int)sizeof(line) - 1) { line[ll++] = ' '; lw += space_w; }
         for (int i = 0; i < wl && ll < (int)sizeof(line) - 1; i++) line[ll++] = buf[i];
         lw += bw;
+        prev_wide = tok_wide;
     }
     if (ll && used < max_lines) {
         line[ll] = 0;
@@ -612,17 +706,6 @@ void display_caption(const char *speaker, uint16_t bar, const char *s)
     flush();
 }
 
-void display_confirm(const char *speaker, uint16_t bar, const char *s)
-{
-    if (!s_fb) return;
-    caption_frame(speaker, bar, s, BTN_Y - 10);
-    // Red edge: CANCEL genuinely discards the customer's words, which the order
-    // screen's pair never does.
-    button_bar("CANCEL", "SEND", C_ERR_EDGE, C_ERR_SOFT);
-    s_btns = BTNS_CONFIRM;
-    flush();
-}
-
 display_button_t display_hit_test(int x, int y)
 {
     if (s_btns == BTNS_NONE) return BTN_NONE;
@@ -630,7 +713,6 @@ display_button_t display_hit_test(int x, int y)
     bool left  = x >= BTN_LEFT_X  && x <= BTN_LEFT_X + BTN_W;
     bool right = x >= BTN_RIGHT_X && x <= BTN_RIGHT_X + BTN_W;
     if (!left && !right) return BTN_NONE;
-    if (s_btns == BTNS_CONFIRM) return left ? BTN_CANCEL : BTN_SEND;
     return left ? BTN_ADD_ORDER : BTN_END_PAY;
 }
 

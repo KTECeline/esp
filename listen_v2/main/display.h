@@ -77,21 +77,14 @@ void display_order(const order_screen_t *s);
 // what is being said in realtime.
 void display_caption(const char *speaker, uint16_t bar, const char *text);
 
-// On-screen buttons. The confirm screen and the order screen each draw a pair,
-// in the same place — display_hit_test() reports whichever pair is actually on
-// screen, so a caller can never act on a button the customer cannot see.
+// On-screen buttons. Only the order screen draws a pair now — display_hit_test()
+// reports it only while that screen is actually up, so a caller can never act
+// on a button the customer cannot see.
 typedef enum {
     BTN_NONE = 0,
-    BTN_CANCEL,      // confirm screen, left
-    BTN_SEND,        // confirm screen, right
     BTN_ADD_ORDER,   // order screen, left
     BTN_END_PAY,     // order screen, right
 } display_button_t;
-
-// Confirm screen: like display_caption(), but the card is shortened to fit
-// CANCEL (outlined, left) and SEND (green, right) buttons along the bottom.
-// The BOOT button still confirms -- touch is an addition, not a replacement.
-void display_confirm(const char *speaker, uint16_t bar, const char *text);
 
 // Which button contains this point, in DISPLAY coordinates (touch.c converts
 // from panel coordinates). Returns BTN_NONE unless a screen with buttons is
