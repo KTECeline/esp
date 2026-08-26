@@ -1,0 +1,14 @@
+{
+  "name": "sleeping",
+  "label": "Sleeping",
+  "emoji": "😴",
+  "description": "Eyes closed, no brows, dimmed. The page adds drifting z's.",
+  "eyes": {
+    "left": "closed",
+    "right": "closed"
+  },
+  "brow": "none",
+  "mouth": "flat",
+  "ink": "#2a6f95",
+  "blink": false
+}

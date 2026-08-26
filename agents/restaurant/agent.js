@@ -33,10 +33,77 @@ const LLM_TOKEN = process.env.AGENT_LLM_TOKEN || "";
 // (a 3B model cannot be trusted with arithmetic).
 const MENU = JSON.parse(readFileSync(path.join(HERE, "menu.json"), "utf8"));
 
+// ---- Runtime settings (agent scope) ----------------------------------------
+// The handful of numbers in this file that a person standing at the counter has
+// a real reason to change: how long the food will take, how many rows fit on
+// the screen, whether a spoken confirmation is required. They live in
+// mcp-core's settings store (scope "agent") so they are changed the same way,
+// through the same tool, as everything else about the fleet — rather than being
+// a second, differently-shaped configuration surface nobody remembers exists.
+//
+// Fetched, not pushed, and that is the right direction here: this agent is a
+// swappable service behind a webhook. mcp-core does not know what a restaurant
+// agent needs, and giving it a list to push would put this file's vocabulary
+// into the core, which is the one thing the core is designed not to know.
+const CORE_URL = process.env.AGENT_CORE_URL || "http://localhost:8000";
+const CORE_TOKEN = process.env.ESP_FLEET_TOKEN || "";
+
+// The values used until the first successful fetch, and after any failure.
+// Every one of them is what this file had hardcoded before, so an agent running
+// with no reachable core behaves exactly as it always did.
+const SETTING_FALLBACKS = {
+  "order.confirm_required": true,
+  "order.max_items": 5,
+  "order.prep_minutes": 10,
+  "order.llm_temperature": 0,
+  "order.currency": MENU.currency || "RM"
+};
+let agentSettings = { ...SETTING_FALLBACKS };
+const setting = (key) => agentSettings[key] ?? SETTING_FALLBACKS[key];
+
+// Polled rather than subscribed. A poll is a few hundred bytes a minute and
+// cannot get wedged; a subscription would need reconnect logic, and the failure
+// mode of a silently dead subscription is an agent confidently quoting a prep
+// time nobody set any more.
+async function refreshSettings() {
+  try {
+    const res = await fetch(`${CORE_URL}/settings?scope=agent`, {
+      headers: CORE_TOKEN ? { "X-Fleet-Token": CORE_TOKEN } : {},
+      signal: AbortSignal.timeout(4000)
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const body = await res.json();
+    if (body && typeof body.settings === "object") {
+      const before = JSON.stringify(agentSettings);
+      agentSettings = { ...SETTING_FALLBACKS, ...body.settings };
+      if (JSON.stringify(agentSettings) !== before) {
+        console.log(`Settings rev ${body.revision}: ` +
+                    Object.entries(agentSettings).map(([k, v]) => `${k}=${v}`).join(" "));
+      }
+    }
+  } catch (err) {
+    // Quiet after the first: an agent started before mcp-core would otherwise
+    // log a failure every minute forever, and it is working correctly the
+    // entire time — on fallbacks that are, by construction, the old behaviour.
+    if (!refreshSettings.warned) {
+      refreshSettings.warned = true;
+      console.warn(`(settings unavailable at ${CORE_URL}: ${err.message} — using built-in ` +
+                   `defaults; will keep trying quietly)`);
+    }
+  }
+}
+
 const menuLines = MENU.items.map((i) => `- ${i.name} (${MENU.currency}${i.price.toFixed(2)})`).join("\n");
-const SYSTEM_PROMPT =
+
+// Built per turn rather than once at import, because two of its rules are now
+// settings: what to tell the customer about the wait, and whether a spoken
+// confirmation is required at all. Rebuilding a few hundred bytes of string is
+// free next to an LLM call, and the alternative — caching it — is how a changed
+// prep time ends up applying only after a restart nobody thinks to do.
+const systemPrompt = () =>
   `You are the voice order-taker at ${MENU.restaurant}, a Malaysian mamak stall. MENU:\n${menuLines}\n\n` +
   "Rules:\n" +
+  `- If asked how long the food will take, say about ${setting("order.prep_minutes")} minutes.\n` +
   "- Speak like a friendly mamak worker: short natural spoken replies, 1-2 sentences, no lists.\n" +
   "- Reply in English with light Manglish flavor (lah, boss). Do not reply in Malay — the voice output is English-only.\n" +
   "- Only take orders for menu items. If asked for something not on the menu, say so and suggest something similar from the menu.\n" +
@@ -44,9 +111,15 @@ const SYSTEM_PROMPT =
   "- Track the customer's FULL order across the whole conversation.\n" +
   "- NEVER state prices or totals yourself — you are bad at arithmetic. Where you want to " +
   "say the total, write exactly {TOTAL} and the till will fill in the correct amount.\n" +
-  "- When the customer says they are done ordering, read the order back with {TOTAL} and ask them to confirm.\n" +
-  "- Set status to \"confirmed\" ONLY when the customer explicitly says yes/confirm/correct " +
-  "AFTER hearing the order read back — never on the same turn they finish ordering.\n\n" +
+  (setting("order.confirm_required")
+    ? "- When the customer says they are done ordering, read the order back with {TOTAL} and ask them to confirm.\n" +
+      "- Set status to \"confirmed\" ONLY when the customer explicitly says yes/confirm/correct " +
+      "AFTER hearing the order read back — never on the same turn they finish ordering.\n\n"
+    // order.confirm_required=false: for a counter where the customer confirms
+    // by tapping END + PAY on the screen instead of saying anything. The model
+    // may then close out an order as soon as the customer says they are done.
+    : "- When the customer says they are done ordering, read the order back with {TOTAL} and " +
+      "set status to \"confirmed\".\n\n") +
   "Respond ONLY with JSON, exactly this shape:\n" +
   '{"reply": "<what you say out loud>", "order": {"status": "none|open|confirmed", "items": [{"qty": <number>, "name": "<menu item name>"}]}}\n' +
   'The items array is the complete order so far (not just new items). Use status "none" when nothing has been ordered yet.';
@@ -128,7 +201,7 @@ function priceOrder(order) {
   }
   if (items.length === 0) return null;
   return { status: order.status === "confirmed" ? "confirmed" : "open",
-           currency: MENU.currency, items, total: Math.round(total * 100) / 100 };
+           currency: setting("order.currency"), items, total: Math.round(total * 100) / 100 };
 }
 
 // The order screen is the agent's responsibility now: it emits the firmware's
@@ -151,10 +224,10 @@ function priceOrder(order) {
 // screen over with the payment prompt, and offering "END + PAY" on a paid order
 // would just re-run a finished flow.
 function orderDisplay(order) {
-  const cur = order.currency || "RM";
+  const cur = order.currency || setting("order.currency");
   const title = order.status === "confirmed" ? "ORDER CONFIRMED" : "YOUR ORDER";
   const lines = [`TITLE|${title}`];
-  for (const it of order.items.slice(0, 5)) {
+  for (const it of order.items.slice(0, setting("order.max_items"))) {
     const name = `${it.qty}X ${it.name}`.toUpperCase().replace(/[^\x20-\x7E]/g, "").slice(0, 15);
     lines.push(`ITEM|${name}|${cur}${it.line_total.toFixed(2)}`);
   }
@@ -186,8 +259,8 @@ async function askLlm(session, text) {
       // "two nasi lemak and one teh tarik" ~1 in 5 times; near-0 makes it
       // extract the same items every time. A little reply variety is a fair
       // trade for not mis-charging customers.
-      temperature: 0,
-      messages: [{ role: "system", content: SYSTEM_PROMPT }, ...session.history]
+      temperature: setting("order.llm_temperature"),
+      messages: [{ role: "system", content: systemPrompt() }, ...session.history]
     })
   });
   if (!response.ok) {
@@ -346,4 +419,11 @@ server.listen(PORT, () => {
                  "can create, finalize or wipe orders. Set AGENT_TOKEN here and " +
                  "token_env on the matching backend in mcp-core's config.json.");
   }
+  // Immediately, then on a slow timer. Not awaited before listening: the agent
+  // is fully functional on the fallbacks, and refusing to serve orders because
+  // a prep time could not be fetched would be a bad trade in every direction.
+  refreshSettings();
+  setInterval(refreshSettings, 60000).unref();
+  console.log(`settings: ${CORE_URL}/settings?scope=agent (order.prep_minutes, ` +
+              `order.confirm_required, order.max_items, order.llm_temperature, order.currency)`);
 });

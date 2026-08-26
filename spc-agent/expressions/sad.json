@@ -1,0 +1,12 @@
+{
+  "name": "sad",
+  "label": "Sad",
+  "emoji": "🙁",
+  "description": "Narrowed eyes, drooping brows, a frown.",
+  "eyes": {
+    "left": "narrow",
+    "right": "narrow"
+  },
+  "brow": "sad",
+  "mouth": "frown"
+}

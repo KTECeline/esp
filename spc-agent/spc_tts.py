@@ -18,10 +18,15 @@ field, because a reply's language varies request to request while this
 script's request shape does not. See that file for why.
 """
 import json
+import os
 import sys
 import urllib.request
 
-TTS_URL = "http://127.0.0.1:5002/v1/audio/speech"
+# The OrangePi's shim listens on 5002, so that stays the default and nothing
+# there has to change. The Radxa runs the same OpenAI-shaped route from its own
+# piper-wrapper.js on 5001 instead, so the port has to be settable per machine
+# rather than baked in.
+TTS_URL = os.environ.get("SPC_TTS_URL", "http://127.0.0.1:5002/v1/audio/speech")
 
 # Generous: Piper synthesises sentence by sentence and a long reply is slow on
 # an RK3588. spc-agent's own "speak" timeout is 55s, so staying under that lets

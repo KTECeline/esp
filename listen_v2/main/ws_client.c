@@ -23,6 +23,7 @@
 #include "esp_websocket_client.h"
 #include "esp_crt_bundle.h"
 #include "box_actions.h"
+#include "box_settings.h"
 
 static const char *TAG = "ws_client";
 static esp_websocket_client_handle_t s_client = NULL;
@@ -53,6 +54,8 @@ static play_opts_t s_opts;
 static play_session_t s_play;
 static char  s_body[WS_BODY_MAX];
 static int   s_body_len;
+// X-Settings-Rev from a /settings header, held until its body arrives.
+static uint32_t s_settings_rev;
 static uint32_t s_body_expected;   // bytes of body still to come (play only)
 
 static void ws_ack(const char *id, int status)
@@ -195,10 +198,18 @@ static void begin_instruction(const char *body, int body_len, uint32_t total_bod
         return;
     }
 
-    if (strcmp(s_path, "/caption") == 0 || strcmp(s_path, "/order") == 0) {
+    if (strcmp(s_path, "/caption") == 0 || strcmp(s_path, "/order") == 0 ||
+        strcmp(s_path, "/settings") == 0) {
         if (strcmp(s_path, "/caption") == 0) {
             strlcpy(s_speaker, "YOU", sizeof(s_speaker));
             head_get(s_head, "X-Speaker", s_speaker, sizeof(s_speaker));
+        }
+        // Stashed now, not in finish_text_instruction(): by the time the body
+        // is complete, s_head has been overwritten by later fragments.
+        if (strcmp(s_path, "/settings") == 0) {
+            char rev[16] = "0";
+            head_get(s_head, "X-Settings-Rev", rev, sizeof(rev));
+            s_settings_rev = (uint32_t)strtoul(rev, NULL, 10);
         }
         s_body_len = 0;
         s_state = WS_TEXT_BODY;
@@ -220,6 +231,12 @@ static void finish_text_instruction(void)
         do_caption(s_body, s_speaker);
     } else if (strcmp(s_path, "/order") == 0) {
         do_order(s_body);
+    } else if (strcmp(s_path, "/settings") == 0) {
+        // The reason this path exists at all: without it, tuning could only be
+        // pushed over LAN HTTP, so a box on a phone hotspot or behind someone
+        // else's NAT — exactly the box hardest to walk over to — would be the
+        // one that could never be adjusted.
+        box_settings_apply(s_body, s_settings_rev);
     }
     ws_ack(s_req_id, 200);
     s_state = WS_IDLE;

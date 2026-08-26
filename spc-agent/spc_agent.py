@@ -23,6 +23,7 @@ import errno
 import glob
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -40,6 +41,28 @@ try:
     from spc_face import FACE_HTML
 except ImportError:
     FACE_HTML = None
+
+# The expression catalog. Imported the same defensive way and for the same
+# reason, except that a device without it can still drive its screen — the
+# module carries the ten builtins, so the fallback here is the narrower one of
+# refusing to validate expressions at all rather than a black panel.
+try:
+    import spc_expressions
+except ImportError:
+    spc_expressions = None
+
+# The picker at /faces. Optional in exactly the way the face page is: a device
+# part-way through a deploy serves the panel and simply has no picker yet.
+try:
+    from spc_picker import PICKER_HTML
+except ImportError:
+    PICKER_HTML = None
+
+
+def search_dirs_hint():
+    """Where a user should put a new expression file, phrased for an error message."""
+    dirs = spc_expressions.search_dirs() if spc_expressions else []
+    return " or ".join(dirs) if dirs else "the expressions directory"
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -59,6 +82,33 @@ FLEET_TOKEN = os.environ.get("SPC_FLEET_TOKEN") or os.environ.get("ESP_FLEET_TOK
 # List them with:  arecord -l   and   aplay -l
 MIC_DEVICE = os.environ.get("SPC_MIC_DEVICE", "default")
 SPEAKER_DEVICE = os.environ.get("SPC_SPEAKER_DEVICE", "default")
+
+# Playback volume, as an amixer simple-control name plus the card holding it.
+#
+# Opt-in rather than guessed, because "which control is the volume" has no
+# reliable answer across boards: one Pi's is 'PCM', another's 'Master', and a
+# USB device whose firmware exposes no mixer at all (the ReSpeaker Lite) has
+# none until an ALSA softvol plugin invents one. Unset = no `volume` capability
+# and /volume answers 501, which is honest; a wrong guess would instead return
+# 200 while moving a control nobody is listening through.
+#
+# NOTE amixer strips a trailing " Volume" from the control name, so a softvol
+# declared as `control { name "SPC Volume" }` is addressed here as "SPC".
+VOLUME_CONTROL = os.environ.get("SPC_VOLUME_CONTROL", "")
+VOLUME_CARD = os.environ.get("SPC_VOLUME_CARD", "")
+
+# Where the level is remembered across restarts. A softvol control does not
+# exist until its PCM is first opened, so it comes back at 100% every boot —
+# loud enough to be alarming in a room. The agent re-applies this on startup.
+VOLUME_STATE = os.environ.get(
+    "SPC_VOLUME_STATE",
+    os.path.join(os.path.expanduser("~"), ".spc_volume"),
+)
+
+# What to use when nothing has been remembered yet — a fresh install, or a
+# state file that was deleted. Not 100: the first thing a new box ever says
+# should not be the loudest thing it can say.
+VOLUME_DEFAULT = int(os.environ.get("SPC_VOLUME_DEFAULT", "65"))
 
 # Video4Linux node for the camera. Absent = no camera = /look returns 501 and
 # mcp-core is told not to expose spc_look.
@@ -123,7 +173,139 @@ TTS_CMD = os.environ.get("SPC_TTS_CMD", "")
 # off.
 SCREEN_ENV = os.environ.get("SPC_SCREEN", "")
 
-TIMEOUTS = {"look": 15, "speak": 55, "sense": 5}
+# ---------------------------------------------------------------------------
+# Runtime settings
+# ---------------------------------------------------------------------------
+# The knobs mcp-core can change without anyone touching this Pi. Everything
+# above is environment: it describes what hardware this box HAS, is decided when
+# the service is installed, and changing it means editing a systemd unit. What
+# follows is behaviour: how long to allow, how long to listen, when to give up —
+# the numbers that depend on the room and the queue, and that someone standing
+# at the counter has a real reason to want changed right now.
+#
+# Pushed by mcp-core (PATCH /settings) and persisted, so a reboot does not
+# silently revert to defaults while the server still reports the tuned values.
+# The authoritative catalog — names, ranges, meanings — is
+# mcp-core/settings-spec.json; these are the fallbacks for a Pi that has never
+# been pushed to, and they are the values this file had as constants before any
+# of this existed.
+# In the service user's home, NOT next to this script — same choice, and the
+# same reason, as VOLUME_STATE above. deploy_spc_agent.sh installs to
+# /opt/spc-agent as root and runs the unit as an ordinary user, so a file beside
+# the script would fail to write. That failure is handled (it warns and stays in
+# memory), but the result would be tuning that silently reverts on every reboot
+# while mcp-core keeps reporting the value someone set — the exact "changed and
+# didn't" failure this whole mechanism exists to avoid.
+SETTINGS_PATH = os.environ.get(
+    "SPC_SETTINGS_FILE",
+    os.path.join(os.path.expanduser("~"), ".spc_settings.json"),
+)
+
+SETTING_DEFAULTS = {
+    "spc.look_timeout_s": 15,
+    "spc.speak_timeout_s": 55,
+    "spc.sense_timeout_s": 5,
+    "spc.volume_timeout_s": 5,
+    "spc.listen_silence_s": 1.2,
+    "spc.listen_timeout_s": 12,
+}
+
+# Clamped independently of the server, and wider than the server's ranges, for
+# the same reason the firmware clamps: this side has to stay usable even if the
+# push came from something that miscalculated, and a 0-second speak timeout
+# would kill every sentence mid-word with no way to fix it but SSH.
+SETTING_BOUNDS = {
+    "spc.look_timeout_s": (1, 300),
+    "spc.speak_timeout_s": (1, 600),
+    "spc.sense_timeout_s": (1, 120),
+    "spc.volume_timeout_s": (1, 120),
+    "spc.listen_silence_s": (0.1, 30),
+    "spc.listen_timeout_s": (1, 300),
+}
+
+SETTINGS = dict(SETTING_DEFAULTS)
+SETTINGS_REVISION = 0
+SETTINGS_LOCK = threading.Lock()
+
+
+def settings_load():
+    """Restore pushed settings at startup. A missing or unreadable file means
+    defaults, never a failure to start: a service that refuses to boot because a
+    tuning file got truncated has turned a cosmetic problem into an outage."""
+    global SETTINGS, SETTINGS_REVISION
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as fh:
+            saved = json.load(fh)
+    except FileNotFoundError:
+        return
+    except Exception as err:
+        print(f"[settings] {SETTINGS_PATH} unreadable ({err}) — using defaults", flush=True)
+        return
+    values = saved.get("settings", saved) if isinstance(saved, dict) else {}
+    merged = dict(SETTING_DEFAULTS)
+    for key, val in (values or {}).items():
+        # Unknown keys are dropped rather than kept: they come from a newer
+        # mcp-core, this build has no code that reads them, and holding them
+        # would only make /settings advertise knobs that do nothing.
+        if key in SETTING_DEFAULTS:
+            merged[key] = _clamp_setting(key, val, merged[key])
+    SETTINGS = merged
+    SETTINGS_REVISION = int(saved.get("revision", 0) or 0) if isinstance(saved, dict) else 0
+    print(f"[settings] rev {SETTINGS_REVISION} loaded from {SETTINGS_PATH}", flush=True)
+
+
+def _clamp_setting(key, raw, fallback):
+    lo, hi = SETTING_BOUNDS[key]
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return fallback
+    val = max(lo, min(hi, val))
+    # Ints stay ints so `-d 12` on the arecord command line does not become
+    # `-d 12.0`, which arecord rejects.
+    return int(val) if isinstance(SETTING_DEFAULTS[key], int) else val
+
+
+def settings_apply(values, revision):
+    """Merge a push and persist it. Returns the keys that actually changed."""
+    global SETTINGS, SETTINGS_REVISION
+    changed = []
+    with SETTINGS_LOCK:
+        merged = dict(SETTINGS)
+        for key, val in (values or {}).items():
+            if key not in SETTING_DEFAULTS:
+                continue
+            new = _clamp_setting(key, val, merged[key])
+            if new != merged[key]:
+                merged[key] = new
+                changed.append(key)
+        SETTINGS = merged
+        SETTINGS_REVISION = int(revision or 0)
+        try:
+            tmp = SETTINGS_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"revision": SETTINGS_REVISION, "settings": SETTINGS}, fh, indent=2)
+            os.replace(tmp, SETTINGS_PATH)
+        except Exception as err:
+            # Live but not durable. Said out loud rather than swallowed, because
+            # the failure is invisible until the next reboot quietly reverts.
+            print(f"[settings] could not save to {SETTINGS_PATH} ({err}) — "
+                  f"applied in memory only, will revert on restart", flush=True)
+    if changed:
+        print(f"[settings] rev {SETTINGS_REVISION} applied: "
+              + ", ".join(f"{k}={SETTINGS[k]}" for k in changed), flush=True)
+    return changed
+
+
+def setting(key):
+    return SETTINGS.get(key, SETTING_DEFAULTS[key])
+
+
+# The per-command kill timeouts, read through the settings so a change lands on
+# the next command with no restart. Kept as a function rather than the old dict
+# so every call site stayed a one-word edit.
+def timeout_for(kind):
+    return setting(f"spc.{kind}_timeout_s")
 
 
 def have(binary):
@@ -198,6 +380,8 @@ def capabilities():
         caps.append("listen")
     if have_screen():
         caps.append("screen")
+    if VOLUME_CONTROL and have("amixer"):
+        caps.append("volume")
     return caps
 
 
@@ -223,6 +407,12 @@ def missing_reason(cap):
         return "no arecord (apt install alsa-utils)"
     if cap == "screen":
         return "no display detected (/dev/dri/card*, /dev/fb0) — set SPC_SCREEN=1 if a panel is attached"
+    if cap == "volume":
+        if not have("amixer"):
+            return "no amixer (apt install alsa-utils)"
+        return ("no volume control configured (set SPC_VOLUME_CONTROL, and SPC_VOLUME_CARD if it "
+                "is not on the default card). A USB device whose firmware exposes no mixer needs "
+                "an ALSA softvol plugin in ~/.asoundrc to have a control at all")
     return "not available"
 
 
@@ -249,6 +439,82 @@ def run(cmd, timeout, stdin=None):
         err = (proc.stderr or b"").decode("utf-8", "replace").strip()
         raise RuntimeError(f"{cmd[0]} failed: {err.splitlines()[-1] if err else 'exit ' + str(proc.returncode)}")
     return proc.stdout
+
+
+# -- volume -----------------------------------------------------------------
+#
+# Shelled out to amixer for the same reason everything else here is: it is the
+# one interface that behaves identically on every board, and it needs no pip.
+
+def _amixer(*args):
+    cmd = ["amixer"]
+    if VOLUME_CARD:
+        cmd += ["-c", VOLUME_CARD]
+    return run(cmd + list(args), timeout_for("volume")).decode("utf-8", "replace")
+
+
+def volume_get():
+    """Current playback level, 0-100.
+
+    amixer prints per-channel lines like `Front Left: 153 [60%] [-20.40dB]`, or
+    `Mono: Playback 153 [60%]` on a mono control. The first percentage is the
+    answer in both shapes.
+    """
+    out = _amixer("sget", VOLUME_CONTROL)
+    match = re.search(r"\[(\d{1,3})%\]", out)
+    if not match:
+        raise RuntimeError(
+            f"could not read a level from control {VOLUME_CONTROL!r} — "
+            f"amixer said: {out.strip().splitlines()[-1] if out.strip() else '(nothing)'}"
+        )
+    return int(match.group(1))
+
+
+def volume_set(level):
+    """Set the level, 0-100, and return what it actually became.
+
+    Reads back rather than echoing the request: a softvol has 256 steps, so the
+    stored value is the nearest one and can differ by a percent from what was
+    asked for. Returning the request would make the web UI and the hardware
+    disagree by a hair forever.
+    """
+    level = max(0, min(100, int(level)))
+    _amixer("sset", VOLUME_CONTROL, f"{level}%")
+    actual = volume_get()
+    try:
+        with open(VOLUME_STATE, "w") as fh:
+            fh.write(str(actual))
+    except OSError as err:
+        # Losing the level across a reboot is not worth failing a call that
+        # already worked — the sound did change.
+        print(f"spc-agent: could not persist volume to {VOLUME_STATE}: {err}", flush=True)
+    return actual
+
+
+def volume_restore():
+    """Apply the remembered level at startup, or the default if there is none.
+
+    Best effort by design — see the except below.
+    """
+    if not VOLUME_CONTROL:
+        return
+    try:
+        with open(VOLUME_STATE) as fh:
+            saved = int(fh.read().strip())
+        source = "restored"
+    except (OSError, ValueError):
+        # No state yet, or it was corrupted. Falling through to the default
+        # rather than returning is the point: leaving an uninitialised softvol
+        # alone means leaving it at 100%.
+        saved = VOLUME_DEFAULT
+        source = "set to default"
+    try:
+        print(f"spc-agent: volume {source} {volume_set(saved)}%", flush=True)
+    except Exception as err:
+        # The usual cause is a softvol whose PCM has not been opened yet, so the
+        # control does not exist. Say so instead of dying before the HTTP server
+        # is even up — every other capability still works.
+        print(f"spc-agent: could not restore volume ({err})", flush=True)
 
 
 def playback_devices():
@@ -295,7 +561,7 @@ def capture_raw_gray():
         f"pixelformat={CAMERA_RAW_FORMAT}",
         "--stream-mmap=3", "--stream-to=-",
         f"--stream-count={CAMERA_RAW_WARMUP}",
-    ], TIMEOUTS["look"])
+    ], timeout_for("look"))
 
     if not out:
         raise RuntimeError(
@@ -357,7 +623,7 @@ def encode_jpeg(gray, width, height):
         "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-f", "rawvideo", "-pix_fmt", "gray", "-s", f"{width}x{height}",
         "-i", "-", "-frames:v", "1", "-f", "mjpeg", "-"
-    ], TIMEOUTS["look"], stdin=gray)
+    ], timeout_for("look"), stdin=gray)
 
 
 def capture_jpeg():
@@ -376,9 +642,9 @@ def capture_jpeg():
             # because v4l2 does not have avfoundation's warm-up problem.
             run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
                  "-f", "v4l2", "-i", CAMERA_DEVICE,
-                 "-vframes", "2", "-q:v", "3", out], TIMEOUTS["look"])
+                 "-vframes", "2", "-q:v", "3", out], timeout_for("look"))
         else:
-            run(["fswebcam", "-d", CAMERA_DEVICE, "--no-banner", "-q", out], TIMEOUTS["look"])
+            run(["fswebcam", "-d", CAMERA_DEVICE, "--no-banner", "-q", out], timeout_for("look"))
         with open(out, "rb") as fh:
             return fh.read()
 
@@ -388,13 +654,13 @@ def speak(text):
         wav = os.path.join(tmp, "say.wav")
         if TTS_CMD:
             cmd = [part.replace("{out}", wav) for part in TTS_CMD.split()]
-            run(cmd, TIMEOUTS["speak"], stdin=text.encode("utf-8"))
+            run(cmd, timeout_for("speak"), stdin=text.encode("utf-8"))
         else:
             engine = "espeak-ng" if have("espeak-ng") else "espeak"
-            run([engine, "-w", wav, text], TIMEOUTS["speak"])
+            run([engine, "-w", wav, text], timeout_for("speak"))
         # Blocks until the speaker has finished. mcp-core's contract promises
         # this, so that two replies in a row cannot overlap in the air.
-        run(["aplay", "-D", SPEAKER_DEVICE, "-q", wav], TIMEOUTS["speak"])
+        run(["aplay", "-D", SPEAKER_DEVICE, "-q", wav], timeout_for("speak"))
         # Returned so the caller learns WHERE the sound went. A bare
         # {"spoken": true} is close to worthless here: it is equally consistent
         # with a speaker in the room and with an HDMI port nobody is plugged
@@ -428,7 +694,7 @@ def sense():
         sensors["presence"] = read_gpio(PRESENCE_GPIO)
     if SENSE_CMD:
         try:
-            out = run(SENSE_CMD.split(), TIMEOUTS["sense"])
+            out = run(SENSE_CMD.split(), timeout_for("sense"))
             parsed = json.loads(out.decode("utf-8", "replace"))
             if isinstance(parsed, dict):
                 sensors.update(parsed)
@@ -498,12 +764,143 @@ def listen(timeout_s, silence_s):
 # The state is deliberately last-write-wins with a per-key merge: a caller that
 # sends only an expression must not blank the QR code someone is mid-scan of.
 
+# ---------------------------------------------------------------------------
+# What this screen can spell
+# ---------------------------------------------------------------------------
+# A panel renders whatever text it is handed, and any character it has no glyph
+# for comes out as '?'. That is the right fallback — a readable question mark
+# beats a blank — but it happens silently, so a model can write a Chinese menu
+# item, get updated:true back, and never learn that the customer is looking at
+# "?? ??". The glyph table is the one thing the device knows and mcp-core cannot
+# guess, so the device is what has to say it.
+#
+# Coverage here describes the FRAMEBUFFER renderer (spc_fb.py), which is what is
+# physically on the glass of both boards. A browser pointed at /face uses the
+# system's own fonts and will usually draw more than this reports; that is a
+# better-than-promised direction, and not worth a second, differently-wrong
+# number.
+try:
+    from cjk_font_data import GLYPHS as _CJK_GLYPHS
+    CJK_CODEPOINTS = frozenset(cp for cp, _ in _CJK_GLYPHS)
+except ImportError:
+    # gen_fb_cjk_font.py has not been run, or its output is not beside this
+    # file. Latin still draws; Chinese becomes '?'. Reported honestly as zero
+    # rather than assumed, because assuming coverage is how the silent failure
+    # above happens in the first place.
+    CJK_CODEPOINTS = frozenset()
+
+# The PSF console font spc_fb.py loads covers the low codepoints — 256 glyphs on
+# the fonts shipped for this, sometimes 512. Anything below this is treated as
+# drawable without inspecting the font file, which the agent does not load.
+# Erring low: a character wrongly called drawable is the failure that matters.
+CONSOLE_FONT_LIMIT = 0x100
+
+
+def undrawable(text):
+    """The distinct characters in `text` this screen has no glyph for.
+
+    Returned in the order first seen, so a caller reading the message left to
+    right meets them in the order they appear in their own string.
+    """
+    seen, out = set(), []
+    for ch in text or "":
+        cp = ord(ch)
+        if cp < CONSOLE_FONT_LIMIT or cp in CJK_CODEPOINTS:
+            continue
+        if ch in seen:
+            continue
+        seen.add(ch)
+        out.append(ch)
+    return out
+
+
+def panel_text(panel):
+    """Every string a panel will actually put on the glass.
+
+    Walks the whole structure rather than naming fields, because the modes carry
+    different keys and a new one must not quietly escape the coverage check.
+    Keys are skipped: qr_data is encoded, not drawn, and mode names are ours.
+    """
+    SKIP = {"mode", "qr_data", "id", "icon"}
+    out = []
+
+    def walk(node, key=None):
+        if isinstance(node, str):
+            if key not in SKIP:
+                out.append(node)
+        elif isinstance(node, dict):
+            for k, v in node.items():
+                walk(v, k)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v, key)
+
+    walk(panel or {})
+    return out
+
+
+def text_coverage():
+    """What this screen can spell, for /health."""
+    return {
+        "cjk_glyphs": len(CJK_CODEPOINTS),
+        "latin": True,
+        "renderer": "framebuffer",
+        "note": (
+            "Characters outside this set render as '?'. cjk_glyphs is a curated "
+            "subset, not all of Unicode CJK — send text through /display and read "
+            "`undrawable` in the reply to know about a specific string."
+            if CJK_CODEPOINTS else
+            "No CJK glyph table on this device — Chinese and other non-Latin text "
+            "renders as '?'. Run gen_fb_cjk_font.py and deploy cjk_font_data.py "
+            "beside spc_fb.py to fix."
+        ),
+    }
+
+
 PANEL_MODES = ("message", "qr", "choices", "order", "blank")
 
-EXPRESSIONS = ("neutral", "happy", "listening", "thinking", "speaking",
-               "confused", "sad", "wink", "sleeping", "error")
-
 GAZES = ("center", "left", "right", "up", "down")
+
+# The expressions this device can draw are JSON files now, not a tuple here.
+# spc_expressions.py finds them, falls back to its own ten builtins when the
+# directory is missing, and reports what it could not parse instead of raising —
+# one malformed file a user just wrote must not stop the agent from booting.
+#
+# CATALOG is swapped wholesale on reload rather than mutated, so a request that
+# is mid-validation keeps reading a consistent set.
+CATALOG = spc_expressions.load() if spc_expressions else None
+CATALOG_VERSION = 0
+CATALOG_LOCK = threading.Lock()
+
+for _problem in (CATALOG.problems if CATALOG else
+                 ["spc_expressions.py is not installed beside spc_agent.py — "
+                  "expression names cannot be validated and /expressions is unavailable. "
+                  "Copy it over; the screen itself still works."]):
+    print(f"expression problem: {_problem}", flush=True)
+
+
+def expressions_reload():
+    """Re-scan the expression directories. Returns the new catalog.
+
+    Bumps the screen version too, which is what pushes the change out to both
+    renderers: they are already long-polling /display/state, so a face added on
+    a wall-mounted panel appears without anyone restarting anything.
+    """
+    global CATALOG, CATALOG_VERSION
+    if spc_expressions is None:
+        raise RuntimeError("spc_expressions.py is not installed beside spc_agent.py")
+    catalog = spc_expressions.load()
+    with CATALOG_LOCK:
+        CATALOG = catalog
+        CATALOG_VERSION += 1
+    for problem in catalog.problems:
+        print(f"expression problem: {problem}", flush=True)
+    with SCREEN_COND:
+        SCREEN["version"] += 1
+        SCREEN["expressions_version"] = CATALOG_VERSION
+        SCREEN["ts"] = time.time()
+        SCREEN_COND.notify_all()
+    return catalog
 
 SCREEN = {
     "expression": "neutral",
@@ -514,6 +911,10 @@ SCREEN = {
     # a page that missed three updates while unplugged skips straight to the
     # current one instead of replaying them.
     "version": 0,
+    # Which generation of the expression directory the renderers should be
+    # drawing from. Separate from `version` because the two change for different
+    # reasons: `version` says the face changed, this says the vocabulary did.
+    "expressions_version": 0,
     "ts": 0.0,
 }
 
@@ -538,8 +939,12 @@ def screen_update(patch):
     gaze = patch.get("gaze")
     panel = patch.get("panel")
 
-    if expression is not None and expression not in EXPRESSIONS:
-        raise ValueError(f"unknown expression '{expression}' — use one of: {', '.join(EXPRESSIONS)}")
+    if expression is not None and CATALOG is not None and expression not in CATALOG:
+        raise ValueError(
+            f"unknown expression '{expression}' — this device draws: "
+            f"{', '.join(CATALOG.names())}. Add one by dropping a JSON file in "
+            f"{search_dirs_hint()} and calling POST /expressions/reload."
+        )
     if gaze is not None and gaze not in GAZES:
         raise ValueError(f"unknown gaze '{gaze}' — use one of: {', '.join(GAZES)}")
     if panel is not None:
@@ -562,6 +967,7 @@ def screen_update(patch):
             # rendered by accident.
             SCREEN["panel"] = panel
         SCREEN["version"] += 1
+        SCREEN["expressions_version"] = CATALOG_VERSION
         SCREEN["ts"] = time.time()
         SCREEN_COND.notify_all()
         return json.loads(json.dumps(SCREEN))
@@ -645,11 +1051,25 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": True,
                 "id": DEVICE_ID,
                 "capabilities": caps,
-                "missing": {c: missing_reason(c) for c in ("look", "speak", "sense", "listen", "screen") if c not in caps},
+                "missing": {c: missing_reason(c) for c in ("look", "speak", "sense", "listen", "screen", "volume") if c not in caps},
                 "auth": bool(FLEET_TOKEN),
+                # The revision only — not the values, which are behind the token
+                # at /settings. Enough for the server to spot a Pi that came back
+                # from a reboot holding older tuning, without making an open
+                # endpoint describe how this device is configured.
+                "settings_rev": SETTINGS_REVISION,
                 "speaker_device": SPEAKER_DEVICE,
                 "mic_device": MIC_DEVICE,
                 "audio_out": playback_devices(),
+                # Only meaningful for a device with a screen, and omitted rather
+                # than sent as zeroes otherwise — an absent key reads as "not
+                # applicable", where "cjk_glyphs: 0" reads as "broken font".
+                **({"text": text_coverage()} if "screen" in caps else {}),
+                # What this device can actually draw. Sent for the same reason
+                # `text` is: the expression list is now per-device — a user can
+                # add to it — so mcp-core cannot know it from its own config,
+                # and a model choosing an argument has to be able to ask.
+                **({"expressions": CATALOG.names()} if "screen" in caps and CATALOG else {}),
             })
 
         # /face and /display/state are open for the same reason /health is: the
@@ -664,6 +1084,45 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(500, b"face page not installed - copy spc_face.py next to spc_agent.py",
                                   "text/plain; charset=utf-8")
             return self._send(200, FACE_HTML.encode("utf-8"), "text/html; charset=utf-8",
+                              {"Cache-Control": "no-store"})
+
+        # Open for the same reason /health is: a wall-mounted web UI needs to draw
+        # the slider in the right position on load, and the current loudness of a
+        # speaker in a public room is not a secret. CHANGING it still needs auth.
+        if path == "/volume":
+            if not self._require("volume"):
+                return
+            try:
+                return self._json(200, {
+                    "volume": volume_get(),
+                    "control": VOLUME_CONTROL,
+                    "card": VOLUME_CARD or "(default)",
+                })
+            except Exception as err:
+                return self._json(500, {"error": str(err)})
+
+        # Open alongside /face and /display/state: the two renderers fetch this
+        # to know what they can draw, and neither can attach a header. It lists
+        # the shapes of faces on a screen anyone in the room is already looking
+        # at, so there is nothing here to keep back.
+        if path == "/expressions":
+            if not self._require("screen"):
+                return
+            if CATALOG is None:
+                return self._json(500, {"error": "spc_expressions.py is not installed beside spc_agent.py"})
+            body = CATALOG.to_json()
+            body["version"] = CATALOG_VERSION
+            return self._json(200, body, headers={"Cache-Control": "no-store"})
+
+        # The picker. Same reasoning as /face — it is a page, and every action
+        # it can take goes back through an authenticated POST.
+        if path == "/faces":
+            if not self._require("screen"):
+                return
+            if PICKER_HTML is None:
+                return self._send(500, b"picker page not installed - copy spc_picker.py next to spc_agent.py",
+                                  "text/plain; charset=utf-8")
+            return self._send(200, PICKER_HTML.encode("utf-8"), "text/html; charset=utf-8",
                               {"Cache-Control": "no-store"})
 
         if path == "/display/state":
@@ -703,13 +1162,81 @@ class Handler(BaseHTTPRequestHandler):
                 "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             })
 
-        return self._json(404, {"error": f"no route {path}. Try /health, /look, /sense, /face, /display, /display/state."})
+        # What this Pi is currently tuned to. Behind the token, unlike /health,
+        # because it is the read half of a write endpoint and there is no reason
+        # for it to be more open than the write.
+        if path == "/settings":
+            if not self._authorized():
+                return self._json(401, {"error": "missing or wrong X-Fleet-Token"})
+            return self._json(200, {"revision": SETTINGS_REVISION, "settings": dict(SETTINGS)})
+
+        return self._json(404, {"error": f"no route {path}. Try /health, /look, /sense, /face, /faces, /display, /display/state, /expressions, /settings, /volume."})
+
+    def do_PATCH(self):
+        """Runtime settings push from mcp-core.
+
+        PATCH rather than POST because it is a merge: keys left out keep their
+        current values, which is what lets the server push only the device-scoped
+        subset without having to know, or restate, everything else this Pi holds.
+        """
+        path = self.path.split("?")[0]
+        if not self._authorized():
+            return self._json(401, {"error": "missing or wrong X-Fleet-Token"})
+        if path != "/settings":
+            return self._json(404, {"error": f"no PATCH route {path}. Only /settings accepts PATCH."})
+        body = self._body()
+        values = body.get("settings", body) if isinstance(body, dict) else {}
+        if not isinstance(values, dict):
+            return self._json(400, {"error": "body must be a JSON object of { key: value }"})
+        changed = settings_apply(values, body.get("revision", 0) if isinstance(body, dict) else 0)
+        # `ignored` is reported rather than swallowed so a newer mcp-core pushing
+        # a knob this build predates shows up as a fact in the reply, instead of
+        # a setting that appears to have been accepted and does nothing.
+        ignored = [k for k in values if k not in SETTING_DEFAULTS]
+        return self._json(200, {
+            "revision": SETTINGS_REVISION,
+            "changed": changed,
+            "ignored": ignored,
+            "settings": dict(SETTINGS),
+        })
 
     def do_POST(self):
         path = self.path.split("?")[0]
         if not self._authorized():
             return self._json(401, {"error": "missing or wrong X-Fleet-Token"})
         body = self._body()
+
+        if path == "/volume":
+            if not self._require("volume"):
+                return
+            level = body.get("level", body.get("volume"))
+            if level is None:
+                return self._json(400, {"error": "level is required, 0-100"})
+            try:
+                level = int(level)
+            except (TypeError, ValueError):
+                return self._json(400, {"error": f"level must be a number 0-100, got {level!r}"})
+            try:
+                return self._json(200, {"volume": volume_set(level), "requested": level})
+            except Exception as err:
+                return self._json(500, {"error": str(err)})
+
+        # Rescan the expression directories. A POST rather than a GET because it
+        # is what publishes a new face to the glass, and because that makes it
+        # land behind the token like every other change to what the screen shows.
+        if path == "/expressions/reload":
+            if not self._require("screen"):
+                return
+            try:
+                catalog = expressions_reload()
+            except RuntimeError as err:
+                return self._json(500, {"error": str(err)})
+            return self._json(200, {
+                "reloaded": True,
+                "version": CATALOG_VERSION,
+                "expressions": catalog.names(),
+                "problems": catalog.problems,
+            })
 
         if path == "/speak":
             if not self._require("speak"):
@@ -734,8 +1261,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/listen":
             if not self._require("listen"):
                 return
-            timeout_s = min(max(float(body.get("timeout_s") or 10), 1), 60)
-            silence_s = min(max(float(body.get("silence_s") or 1.2), 0.2), 5)
+            # An explicit argument still wins — a caller who says "give me 30
+            # seconds" has a reason. Omitting it now means "use this Pi's
+            # configured default" rather than a literal buried here, so the
+            # auto-stop tuning has one home and mcp-core can move it.
+            timeout_s = min(max(float(body.get("timeout_s") or setting("spc.listen_timeout_s")), 1), 60)
+            silence_s = min(max(float(body.get("silence_s") or setting("spc.listen_silence_s")), 0.2), 5)
             try:
                 wav = listen(timeout_s, silence_s)
             except Exception as err:
@@ -758,12 +1289,19 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as err:
                 return self._json(400, {"error": str(err)})
             panel_mode = state["panel"].get("mode")
-            print(f"screen v{state['version']}: {state['expression']} / {panel_mode}", flush=True)
+            # Reported, never rejected. The panel is already up by the time this
+            # is computed and '?' is a better answer than a 400 — but the caller
+            # is told, because the alternative is a model that believes it wrote
+            # Chinese to a screen showing question marks.
+            missing = undrawable("".join(panel_text(state["panel"])))
+            print(f"screen v{state['version']}: {state['expression']} / {panel_mode}"
+                  + (f" [undrawable: {''.join(missing)}]" if missing else ""), flush=True)
             return self._json(200, {
                 "updated": True,
                 "version": state["version"],
                 "expression": state["expression"],
                 "panel_mode": panel_mode,
+                **({"undrawable": "".join(missing)} if missing else {}),
             })
 
         return self._json(404, {"error": f"no route {path}. Try /speak, /listen, /display."})
@@ -777,10 +1315,14 @@ def main():
         print(f"  auth         {'ON' if FLEET_TOKEN else 'OFF (set SPC_FLEET_TOKEN)'}")
         print(f"  mic          {MIC_DEVICE}")
         print(f"  speaker      {SPEAKER_DEVICE}")
+        print(f"  volume       {VOLUME_CONTROL or '(none configured)'}"
+              f"{' on card ' + VOLUME_CARD if VOLUME_CARD else ''}"
+              f"{f', default {VOLUME_DEFAULT}%' if VOLUME_CONTROL else ''}")
         print(f"  camera       {CAMERA_DEVICE}")
         print(f"  screen       {'yes' if have_screen() else 'no'}")
+        print(f"  cjk glyphs   {len(CJK_CODEPOINTS) or 'none — non-Latin text renders as ?'}")
         print(f"  capabilities {', '.join(capabilities()) or 'none'}")
-        for cap in ("look", "speak", "sense", "listen", "screen"):
+        for cap in ("look", "speak", "sense", "listen", "screen", "volume"):
             if cap not in capabilities():
                 print(f"    {cap}: {missing_reason(cap)}")
         return
@@ -788,15 +1330,27 @@ def main():
     caps = capabilities()
     print(f"spc-agent {DEVICE_ID} on {HOST}:{PORT}", flush=True)
     print(f"  capabilities: {', '.join(caps) or 'NONE — nothing is wired up'}", flush=True)
-    for cap in ("look", "speak", "sense", "listen", "screen"):
+    for cap in ("look", "speak", "sense", "listen", "screen", "volume"):
         if cap not in caps:
             print(f"  no {cap}: {missing_reason(cap)}", flush=True)
     if "screen" in caps:
         print(f"  face page: http://localhost:{PORT}/face", flush=True)
         if FACE_HTML is None:
             print("  WARNING: spc_face.py is missing next to this script — /face has nothing to serve.", flush=True)
+        if CJK_CODEPOINTS:
+            print(f"  text: Latin + {len(CJK_CODEPOINTS)} CJK glyphs", flush=True)
+        else:
+            print("  text: Latin only — no cjk_font_data.py beside this script, so Chinese "
+                  "renders as '?'. Run gen_fb_cjk_font.py and deploy its output.", flush=True)
     if not FLEET_TOKEN:
         print("  WARNING: no SPC_FLEET_TOKEN — anyone who can reach this port can open the mic.", flush=True)
+    # Before volume_restore() and before serving: every timeout below reads
+    # through these, so loading them late would mean the first command of the
+    # day ran on defaults this Pi was explicitly told not to use.
+    settings_load()
+    # After the banner so its failure message has context, and before serving so
+    # the first /speak of the day is not at whatever level the last boot left.
+    volume_restore()
     # Threading matters: /speak and /listen both block for many seconds, and a
     # single-threaded server would make a health check queue behind them.
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()

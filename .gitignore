@@ -74,6 +74,11 @@ compile_commands.json
 listen_v2/main/wifi_config.h
 # runtime config: LAN IPs / webhook URLs (config.example.json is the template)
 config.json
+# runtime setting OVERRIDES, written by the server as knobs are tuned. Ignored
+# for the same reason config.json is — it is per-install state, not source. The
+# CATALOG (mcp-core/settings-spec.json) IS committed: it carries the defaults,
+# ranges and documentation, so a fresh clone has every knob at its shipped value.
+settings.json
 
 # =========================
 # External repositories

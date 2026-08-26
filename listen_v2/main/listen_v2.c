@@ -3,7 +3,7 @@
 //
 // Controls:
 //   TOUCH SCREEN       — the primary control. TAP the idle screen to start a
-//                        listen turn (up to MAX_RECORD_SECONDS, auto-stops on
+//                        listen turn (up to listen.max_record_seconds, auto-stops on
 //                        silence or a tap while recording) and it goes
 //                        straight to the backend — no separate confirm/send
 //                        step. HOLD the BUSY badge 1.5s to end a session by
@@ -15,8 +15,10 @@
 //                        actual mic on/off each press, so it can't reliably
 //                        start a listen turn (muted the mic every other press).
 //                        Left as the privacy mute it physically is.
-// Recording auto-stops after VAD_SILENCE_HOLD_MS of silence following detected
-// speech, or hits MAX_RECORD_SECONDS as an absolute safety cap.
+// Recording auto-stops after listen.silence_hold_ms of silence following
+// detected speech, or hits listen.max_record_seconds as an absolute safety cap.
+// Both are runtime settings pushed by the server, not compile-time constants —
+// see box_settings.h.
 //
 // Mic path fixes (see notes): new I2C master driver (not legacy), DUPLEX I2S so
 // the ES7210 gets a stable MCLK, I2S Std Philips mono 16-bit. Console on
@@ -27,6 +29,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdlib.h>   // strtoul, for the settings push's revision header
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -48,6 +51,7 @@
 #include "display.h"
 #include "provisioning.h"
 #include "box_actions.h"
+#include "box_settings.h"
 #include "ws_client.h"
 #include "esp_timer.h"
 #include "mdns.h"
@@ -69,7 +73,7 @@ static volatile TickType_t s_caption_at_tick = 0;
 static volatile TickType_t s_upload_done_tick = 0;
 
 // A recording now goes straight to the backend the moment it ends (VAD
-// silence, a manual tap, or the MAX_RECORD_SECONDS cap) — there is no
+// silence, a manual tap, or the listen.max_record_seconds cap) — there is no
 // separate tap-to-confirm step any more. Mishearings are corrected
 // conversationally through the agent instead of gated by a screen tap.
 
@@ -77,7 +81,7 @@ static volatile TickType_t s_upload_done_tick = 0;
 // A "session" is one customer. It starts when the presence radar first sees
 // someone (greet ONCE) or when they simply start ordering by touch/BOOT (no
 // greeting — they're already talking to us). It ends when the radar has seen
-// nobody for SESSION_ABSENT_MS, which resets the conversation server-side so
+// nobody for session.absent_ms, which resets the conversation server-side so
 // the next customer is greeted fresh and never inherits the previous order.
 //
 // This replaces a bare 20s greet cooldown, which only approximated a session:
@@ -92,7 +96,10 @@ static volatile TickType_t s_upload_done_tick = 0;
 // a fresh session and re-greeted them (4 greetings in 70s). So the timer is
 // longer AND, more importantly, it is fed by interaction as well as radar:
 // a customer who is tapping, talking or confirming is obviously present.
-#define SESSION_ABSENT_MS 30000
+//
+// Now a runtime setting (session.absent_ms) rather than a constant — the right
+// number depends on where the box is standing and what the radar can see from
+// there, which is not something a firmware release can know. See box_settings.h.
 static volatile bool s_session_active = false;
 // Last moment we had ANY evidence of the customer — radar presence or a
 // deliberate interaction. Sessions end relative to this, not to radar alone.
@@ -150,31 +157,21 @@ static char s_ws_url[120] = "";
 #define PIN_MUTE_BTN    1
 
 // ---- Recording params ----
+// The wire format is fixed by what the STT model expects, so these stay
+// compiled in. The TUNING that sits on top of them — gain, thresholds, how long
+// a turn may run — moved to box_settings.h, because those are properties of the
+// room the box is standing in, not of the audio pipeline.
 #define SAMPLE_RATE     16000
 #define BITS_PER_SAMPLE 16
 #define CHANNELS        1
-#define MIC_GAIN_DB     30.0f
-// Press-to-start recording, auto-stops on silence (voice-activity detection).
-// Manual tap-to-stop and this MAX cap both still work as fallbacks.
-#define MAX_RECORD_SECONDS 20   // hard cap on a single listen turn
-
-// --- Voice-activity auto-stop tuning ---
-// VAD_SILENCE_PEAK: below this int16 peak, a chunk counts as "quiet". Raised
-// from 400 to 1500 after MEASURING the real ambient noise floor on-site
-// (median ~646, p90 ~1360, occasional spikes to ~3800 with MIC_GAIN_DB=30) —
-// at 400 background noise never dropped below the threshold, so it never
-// auto-stopped. At 1500 most ambient counts as quiet. In genuinely loud rooms
-// the noise still overlaps speech and auto-stop can lag; the tap-to-stop
-// override in the record loop is the reliable manual backup there.
-#define VAD_SILENCE_PEAK      1500
-// How many consecutive quiet chunks (~32ms each) after real speech before we
-// consider the user done talking and auto-stop.
-#define VAD_SILENCE_HOLD_MS   1200
-// How many consecutive loud chunks are needed to confirm "speech actually
-// started" (filters out a single click/pop from falsely arming the timer).
-#define VAD_SPEECH_CONFIRM_CHUNKS 3
 #define VAD_CHUNK_MS           32   // 1024 bytes @ 16kHz/16-bit mono ≈ 32ms
-#define MAX_RECORD_BYTES  ((uint32_t)SAMPLE_RATE * MAX_RECORD_SECONDS * (BITS_PER_SAMPLE/8) * CHANNELS)
+
+// The recording buffer is allocated once, at this ceiling, and
+// listen.max_record_seconds shortens turns within it. Sizing the buffer from a
+// runtime setting instead would mean a reallocation — of ~640KB of PSRAM — in
+// the middle of a conversation, on a box whose memory is already the tightest
+// resource it has.
+#define MAX_RECORD_BYTES  ((uint32_t)SAMPLE_RATE * BOX_MAX_RECORD_SECONDS_CEIL * (BITS_PER_SAMPLE/8) * CHANNELS)
 
 static const char *TAG = "listen_v2";
 
@@ -228,22 +225,26 @@ i2c_master_bus_handle_t bsp_i2c_bus(void) { return s_i2c_bus; }
 
 // How long the BUSY badge must be held to end a session by hand. Long enough
 // that a customer brushing the corner cannot trigger it, short enough that a
-// waiter clearing a table does not think it is broken.
-#define BADGE_HOLD_MS 1500
+// waiter clearing a table does not think it is broken. Tunable at runtime as
+// screen.badge_hold_ms.
 
 // Watch a finger already resting on the badge. Returns true only if it stays
-// down for the full hold. Blocking on purpose — it lasts at most 1.5s, mirrors
-// how the 5s BOOT hold is timed, and nothing else in the idle loop is urgent.
+// down for the full hold. Blocking on purpose — it lasts at most a second or
+// two, mirrors how the 5s BOOT hold is timed, and nothing else in the idle loop
+// is urgent.
 static bool badge_hold_completed(void)
 {
     const TickType_t start = xTaskGetTickCount();
+    // Read once: a push landing mid-hold must not move the finish line under a
+    // finger that is already down.
+    const int32_t hold_ms = box_settings()->badge_hold_ms;
     bool acked = false;
-    while ((int32_t)(xTaskGetTickCount() - start) < pdMS_TO_TICKS(BADGE_HOLD_MS)) {
+    while ((int32_t)(xTaskGetTickCount() - start) < pdMS_TO_TICKS(hold_ms)) {
         if (!touch_is_pressed()) return false;      // released early: just a tap
         // Confirm the hold registered at the halfway mark, so a waiter is not
         // holding a screen that gives no sign of listening. Drawn once, not per
         // poll — repainting at 20Hz would flicker.
-        if (!acked && (int32_t)(xTaskGetTickCount() - start) >= pdMS_TO_TICKS(BADGE_HOLD_MS / 2)) {
+        if (!acked && (int32_t)(xTaskGetTickCount() - start) >= pdMS_TO_TICKS(hold_ms / 2)) {
             acked = true;
             display_badge("HOLD", COL_WARN);
         }
@@ -442,8 +443,6 @@ static void wifi_scan_log(void)
 // already been told it would help.
 #define DEFAULT_HELP_URL "https://claude.ai/code/artifact/3bde646b-0200-4437-9a17-b180b3a215bf"
 
-#define HELP_SCREEN_MAX_MS 60000
-
 // "Tap RST twice" -> put the setup guide on screen as a QR. Dismissed by a tap
 // or by the timeout, then boot continues exactly as it would have; nothing here
 // changes state, so triggering it by accident costs a few seconds and nothing
@@ -466,9 +465,12 @@ static void show_help_qr_if_double_reset(void)
     }
     ESP_LOGI(TAG, "help QR on screen (%s) — tap to dismiss", url);
 
+    // Runtime setting (screen.help_max_ms), read once so the countdown a person
+    // is watching cannot be changed out from under them mid-scan.
     TickType_t start = xTaskGetTickCount();
+    const int32_t help_max_ms = box_settings()->help_max_ms;
     int x, y;
-    while ((xTaskGetTickCount() - start) < pdMS_TO_TICKS(HELP_SCREEN_MAX_MS)) {
+    while ((xTaskGetTickCount() - start) < pdMS_TO_TICKS(help_max_ms)) {
         if (touch_get_tap(&x, &y)) break;
         // BOOT is pulled up, so LOW = pressed. Reading it directly keeps this
         // working on a box whose touch panel wasn't detected.
@@ -663,13 +665,20 @@ static void register_with_core(void)
     // place for them: it happens on every boot, including the boot that follows
     // a rollback — which is the one where the reported build silently stops
     // matching the build that was pushed.
-    char body[320];
+    //
+    // settings_rev rides along for the same reason: this is the first thing the
+    // box says after a reboot, so it is the earliest possible moment the server
+    // can notice that a box came back holding tuning older than the current
+    // revision — and re-push it before the first customer of the day.
+    char body[352];
     int len = snprintf(body, sizeof(body),
                        "{\"box_id\":\"%s\",\"name\":\"%s\",\"ip\":\"%s\","
-                       "\"fw\":\"%s\",\"fw_sha\":\"%s\",\"slot\":\"%s\",\"pending_verify\":%s}",
+                       "\"fw\":\"%s\",\"fw_sha\":\"%s\",\"slot\":\"%s\",\"pending_verify\":%s,"
+                       "\"settings_rev\":%u}",
                        s_box_id, s_box_name[0] ? s_box_name : s_box_id, s_ip_str,
                        ota_running_version(), ota_running_sha(), ota_running_slot(),
-                       ota_pending_verify() ? "true" : "false");
+                       ota_pending_verify() ? "true" : "false",
+                       (unsigned)box_settings_revision());
     esp_http_client_config_t cfg = { .url = s_register_url,
                                      .method = HTTP_METHOD_POST, .timeout_ms = 5000 };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
@@ -730,9 +739,20 @@ static void record_toggle_and_send(const char *rec_line2)
         .bits_per_sample = BITS_PER_SAMPLE, .channel = CHANNELS, .sample_rate = SAMPLE_RATE,
     };
     ESP_ERROR_CHECK(esp_codec_dev_open(s_mic, &mic_fs));
-    esp_codec_dev_set_in_gain(s_mic, MIC_GAIN_DB);
-    ESP_LOGI(TAG, ">>> recording (auto-stops after %dms silence, or tap REC, max %ds) <<<",
-            VAD_SILENCE_HOLD_MS, MAX_RECORD_SECONDS);
+
+    // Snapshotted for this turn. A settings push landing mid-recording must not
+    // move the auto-stop threshold while someone is halfway through a sentence
+    // — the customer would experience it as the box behaving differently within
+    // one breath, which is the least debuggable kind of bug there is. The new
+    // values take effect on the next turn, milliseconds later.
+    const box_settings_t set = *box_settings();
+    esp_codec_dev_set_in_gain(s_mic, set.mic_gain_db);
+    // The runtime cap, which may be shorter than the buffer we allocated but
+    // can never be longer (box_settings clamps it to the ceiling).
+    const uint32_t max_bytes =
+        (uint32_t)SAMPLE_RATE * (uint32_t)set.max_record_seconds * (BITS_PER_SAMPLE / 8) * CHANNELS;
+    ESP_LOGI(TAG, ">>> recording (auto-stops after %dms silence below peak %d, or tap REC, max %ds) <<<",
+            (int)set.silence_hold_ms, (int)set.silence_peak, (int)set.max_record_seconds);
     display_status("REC", rec_line2, COL_REC);
 
     const uint32_t chunk = 1024;
@@ -742,7 +762,7 @@ static void record_toggle_and_send(const char *rec_line2)
     int speech_run = 0;        // consecutive loud chunks (confirms real speech, not a click)
     bool speech_started = false;
     uint32_t silence_ms = 0;
-    while (s_record_len + chunk <= MAX_RECORD_BYTES) {
+    while (s_record_len + chunk <= max_bytes) {
         // Tight, back-to-back read — nothing slow in between.
         if (esp_codec_dev_read(s_mic, tmp, chunk) == 0) {
             memcpy(s_record_buf + s_record_len, tmp, chunk);
@@ -753,8 +773,8 @@ static void record_toggle_and_send(const char *rec_line2)
                 int v = sm[i]; if (v < 0) v = -v; if (v > peak) peak = v;
             }
 
-            if (peak > VAD_SILENCE_PEAK) {
-                if (++speech_run >= VAD_SPEECH_CONFIRM_CHUNKS) speech_started = true;
+            if (peak > set.silence_peak) {
+                if (++speech_run >= set.speech_confirm_chunks) speech_started = true;
                 silence_ms = 0;
             } else {
                 speech_run = 0;
@@ -766,7 +786,7 @@ static void record_toggle_and_send(const char *rec_line2)
                         (unsigned)call_ctr, peak, (unsigned)s_record_len, speech_started, (unsigned)silence_ms);
             }
 
-            if (speech_started && silence_ms >= VAD_SILENCE_HOLD_MS) {
+            if (speech_started && silence_ms >= (uint32_t)set.silence_hold_ms) {
                 ESP_LOGI(TAG, "auto-stop: %ums silence after speech", (unsigned)silence_ms);
                 break;
             }
@@ -1346,6 +1366,39 @@ static esp_err_t order_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+// Runtime settings push: newline-separated "key|value" lines, the server's
+// dotted key names verbatim. Same shape as /order, and for the same reason —
+// this firmware links no JSON parser, and adding one to carry eight integers
+// would cost internal SRAM the TLS buffers already need.
+//
+// Answers with the revision it now holds, so the server learns whether the push
+// landed from the response rather than from a follow-up poll.
+static esp_err_t settings_handler(httpd_req_t *req)
+{
+    if (!fleet_authed(req)) return fleet_deny(req);
+    static char body[512];   // static: keeps httpd task stack small
+    int len = req->content_len;
+    if (len < 0) len = 0;
+    if (len > (int)sizeof(body) - 1) len = sizeof(body) - 1;
+    int got = 0;
+    while (got < len) {
+        int r = httpd_req_recv(req, body + got, len - got);
+        if (r <= 0) break;
+        got += r;
+    }
+    body[got] = 0;
+
+    char rev[16] = "0";
+    httpd_req_get_hdr_value_str(req, "X-Settings-Rev", rev, sizeof(rev));
+    int changed = box_settings_apply(body, (uint32_t)strtoul(rev, NULL, 10));
+
+    char reply[64];
+    snprintf(reply, sizeof(reply), "ok rev=%u changed=%d",
+             (unsigned)box_settings_revision(), changed);
+    httpd_resp_sendstr(req, reply);
+    return ESP_OK;
+}
+
 // /health, /register and /wake all live next to /upload on the same
 // server, so they're derived from post_url (which carries the real host AND
 // port). Re-run whenever post_url changes so a repointed box updates every URL
@@ -1518,6 +1571,12 @@ static void start_http_server(void)
     cfg.stack_size = 8192;
     cfg.recv_wait_timeout = 20;
     cfg.lru_purge_enable = true;
+    // The default is 8 and we now register 7. Raised deliberately, because
+    // running out here fails in the worst possible way: httpd_register_uri_handler
+    // returns ESP_ERR_HTTPD_HANDLERS_FULL, nothing below checks it, and the
+    // route simply does not exist — a box that answers every other request
+    // perfectly while one feature is silently missing. Each slot is a few bytes.
+    cfg.max_uri_handlers = 12;
     if (httpd_start(&server, &cfg) == ESP_OK) {
         httpd_uri_t play = { .uri = "/play", .method = HTTP_POST, .handler = play_handler };
         httpd_register_uri_handler(server, &play);
@@ -1529,6 +1588,8 @@ static void start_http_server(void)
         httpd_register_uri_handler(server, &srv);
         httpd_uri_t sess = { .uri = "/session", .method = HTTP_POST, .handler = session_handler };
         httpd_register_uri_handler(server, &sess);
+        httpd_uri_t setg = { .uri = "/settings", .method = HTTP_POST, .handler = settings_handler };
+        httpd_register_uri_handler(server, &setg);
         httpd_uri_t ota = { .uri = "/ota", .method = HTTP_POST, .handler = ota_handler };
         httpd_register_uri_handler(server, &ota);
         ESP_LOGI(TAG, "TALK server up: POST a WAV to http://%s/play", s_ip_str);
@@ -1547,6 +1608,12 @@ void app_main(void)
         nerr = nvs_flash_init();
     }
     ESP_ERROR_CHECK(nerr);
+
+    // Immediately after NVS and before ANY of the code that reads a setting.
+    // show_help_qr_if_double_reset() below is the first such reader and it runs
+    // only a few lines down, so there is no window in which a default is used
+    // in place of a value this box has actually been given.
+    box_settings_load();
 
     i2c_init();
     display_init();
@@ -1611,6 +1678,33 @@ void app_main(void)
     // through resolve_mdns_host() unchanged, so both forms keep working.
     if (mdns_init() == ESP_OK) {
         mdns_hostname_set(s_box_id);   // makes the box itself discoverable too, for free
+        // ...but a hostname is only findable by something that already knows
+        // the name to ask for, which for a box nobody has adopted yet is
+        // nothing. Advertising a SERVICE makes the box enumerable: mcp-core
+        // browses _espbox._tcp and lists whatever answers (discovery.js), so a
+        // new box shows up on the setup page by itself instead of having to be
+        // hunted down by ARP-scanning the subnet for Espressif MAC prefixes —
+        // which cannot see across a subnet and cannot tell you WHICH box it
+        // found. The TXT records carry that: identity, not just an address.
+        //
+        // Port 80 is where start_http_server() below listens, and is what the
+        // server dials for /play, /caption, /order and /server.
+        mdns_txt_item_t txt[] = {
+            { "id",   s_box_id },
+            { "name", s_box_name[0] ? s_box_name : s_box_id },
+            { "fw",   ota_running_version() },
+        };
+        esp_err_t merr = mdns_service_add(NULL, "_espbox", "_tcp", 80,
+                                          txt, sizeof(txt) / sizeof(txt[0]));
+        if (merr != ESP_OK) {
+            // Non-fatal by design: discovery is a convenience for setup, and a
+            // box that cannot advertise is still fully usable once adopted by
+            // address. Logged because otherwise "it never appears on the setup
+            // page" has no visible cause.
+            ESP_LOGW(TAG, "mDNS service advertise failed: %s", esp_err_to_name(merr));
+        } else {
+            ESP_LOGI(TAG, "advertising _espbox._tcp as \"%s\"", s_box_id);
+        }
     }
     char resolved_post_url[sizeof(s_post_url)];
     resolve_mdns_host(s_post_url, resolved_post_url, sizeof(resolved_post_url));
@@ -1723,7 +1817,8 @@ void app_main(void)
             note_activity();   // someone is definitely here, whatever radar says
             // Staff gesture: HOLD the BUSY badge to end the session by hand,
             // for when a customer walks off and the radar has not timed out
-            // yet (SESSION_ABSENT_MS is 30s, and it is fed by interaction, so
+            // yet (session.absent_ms defaults to 30s, and it is fed by
+            // interaction, so
             // a lingering group can hold a box "busy" far longer).
             //
             // It has to be intercepted HERE, before start_listening(), because
@@ -1784,7 +1879,7 @@ void app_main(void)
             }
         } else if (s_session_active && s_radar_seen &&
                    (int32_t)(xTaskGetTickCount() - s_last_seen_tick) >=
-                       pdMS_TO_TICKS(SESSION_ABSENT_MS)) {
+                       pdMS_TO_TICKS(box_settings()->session_absent_ms)) {
             // No radar presence AND no interaction for the whole window.
             s_session_active = false;
             ESP_LOGI(TAG, "session end (customer left) — resetting conversation");

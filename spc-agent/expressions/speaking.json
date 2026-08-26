@@ -1,0 +1,12 @@
+{
+  "name": "speaking",
+  "label": "Speaking",
+  "emoji": "💬",
+  "description": "Open mouth, which the browser page animates while it talks.",
+  "eyes": {
+    "left": "open",
+    "right": "open"
+  },
+  "brow": "flat",
+  "mouth": "open"
+}

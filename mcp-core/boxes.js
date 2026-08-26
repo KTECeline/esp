@@ -93,7 +93,13 @@ export class BoxRegistry {
       // Which firmware the box reported at its last /register. Live-only for
       // the same reason as `occupied`, and null until it registers — boxes on
       // pre-OTA firmware never send it, so null means "unknown", not "stale".
-      fw: null
+      fw: null,
+      // Which runtime-settings revision this box is known to have applied.
+      // null = unknown, which is the correct starting state after a restart:
+      // the box may well be up to date, but this process has not verified it,
+      // and re-pushing to a box that already agrees is cheap. Assuming it were
+      // current would leave a box quietly running old tuning forever.
+      settingsRev: null
     }));
   }
 
@@ -138,7 +144,8 @@ export class BoxRegistry {
     const host = ip.split(":")[0];
     const existing = this.byId(id);
     if (!existing) {
-      this.boxes.push({ id, name: name || id, ip, host });
+      this.boxes.push({ id, name: name || id, ip, host, occupied: null, occupiedAt: null,
+                        fw: null, settingsRev: null });
       this.onChange?.();
       return "added";
     }
@@ -156,6 +163,22 @@ export class BoxRegistry {
     }
     if (changed) this.onChange?.();
     return changed ? "updated" : "unchanged";
+  }
+
+  // Drop a box from the fleet. Returns false when there was nothing to remove,
+  // so the caller can 404 rather than reporting a deletion that didn't happen.
+  //
+  // This only forgets the box HERE. The box itself still holds our address in
+  // NVS and keeps uploading, and fromId() re-adds any id that talks to us — so
+  // a box removed while still powered on and pointed here WILL come back. That
+  // is deliberate (a registry that fights its own self-healing would be worse),
+  // but it means "forget" is for retiring hardware, not for muting a live box.
+  remove(id) {
+    const i = this.boxes.findIndex((b) => b.id === id);
+    if (i === -1) return false;
+    this.boxes.splice(i, 1);
+    this.onChange?.();
+    return true;
   }
 
   // Resolve the box a request came from, via its X-Box-Id header.
@@ -262,6 +285,46 @@ export async function sendSessionOverride(box, occupied) {
     return null;
   }
 }
+
+// Push the box-scoped runtime settings (VAD tuning, session timeout, screen
+// hold times) to one box, which stores them in NVS and applies them on its next
+// listen or session.
+//
+// The wire format is the same "KEY|VALUE" line protocol the order screen
+// already uses, rather than JSON, and that is not laziness: the firmware has no
+// JSON parser linked in, and adding one to a box whose scarcest resource is
+// internal SRAM to carry eight integers would be a poor trade. `revision` rides
+// in a header so a box can ignore a push it has already applied without parsing
+// the body at all.
+//
+// Throws rather than warning: unlike a caption, a settings push that silently
+// failed leaves the fleet disagreeing with what the server reports, which is
+// the exact failure this whole mechanism exists to prevent. Callers that are
+// sweeping many boxes catch per box.
+export async function sendSettings(box, { revision, settings }) {
+  const body = Object.entries(settings)
+    .map(([k, v]) => `${k}|${typeof v === "boolean" ? (v ? "1" : "0") : v}`)
+    .join("\n");
+  // Both receivers on the box read into a 512-byte static buffer (WS_BODY_MAX
+  // in ws_client.c, the same size in settings_handler) and silently truncate
+  // past it. Truncation here would not fail — it would apply the first N
+  // settings, mangle the one straddling the cut, and report success, which is
+  // the worst shape a bug can take. Caught on this side, where the message can
+  // name the fix, because the box cannot know what it never received.
+  if (Buffer.byteLength(body) > BOX_SETTINGS_BODY_MAX) {
+    throw new Error(
+      `box-scoped settings are ${Buffer.byteLength(body)} bytes, over the firmware's ` +
+      `${BOX_SETTINGS_BODY_MAX}-byte limit. Either shorten the key names in ` +
+      `settings-spec.json, or raise WS_BODY_MAX in ws_client.c and the buffer in ` +
+      `settings_handler (both), and reflash. Nothing was sent.`
+    );
+  }
+  return await postToBox(box, "/settings", body, { "X-Settings-Rev": String(revision) }, 8000);
+}
+// Must match WS_BODY_MAX in listen_v2/main/ws_client.c and the body[] in that
+// file's settings_handler. Kept as a named constant so the coupling is visible
+// from this side too — the two numbers have to move together.
+const BOX_SETTINGS_BODY_MAX = 511;   // 512-byte buffer, minus the NUL
 
 // Verbatim passthrough of a backend-supplied display entry:
 //   { path: "/order", body: "TITLE|...", headers: {...} }

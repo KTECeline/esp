@@ -1,0 +1,12 @@
+{
+  "name": "confused",
+  "label": "Confused",
+  "emoji": "😕",
+  "description": "Lopsided eyes and a wavy mouth. For a request that did not parse.",
+  "eyes": {
+    "left": "open",
+    "right": "narrow"
+  },
+  "brow": "raised",
+  "mouth": "wave"
+}

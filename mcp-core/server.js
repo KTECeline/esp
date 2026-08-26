@@ -23,12 +23,14 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { Bonjour } from "bonjour-service";
 import { loadConfig, loadRawConfig, writeConfig, ESP_ROOT } from "./config.js";
-import { BoxRegistry, asciiOneline, sendCaption, sendAudio, sendDisplay, sendSessionOverride, setFleetToken, isCgnat } from "./boxes.js";
+import { BoxRegistry, asciiOneline, sendCaption, sendAudio, sendDisplay, sendSessionOverride, sendSettings, setFleetToken, isCgnat } from "./boxes.js";
 import { createMcpServer } from "./mcp-tools.js";
 import { startWsHub, setWsFleetToken, wsHas } from "./ws-hub.js";
 import { createSpeechEngine, needsLocalEngine } from "./speech.js";
 import { captureJpeg, scanQr, describeDevice } from "./vision.js";
 import { createSpcRegistry, probeSpcDevices } from "./spc.js";
+import { BoxDiscovery } from "./discovery.js";
+import { createSettings, SETTING_SCOPES } from "./settings.js";
 
 const config = loadConfig();
 // The raw parsed config is kept for round-tripping: box self-registration
@@ -45,11 +47,35 @@ function persistBoxes() {
     .catch((err) => console.warn("(config.json write failed: " + err.message + ")"));
 }
 const boxes = new BoxRegistry(config.boxes, persistBoxes);
+
+// Behaviour knobs that used to be constants scattered across three languages —
+// see settings.js for why these are a separate file from config.json. Changing
+// one that lives on hardware pushes it there; pushSettingsToFleet is a hoisted
+// declaration further down, so it is safe to reference before its definition.
+const settings = createSettings({
+  specPath: path.join(ESP_ROOT, "mcp-core", "settings-spec.json"),
+  valuePath: process.env.MCP_CORE_SETTINGS || path.join(ESP_ROOT, "settings.json"),
+  onChange: ({ scopes, revision }) => pushSettingsToFleet(scopes, revision)
+});
+
 // The OrangePi side of the fleet. Deliberately NOT merged into BoxRegistry —
 // see the header of spc.js for why a box and a Pi stay separate transports.
 // Empty unless config.json has a `devices` block, and an empty registry
 // registers no spc_* tools at all.
-const spc = createSpcRegistry(config.devices);
+const spc = createSpcRegistry(config.devices, () => settings.all());
+// Listens for boxes announcing themselves on the LAN. Purely observational —
+// what it finds is a candidate list, not the fleet; adopting one is an explicit
+// authenticated action. Shares MDNS_DISABLE with the advertiser: a network that
+// blocks multicast one way blocks it both ways.
+const discovery = new BoxDiscovery({
+  enabled: process.env.MDNS_DISABLE !== "1",
+  // Read through a getter, not copied: discovery.stale_ms is compared against
+  // on every list, so a change applies to the next request with no restart.
+  // requery_ms is the exception — it arms one interval at startup — and the
+  // catalog marks it as restart-required so nobody is told otherwise.
+  staleMs: () => settings.get("discovery.stale_ms"),
+  requeryMs: () => settings.get("discovery.requery_ms")
+});
 const MCP_SERVER_PATH = path.join(ESP_ROOT, "voice-mcp-server", "dist", "index.js");
 const LOG_PATH = process.env.INTERACTION_LOG || path.join(ESP_ROOT, "mcp-core", "interaction_log.jsonl");
 
@@ -100,7 +126,6 @@ function notifyTranscript(boxId, text) {
 // session state behind the webhook). Capped so a long chat can't grow the
 // prompt without bound.
 const llmHistoryByBox = new Map(); // box.id -> [{role, content}]
-const HISTORY_MAX = 12;
 
 const nowMs = () => Date.now();
 
@@ -209,20 +234,31 @@ async function ttsForBox(text) {
 }
 
 // ---- Wake / greeting --------------------------------------------------------
-// GREETING_TEXT is synthesized ONCE and cached in memory — a live TTS call on
+// The greeting is synthesized ONCE and cached in memory — a live TTS call on
 // every tap would blow the "1-2s from tap to greeting" latency target for no
-// reason, since it's the same phrase every time. Config-overridable so this
-// stays reusable for non-restaurant projects, per the README's design goal.
-const GREETING_TEXT = config.greetingText || "Hi! How can I help you today?";
-let cachedGreetingWav = null;
+// reason, since it's the same phrase every time. Overridable so this stays
+// reusable for non-restaurant projects, per the README's design goal.
+//
+// Three sources, most specific first: the greeting.text setting (changeable at
+// runtime, including by the agent), then config.json, then a neutral fallback
+// so a fresh install still speaks.
+const greetingText = () =>
+  settings.get("greeting.text") || config.greetingText || "Hi! How can I help you today?";
+// Keyed by the text it was synthesized from, not a bare boolean — that is what
+// makes the cache self-invalidating when the greeting is changed. A stale WAV
+// here would have the box cheerfully speaking the old greeting forever, with
+// the settings endpoint reporting the new one: a change that appears to work
+// and doesn't.
+let cachedGreeting = { text: null, wav: null };
 async function getGreetingAudio() {
-  if (!cachedGreetingWav) {
-    console.log(`Pre-caching greeting audio: "${GREETING_TEXT}"`);
+  const text = greetingText();
+  if (cachedGreeting.text !== text) {
+    console.log(`Pre-caching greeting audio: "${text}"`);
     const t0 = nowMs();
-    cachedGreetingWav = await ttsForBox(GREETING_TEXT);
+    cachedGreeting = { text, wav: await ttsForBox(text) };
     console.log(`Greeting cached (${nowMs() - t0}ms, reused for every wake).`);
   }
-  return cachedGreetingWav;
+  return cachedGreeting.wav;
 }
 
 // Greet on approach: the box's presence radar saw someone walk up, so speak
@@ -237,7 +273,7 @@ async function handleWake(box) {
   const t0 = nowMs();
   const wav = await getGreetingAudio();
   console.log(`[${box.name}] greeting ready at +${nowMs() - t0}ms, sending to box...`);
-  await sendAudio(box, wav, { replyText: GREETING_TEXT });
+  await sendAudio(box, wav, { replyText: greetingText() });
 }
 
 // ---- Backend router --------------------------------------------------------
@@ -279,7 +315,10 @@ async function askOpenAiChat(name, bc, box, text) {
   // instead of restarting.
   let history = llmHistoryByBox.get(box.id) || [];
   history.push({ role: "user", content: text });
-  if (history.length > HISTORY_MAX) history = history.slice(-HISTORY_MAX);
+  // Read per call, so lowering it on a slow local model shortens the very next
+  // prompt instead of only affecting conversations started after a restart.
+  const historyMax = settings.get("chat.history_max");
+  if (history.length > historyMax) history = history.slice(-historyMax);
 
   const res = await fetch(bc.url, {
     method: "POST",
@@ -479,12 +518,10 @@ async function handleUpload(box, audioBuffer) {
 // conversation, and sub-second clips come back from Whisper as "[BLANK_AUDIO]".
 // A tap cannot be misheard.
 
-// How long to watch the counter camera for a payment QR before giving up. Long
-// enough to fish a phone out of a pocket, short enough that a walk-off doesn't
-// hold the box forever.
-const PAY_SCAN_TIMEOUT_MS = 90_000;
-const PAY_SCAN_INTERVAL_MS = 1500;
-const PAID_LINGER_MS = 4000;
+// How long to watch the counter camera for a payment QR, how often to look,
+// and how long PAID sits on screen afterwards — all runtime settings now
+// (pay.*), because the right answer depends on the queue, not on the code.
+// Read at each use so a change mid-service applies to the next customer.
 
 // The payment prompt reuses the order screen's line protocol — NOTE replaces
 // the itemized rows, so no new firmware screen was needed for this.
@@ -516,7 +553,11 @@ async function resetBackendSessions(box) {
 // scanQr already retries internally, and giving up on one bad frame would end
 // the flow for no reason.
 async function waitForPaymentQr(box) {
-  const deadline = nowMs() + PAY_SCAN_TIMEOUT_MS;
+  // Snapshotted for the duration of one scan: re-reading the deadline every
+  // loop would let a mid-flow change move the finish line under a customer who
+  // is already holding their phone up.
+  const scanIntervalMs = settings.get("pay.scan_interval_ms");
+  const deadline = nowMs() + settings.get("pay.scan_timeout_ms");
   while (nowMs() < deadline) {
     try {
       const found = await scanQr(config.vision);
@@ -524,7 +565,7 @@ async function waitForPaymentQr(box) {
     } catch (err) {
       console.warn(`       (QR scan frame failed: ${err.message})`);
     }
-    await new Promise((r) => setTimeout(r, PAY_SCAN_INTERVAL_MS));
+    await new Promise((r) => setTimeout(r, scanIntervalMs));
   }
   return null;
 }
@@ -583,13 +624,13 @@ async function handleOrderAction(box, action) {
         record.outcome = "paid";
         record.qr = qr.slice(0, 200);
       } else {
-        console.log(`[${box.name}] no payment QR within ${PAY_SCAN_TIMEOUT_MS / 1000}s`);
+        console.log(`[${box.name}] no payment QR within ${settings.get("pay.scan_timeout_ms") / 1000}s`);
         await sendDisplay(box, payScreen("PAY AT COUNTER", "SORRY - NO QR DETECTED", total));
         record.outcome = "payment_timeout";
       }
       // Either way the customer is done at this box. Let the closing screen sit
       // long enough to read, then hand the box to the next person.
-      await new Promise((r) => setTimeout(r, PAID_LINGER_MS));
+      await new Promise((r) => setTimeout(r, settings.get("pay.paid_linger_ms")));
       llmHistoryByBox.delete(box.id);
       await resetBackendSessions(box);
       await sendSessionOverride(box, false);
@@ -655,7 +696,15 @@ const server = http.createServer(async (req, res) => {
         // prompt. Two devices in one restaurant disagreeing about what a
         // customer said would be a bug nobody could reproduce.
         transcribe: sttFromBuffer,
-        waitForTranscript
+        waitForTranscript,
+        // The store itself, not a copy: a tool that changed a snapshot would
+        // report success and change nothing.
+        settings,
+        // So fleet_settings_list can say whether a change actually landed on
+        // the hardware rather than only in this process.
+        settingsSync: () => boxes.boxes.map((b) => ({
+          id: b.id, name: b.name, in_sync: b.settingsRev === settings.revision
+        }))
       });
       const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
       res.on("close", () => { transport.close(); mcp.close(); });
@@ -689,6 +738,91 @@ const server = http.createServer(async (req, res) => {
           occupied: b.occupied   // null = box hasn't reported a session event yet
         }))
       });
+    }
+
+    // ---- Runtime settings ---------------------------------------------------
+    // The whole point of settings.js, over HTTP. Four routes:
+    //
+    //   GET   /settings              everything, with type/range/meaning
+    //   GET   /settings?scope=box    one scope's plain values — what hardware polls
+    //   PATCH /settings              change some keys
+    //   POST  /settings/reset        drop overrides, back to shipped defaults
+    //
+    // Authenticated with the FLEET token, not the MCP one, because both
+    // audiences need it: an agent tuning a timeout, and a box or a Pi fetching
+    // what it should be running after a reboot. Anyone who can drive the
+    // hardware can already do far more than change a timeout, so a third
+    // credential would be ceremony rather than security.
+    if (req.url === "/settings" || req.url.startsWith("/settings?")) {
+      if (!fleetAuthed()) return denyFleet();
+      const scope = new URL(req.url, "http://x").searchParams.get("scope");
+      if (scope && !SETTING_SCOPES.includes(scope)) {
+        return json(400, { error: `unknown scope "${scope}" — valid: ${SETTING_SCOPES.join(", ")}` });
+      }
+
+      if (req.method === "GET") {
+        // With a scope: the lean {revision, settings} payload hardware applies
+        // directly. Without: the full catalog, which is what a human or a model
+        // needs before deciding what to change.
+        if (scope) return json(200, settings.payload(scope));
+        return json(200, {
+          revision: settings.revision,
+          spec_version: settings.specVersion,
+          settings: settings.describe(),
+          // So a caller can see at a glance whether a change it made has
+          // actually reached the hardware, without a second request.
+          boxes: boxes.boxes.map((b) => ({
+            id: b.id, name: b.name,
+            settings_rev: b.settingsRev,
+            in_sync: b.settingsRev === settings.revision
+          }))
+        });
+      }
+
+      if (req.method === "PATCH" || req.method === "POST") {
+        let patch;
+        try {
+          patch = JSON.parse((await readBody(req)).toString("utf8") || "{}");
+        } catch (err) {
+          return json(400, { error: `body must be JSON of { key: value }: ${err.message}` });
+        }
+        // Accept both {settings:{...}} and a bare {...}, since the GET reply
+        // wraps values in `settings` and round-tripping it is the obvious move.
+        if (patch && typeof patch === "object" && patch.settings && typeof patch.settings === "object") {
+          patch = patch.settings;
+        }
+        try {
+          const result = await settings.set(patch, { actor: "HTTP" });
+          return json(200, { revision: result.revision, changed: result.changed,
+                             unchanged: result.unchanged ?? [] });
+        } catch (err) {
+          // 400, not 500: a rejected value is the caller's mistake, and the
+          // message names the key and its range so it can be fixed and retried.
+          return json(400, { error: err.message });
+        }
+      }
+      return json(405, { error: "use GET to read settings, PATCH to change them" });
+    }
+
+    if (req.method === "POST" && req.url === "/settings/reset") {
+      if (!fleetAuthed()) return denyFleet();
+      let body = {};
+      try {
+        body = JSON.parse((await readBody(req)).toString("utf8") || "{}");
+      } catch (err) {
+        return json(400, { error: `body must be JSON of { keys: [...] } or { all: true }: ${err.message}` });
+      }
+      // Deliberately no "reset everything" by omission: an empty body resetting
+      // the entire fleet's tuning would be a very easy accident to have.
+      if (!body.all && !Array.isArray(body.keys)) {
+        return json(400, { error: 'send { "keys": ["a.b"] } for specific keys, or { "all": true } to clear every override' });
+      }
+      try {
+        const result = await settings.reset(body.all ? "all" : body.keys, { actor: "HTTP" });
+        return json(200, { revision: result.revision, changed: result.changed });
+      } catch (err) {
+        return json(400, { error: err.message });
+      }
     }
 
     // The firmware image a box downloads during an update. Authenticated like
@@ -797,7 +931,7 @@ const server = http.createServer(async (req, res) => {
       } catch {
         return json(400, { error: "invalid JSON" });
       }
-      const { box_id, name, ip, fw, fw_sha, slot, pending_verify } = parsed;
+      const { box_id, name, ip, fw, fw_sha, slot, pending_verify, settings_rev } = parsed;
       if (typeof box_id !== "string" || !box_id || typeof ip !== "string" || !ip) {
         return json(400, { error: "box_id and ip are required strings" });
       }
@@ -814,7 +948,150 @@ const server = http.createServer(async (req, res) => {
         ? ` fw=${fw}/${fw_sha ?? "?"} slot=${slot ?? "?"}${pending_verify === true ? " PENDING-VERIFY" : ""}`
         : "";
       console.log(`Box registered: ${box_id} ("${name || box_id}") @ ${ip} [${action}]${fwNote}`);
-      return json(200, { ok: true, box_id, name: name || box_id, ip, action });
+
+      // A box that just rebooted is the most likely one to be holding stale
+      // tuning, and this is the earliest moment we hear from it. Recording what
+      // it says it has lets the sweep decide, and pushing right now — rather
+      // than waiting up to a minute for the sweep — means the first customer of
+      // the day gets the tuned box, not yesterday's.
+      const b = boxes.byId(box_id);
+      if (b) {
+        b.settingsRev = Number.isInteger(settings_rev) ? settings_rev : null;
+        if (b.settingsRev !== settings.revision) {
+          // Deliberately not awaited: the box is blocked on this response
+          // during its own boot, and it cannot accept the settings push until
+          // it has finished handling this request.
+          sendSettings(b, settings.payload("box"))
+            .then(() => { b.settingsRev = settings.revision; })
+            .catch(() => { /* the sweep retries */ });
+        }
+      }
+      return json(200, { ok: true, box_id, name: name || box_id, ip, action,
+                         settings_rev: settings.revision });
+    }
+
+    // What boxes are on this network right now, from mDNS. The complement of
+    // /register: /register is a box that already knows where we are announcing
+    // itself, this is finding the ones that DON'T. Read-only — it touches no
+    // hardware — but still authenticated, because the reply is an inventory of
+    // every box on the LAN with its address, which is precisely the target list
+    // for an attack on the fleet (same reasoning as /health's box list).
+    if (req.method === "GET" && req.url === "/discover") {
+      if (!fleetAuthed()) return denyFleet();
+      const known = new Set(boxes.boxes.map((b) => b.id));
+      const found = discovery.list(known);
+      return json(200, {
+        // Distinguishes "discovery is broken on this network" from "discovery
+        // works and there is nothing here" — identical-looking empty lists that
+        // call for completely different next steps. Multicast being dropped is
+        // the normal case on the managed WiFi this project keeps meeting.
+        mdns: discovery.enabled ? (discovery.error ? "failed" : "ok") : "disabled",
+        mdnsError: discovery.error,
+        boxes: found,
+        // Echoed so the setup page can show what a box WOULD be pointed at, and
+        // so "why did adopt fail" is answerable without reading server logs.
+        serverUrl: lanIp() ? `http://${lanIp()}:${config.listenPort}/upload` : null
+      });
+    }
+
+    // Take a discovered box into the fleet: add it to the registry and tell it
+    // to talk to us. Deliberately one step — a box in config.json that has not
+    // been pointed here is a box that shows NO SERVER, which is the exact
+    // half-configured state this whole feature exists to remove.
+    //
+    // `ip` may be supplied directly, so a box on a subnet where multicast never
+    // arrives can still be added by hand from the same page.
+    if (req.method === "POST" && req.url === "/adopt") {
+      if (!fleetAuthed()) return denyFleet();
+      let parsed;
+      try {
+        parsed = JSON.parse((await readBody(req)).toString("utf8"));
+      } catch {
+        return json(400, { error: "invalid JSON" });
+      }
+      const { box_id, ip, name } = parsed;
+      if (typeof box_id !== "string" || !box_id) {
+        return json(400, { error: "box_id is required" });
+      }
+      // Trust the discovered address over a client-supplied one when we have
+      // it: the page's copy can be a stale render, mDNS is what answered most
+      // recently. A box not in the discovery cache must supply its own ip.
+      const discovered = discovery.list().find((b) => b.id === box_id);
+      const addr = discovered?.ip || (typeof ip === "string" ? ip.trim() : "");
+      if (!addr) {
+        return json(404, { error: `box "${box_id}" is not visible on the network — supply its ip explicitly` });
+      }
+      if (isCgnat(addr)) {
+        // The lanIp() landmine from the other direction. A box entry must hold
+        // a LAN address because every push dials it directly; storing a tunnel
+        // address would break /play, /caption and /order for that box until
+        // someone edited config.json by hand.
+        return json(400, { error: `${addr} is a tailnet/CGNAT address — a box entry must hold its LAN address` });
+      }
+      // Name precedence: explicit request body, then whatever the box itself
+      // announced over mDNS, then upsert()'s own fallback to the id. A client
+      // that just clicks "Add" on the setup page sends no name at all, and
+      // without this the box's real TXT-advertised name is thrown away for
+      // its id — which is exactly the "192.168.1.x" opacity this feature
+      // exists to fix.
+      const resolvedName = (typeof name === "string" && name) ? name : (discovered?.name || null);
+      const action = boxes.upsert(box_id, resolvedName, addr);
+      const box = boxes.byId(box_id);
+      try {
+        const serverUrl = await pointBoxAtUs(box, "adopt");
+        console.log(`Box adopted: ${box_id} @ ${addr} [${action}]`);
+        return json(200, { ok: true, box_id, name: box.name, ip: addr, action, serverUrl });
+      } catch (err) {
+        // The registry entry stays: the box is real and was seen, the push just
+        // didn't land (asleep mid-recording, old firmware without /server). The
+        // 60s adoption sweep will keep retrying it, so reporting a hard failure
+        // and rolling back would be less true than saying what happened.
+        return json(502, {
+          ok: false, box_id, ip: addr, action,
+          error: `added to the fleet, but could not reach it to point it here: ${err.message}. ` +
+                 "It will be retried automatically every 60s."
+        });
+      }
+    }
+
+    // Drop a box from the fleet. The registry is persisted to config.json, so
+    // without this a box adopted by mistake (or a decommissioned one) can only
+    // be removed by hand-editing a file the server rewrites underneath you.
+    if (req.method === "POST" && req.url === "/forget") {
+      if (!fleetAuthed()) return denyFleet();
+      let parsed;
+      try {
+        parsed = JSON.parse((await readBody(req)).toString("utf8"));
+      } catch {
+        return json(400, { error: "invalid JSON" });
+      }
+      const { box_id } = parsed;
+      if (typeof box_id !== "string" || !box_id) {
+        return json(400, { error: "box_id is required" });
+      }
+      if (!boxes.remove(box_id)) return json(404, { error: `no box "${box_id}" in the fleet` });
+      console.log(`Box forgotten: ${box_id}`);
+      // Note what is NOT done here: the box keeps its stored server URL and
+      // will go on uploading to us, and fromId() would auto-register it again
+      // on its next request. Removing it from our list is not the same as
+      // telling it to forget us — that needs a re-provision at the hardware.
+      return json(200, { ok: true, box_id });
+    }
+
+    // The setup page itself. Open on purpose: it is a static shell containing
+    // no fleet data and no secrets — every byte it displays comes from the
+    // authenticated endpoints above, which it calls with a token the operator
+    // supplies. Serving it openly means someone locked out can still reach the
+    // screen that explains what to do.
+    if (req.method === "GET" && (req.url === "/setup" || req.url === "/setup/")) {
+      let page;
+      try {
+        page = await readFile(path.join(ESP_ROOT, "mcp-core", "setup.html"));
+      } catch {
+        return json(404, { error: "setup.html is missing from this install" });
+      }
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      return res.end(page);
     }
 
     // Manual session reset between customers / demo runs.
@@ -940,32 +1217,125 @@ function lanIp() {
 // own HTTP server, which the firmware now brings up BEFORE it waits for us,
 // exactly so it can still be reached while it's lost. Best-effort and quiet —
 // a box that's offline, on old firmware, or on another network just fails.
-async function adoptKnownBoxes(reason) {
+// One box's worth of that push. Split out so the manual adopt path (POST
+// /adopt, from the setup page) delivers byte-identical headers to the periodic
+// sweep — the token hand-off, the reverse-channel URL and the help URL are easy
+// to half-remember at a second call site, and a box adopted with any of them
+// missing fails later in ways that look like unrelated bugs.
+//
+// Throws on failure rather than swallowing, so an operator who just clicked
+// "Add" gets told why; the periodic sweep catches and ignores.
+async function pointBoxAtUs(box, reason) {
   const ip = lanIp();
-  if (!ip) return;
+  if (!ip) throw new Error("no usable LAN address for this machine (see startup log; set lan_ip in config.json)");
   const url = `http://${ip}:${config.listenPort}/upload`;
+  // The adopt push doubles as token delivery (trust-on-first-use): a box
+  // with no token stored accepts and saves this one, and only starts
+  // enforcing afterwards. That's why a box can never lock us out — the
+  // token it enforces is one we handed it.
+  const headers = config.fleetToken ? { "X-Fleet-Token": config.fleetToken } : {};
+  // Same push also hands over the reverse-channel URL, so a box learns
+  // where to dial without a separate provisioning step. Defaults to this
+  // machine on the LAN; set ws_url in config.json to a public relay
+  // (e.g. a Tailscale Funnel wss:// address) to make boxes reachable from
+  // networks that have no route to this LAN at all.
+  headers["X-Ws-Url"] = config.wsUrl || `ws://${ip}:${config.listenPort}/ws`;
+  // Target of the box's help QR (tap RST twice). Pushed rather than baked
+  // into firmware so the guide can move hosts without reflashing. Omitted
+  // when unset, which leaves the box on its built-in fallback.
+  if (config.helpUrl) headers["X-Help-Url"] = config.helpUrl;
+  const res = await fetch(`http://${box.ip}/server`, {
+    method: "POST", body: url, headers, signal: AbortSignal.timeout(3000)
+  });
+  if (!res.ok) throw new Error(`box answered HTTP ${res.status}`);
+  console.log(`Pointed ${box.name} @ ${box.ip} at ${url} (${reason})`);
+  return url;
+}
+
+async function adoptKnownBoxes(reason) {
+  if (!lanIp()) return;
   for (const b of boxes.boxes) {
     try {
-      // The adopt push doubles as token delivery (trust-on-first-use): a box
-      // with no token stored accepts and saves this one, and only starts
-      // enforcing afterwards. That's why a box can never lock us out — the
-      // token it enforces is one we handed it.
-      const headers = config.fleetToken ? { "X-Fleet-Token": config.fleetToken } : {};
-      // Same push also hands over the reverse-channel URL, so a box learns
-      // where to dial without a separate provisioning step. Defaults to this
-      // machine on the LAN; set ws_url in config.json to a public relay
-      // (e.g. a Tailscale Funnel wss:// address) to make boxes reachable from
-      // networks that have no route to this LAN at all.
-      headers["X-Ws-Url"] = config.wsUrl || `ws://${ip}:${config.listenPort}/ws`;
-      // Target of the box's help QR (tap RST twice). Pushed rather than baked
-      // into firmware so the guide can move hosts without reflashing. Omitted
-      // when unset, which leaves the box on its built-in fallback.
-      if (config.helpUrl) headers["X-Help-Url"] = config.helpUrl;
-      const res = await fetch(`http://${b.ip}/server`, {
-        method: "POST", body: url, headers, signal: AbortSignal.timeout(3000)
-      });
-      if (res.ok) console.log(`Pointed ${b.name} @ ${b.ip} at ${url} (${reason})`);
+      await pointBoxAtUs(b, reason);
     } catch { /* offline / old firmware / different subnet — nothing to do */ }
+  }
+}
+
+// ---- Getting a changed setting onto the hardware ---------------------------
+// server-scoped keys need none of this: they are read straight out of the store
+// at the point of use. box and device keys live on other machines, so a change
+// here is only half of the change.
+//
+// Best-effort by design, and the reason is the same one that made adoption a
+// repeating sweep rather than a one-shot: at any moment some box is asleep,
+// mid-recording, or on a network we cannot reach. Refusing the change because
+// one box out of five did not answer would mean the fleet can only be tuned
+// when it is perfectly healthy. So the store is the source of truth, the push
+// is an optimisation, and settingsSweep() below re-delivers to whoever missed
+// it. Each box also asks for the current settings when it registers, which
+// covers a box that was simply switched off for the whole conversation.
+async function pushSettingsToBoxes(reason) {
+  const payload = settings.payload("box");
+  const results = [];
+  for (const b of boxes.boxes) {
+    try {
+      await sendSettings(b, payload);
+      b.settingsRev = payload.revision;
+      results.push({ box: b.id, ok: true });
+    } catch (err) {
+      // Cleared, not left stale: a failed push means we no longer know what
+      // this box is running, and the sweep must retry it.
+      b.settingsRev = null;
+      results.push({ box: b.id, ok: false, error: err.message });
+      console.warn(`(settings push to ${b.name} failed: ${err.message} — will retry)`);
+    }
+  }
+  if (results.length) {
+    const ok = results.filter((r) => r.ok).length;
+    console.log(`Settings rev ${payload.revision} pushed to ${ok}/${results.length} boxes (${reason})`);
+  }
+  return results;
+}
+
+async function pushSettingsToDevices(reason) {
+  const payload = settings.payload("device");
+  const results = [];
+  for (const d of spc.devices) {
+    try {
+      await spc.pushSettings(d, payload);
+      results.push({ device: d.id, ok: true });
+    } catch (err) {
+      results.push({ device: d.id, ok: false, error: err.message });
+      console.warn(`(settings push to ${d.id} failed: ${err.message} — will retry)`);
+    }
+  }
+  if (results.length) {
+    const ok = results.filter((r) => r.ok).length;
+    console.log(`Settings rev ${payload.revision} pushed to ${ok}/${results.length} devices (${reason})`);
+  }
+  return results;
+}
+
+// The store's onChange hook. Only the scopes that actually changed are pushed,
+// so tuning a pay timeout does not wake every box on the network.
+async function pushSettingsToFleet(scopes, revision) {
+  if (scopes.includes("box")) await pushSettingsToBoxes(`rev ${revision}`);
+  if (scopes.includes("device")) await pushSettingsToDevices(`rev ${revision}`);
+}
+
+// Catch-up for hardware that was unreachable when a change landed. Cheap: a box
+// already on the current revision is skipped entirely, so a healthy idle fleet
+// costs nothing per round.
+async function settingsSweep() {
+  const stale = boxes.boxes.filter((b) => b.settingsRev !== settings.revision);
+  if (stale.length === 0) return;
+  const payload = settings.payload("box");
+  for (const b of stale) {
+    try {
+      await sendSettings(b, payload);
+      b.settingsRev = payload.revision;
+      console.log(`Settings rev ${payload.revision} caught ${b.name} up`);
+    } catch { /* still unreachable — try again next round */ }
   }
 }
 
@@ -1037,7 +1407,13 @@ async function main() {
   setWsFleetToken(config.fleetToken);
   // Shares the main HTTP server (one port, one thing to expose). Started before
   // listen() so no box can race the upgrade handler.
-  startWsHub(server, { path: "/ws" });
+  startWsHub(server, {
+    path: "/ws",
+    throttleSettings: () => ({
+      windowMs: settings.get("wshub.fail_window_ms"),
+      max: settings.get("wshub.fail_max")
+    })
+  });
   // The whole point of the hosted providers: an all-hosted config never spawns
   // voice-mcp-server, so that deployment needs neither whisper.cpp compiled nor
   // MOSS-TTS installed — the two steps the setup guide calls genuinely hard.
@@ -1081,13 +1457,26 @@ async function main() {
     console.log(`Fleet auth: ${config.fleetToken ? "ON" : "OFF (set fleet_token_env to enable)"}`
               + ` | /mcp auth: ${config.mcpToken ? "ON" : "OFF"}`);
     startMdnsAdvertiser();
+    // Both directions of mDNS start together: we announce ourselves so boxes
+    // can find us, and listen so we can find them.
+    discovery.start();
+    console.log(`Setup page: http://${lanIp() || "localhost"}:${config.listenPort}/setup`);
     // Immediately, then on a slow timer: a box that booted before us, or that
     // is pointed at a stale address after this machine changed networks, gets
     // corrected without anyone typing an IP or re-provisioning. 60s is well
     // inside the firmware's own retry backoff, so a lost box recovers on its
     // own within about a minute of mcp-core being up.
     adoptKnownBoxes("startup");
-    setInterval(() => adoptKnownBoxes("periodic"), 60000);
+    const sweepMs = settings.get("adopt.sweep_ms");
+    setInterval(() => adoptKnownBoxes("periodic"), sweepMs);
+    // Runtime settings ride the same sweep. A box that was asleep when a knob
+    // changed is caught up here rather than running yesterday's tuning until
+    // someone notices; a box already on the current revision costs nothing.
+    console.log(`Runtime settings: ${Object.keys(settings.all()).length} knobs, ` +
+                `rev ${settings.revision} — GET /settings`);
+    pushSettingsToBoxes("startup").catch(() => {});
+    pushSettingsToDevices("startup").catch(() => {});
+    setInterval(() => { settingsSweep().catch(() => {}); }, sweepMs);
   });
   // Pre-warm the greeting cache so the FIRST wake tap of the day is fast too,
   // not just the second one. Failure here isn't fatal — getGreetingAudio()
@@ -1097,6 +1486,7 @@ async function main() {
 
 for (const sig of ["SIGINT", "SIGTERM"]) {
   process.on(sig, () => {
+    discovery.stop();
     bonjour?.unpublishAll(() => process.exit(0));
     // Fallback in case unpublishAll's callback never fires (e.g. no network).
     setTimeout(() => process.exit(0), 1000);

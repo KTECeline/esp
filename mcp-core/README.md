@@ -65,6 +65,9 @@ can pick *where* to speak or look rather than guessing between id strings.
 | `spc_sense` | `device_id?` | Passthrough of whatever sensors that Pi reports. |
 | `spc_look` | `device_id?` | A frame from the Pi's camera. |
 | `spc_expression` | `device_id?`, `expression?`, `gaze?`, `panel?` | Drives the Pi's own screen: an animated face on top, and below it a message, a QR code, choice tiles or an order summary. What you leave out stays as it was, so the eyes can change without disturbing a QR someone is scanning. |
+| `fleet_settings_list` | `scope?` | Every runtime knob: value, default, range, and what it actually controls. |
+| `fleet_settings_set` | `changes`, `reason?` | Changes knobs and pushes anything hardware-side to the boxes and Pis. Range-checked, all-or-nothing. |
+| `fleet_settings_reset` | `keys?` **or** `all?` | Back to shipped defaults, and back to *following* them. |
 
 Every tool is registered only when the hardware behind it exists — see
 [`../spc-agent/README.md`](../spc-agent/README.md) for the Pi-side contract.
@@ -131,6 +134,67 @@ node server.js
 Requires a local `voice-mcp-server` (STT via whisper.cpp, TTS via any
 OpenAI-compatible speech endpoint) — mcp-core spawns it over stdio
 automatically. See the parent repo for a working example.
+
+## Runtime settings — the knobs, and who may turn them
+
+`config.json` is **wiring**: addresses, tokens, which backend, which camera.
+Get it wrong and the fleet is offline, so it is a human's file, read once at
+startup.
+
+Everything else — how long the box waits before it stops listening, how loud
+counts as speech, how long to watch for a payment QR, how long the food takes —
+is a **setting**. Those used to be constants in three languages (a `#define` in
+`listen_v2.c`, a `const` here, a dict in `spc_agent.py`), which meant changing
+one was an edit, a restart, and for the box ones a reflash. In practice nobody
+changed them, so a threshold measured once in one room became the fleet's answer
+everywhere.
+
+Settings live in one catalog, [`settings-spec.json`](settings-spec.json), which
+carries every knob's type, range, default and meaning. Only the values someone
+*changed* are written to `settings.json` at the repo root — so an untouched knob
+follows the default, and a better default in a later release actually reaches
+you.
+
+```bash
+curl -s localhost:8000/settings                    # everything, with ranges and docs
+curl -s 'localhost:8000/settings?scope=box'        # just what a box needs, as it gets it
+curl -s -X PATCH localhost:8000/settings -d '{"listen.silence_hold_ms": 1800}'
+curl -s -X POST  localhost:8000/settings/reset -d '{"keys": ["listen.silence_hold_ms"]}'
+```
+
+The same thing as MCP tools, which is what lets the agent tune the box it is
+standing in front of: `fleet_settings_list`, `fleet_settings_set`,
+`fleet_settings_reset`.
+
+`scope` says who holds the value and therefore who has to be told when it
+changes:
+
+| scope | Lives on | On change |
+|---|---|---|
+| `server` | mcp-core | Read live at the next use. Nothing to push. |
+| `box` | ESP32-S3-BOX NVS | Pushed over the reverse channel (or LAN HTTP), applied on the next listen or session. |
+| `device` | The OrangePi | `PATCH /settings` on the Pi, which persists it. |
+| `agent` | Nowhere here | The ordering agent polls `GET /settings?scope=agent`. |
+
+Hardware pushes are **best effort, and the store is the truth**. A box that is
+switched off when you change something is not an error — the change is saved,
+and the adoption sweep re-delivers it when the box comes back. Each box also
+reports its revision at `/register`, so a box that reboots holding stale tuning
+is corrected before the first customer of the day rather than up to a sweep
+later. `GET /settings` shows `in_sync` per box, which is how you tell "changed"
+from "changed *and landed*".
+
+Every value is range-checked here, and clamped **again** on the box and on the
+Pi. Those two sets of bounds answer different questions: the server's stop
+someone typing a silly number, the device's stop a value that would leave the
+hardware unusable and un-tunable. A box that accepted `silence_hold_ms=0` would
+stop recording at the first pause for breath, and the only way out would be a
+reflash.
+
+Adding a knob means editing `settings-spec.json`, reading it where it applies,
+and — for a `box` knob — adding one line to `box_settings.c` and reflashing.
+The test suite fails if the box-scoped set outgrows the firmware's 512-byte
+buffer.
 
 ## Security
 

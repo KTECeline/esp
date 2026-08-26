@@ -1,0 +1,10 @@
+{
+  "name": "smug",
+  "label": "Smug",
+  "emoji": "😏",
+  "description": "Narrowed eyes looking away, small mouth. Built entirely from shapes both renderers already draw.",
+  "eyes": { "left": "narrow", "right": "narrow" },
+  "brow": "raised",
+  "mouth": "small",
+  "gaze": "right"
+}

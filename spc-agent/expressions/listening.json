@@ -1,0 +1,12 @@
+{
+  "name": "listening",
+  "label": "Listening",
+  "emoji": "👂",
+  "description": "Eyes wide and attentive. Set this before you listen.",
+  "eyes": {
+    "left": "wide",
+    "right": "wide"
+  },
+  "brow": "raised",
+  "mouth": "small"
+}

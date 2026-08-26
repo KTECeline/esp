@@ -1,0 +1,12 @@
+{
+  "name": "wink",
+  "label": "Wink",
+  "emoji": "😉",
+  "description": "One eye arched shut. The asymmetry is the point.",
+  "eyes": {
+    "left": "happy",
+    "right": "open"
+  },
+  "brow": "raised",
+  "mouth": "grin"
+}

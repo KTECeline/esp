@@ -1,0 +1,359 @@
+{
+  "version": 1,
+  "_comment": "The catalog of every runtime-tunable knob in the fleet. This file is the SCHEMA (name, type, range, default, meaning); settings.json next to config.json holds only the values someone changed. Splitting them that way means a default improved in a release reaches every install, instead of being frozen the first time anyone saved a value.\n\nThis is deliberately NOT config.json. config.json is wiring — addresses, tokens, which backend, which camera — the things that make the fleet exist, and getting them wrong takes it offline. These are behaviour knobs: how long to wait, how loud is loud, how many items fit. They are safe to change while a customer is standing there, so the agent is allowed to change them itself.\n\nscope decides who has to be told about a change:\n  server  - mcp-core reads it live on the next use. Nothing to push.\n  box     - pushed to every ESP32-S3-BOX over its reverse channel (or HTTP), stored in the box's NVS, applied on the next listen/session.\n  device  - pushed to spc devices (the OrangePi) via PATCH /settings.\n  agent   - not used by mcp-core at all; served to the agent webhook, which fetches it. Kept here so a restaurant's rules live in the same place as everything else.\n\n`restart` marks a knob that only takes effect on the next mcp-core start (a timer armed once at boot). It still saves and still reports honestly rather than pretending to have applied.",
+
+  "settings": [
+    {
+      "key": "listen.silence_hold_ms",
+      "scope": "box",
+      "type": "int",
+      "default": 1200,
+      "min": 200,
+      "max": 6000,
+      "unit": "ms",
+      "summary": "How long the box must hear silence, after real speech, before it stops recording on its own.",
+      "guidance": "This is the auto-stop knob. Lower feels snappy but clips people who pause mid-sentence to think; higher is patient but leaves an awkward gap before the reply. Raise it for customers who speak slowly or in a second language; lower it for a fast queue."
+    },
+    {
+      "key": "listen.silence_peak",
+      "scope": "box",
+      "type": "int",
+      "default": 1500,
+      "min": 100,
+      "max": 12000,
+      "summary": "Peak int16 sample level below which a 32ms chunk counts as quiet.",
+      "guidance": "The room's noise floor, measured. If auto-stop never fires, the background is louder than this — raise it. If the box cuts people off mid-word, it is treating speech as silence — lower it. On-site measurement on this hardware at mic_gain_db=30: median ambient ~646, p90 ~1360, spikes ~3800. Re-measure after changing listen.mic_gain_db, since the two move together."
+    },
+    {
+      "key": "listen.speech_confirm_chunks",
+      "scope": "box",
+      "type": "int",
+      "default": 3,
+      "min": 1,
+      "max": 20,
+      "unit": "chunks of ~32ms",
+      "summary": "Consecutive loud chunks needed before the box believes speech actually started.",
+      "guidance": "Stops a single click, door slam or chair scrape from arming the silence timer and ending the turn instantly. Raise it in a noisy room; 1 makes the box hair-trigger."
+    },
+    {
+      "key": "listen.max_record_seconds",
+      "scope": "box",
+      "type": "int",
+      "default": 20,
+      "min": 3,
+      "max": 20,
+      "unit": "s",
+      "summary": "Hard cap on a single listen turn, whatever the voice activity detector thinks.",
+      "guidance": "The safety net for a box left recording in an empty room. The maximum is 20 because the recording buffer is allocated once at boot for 20 seconds of 16kHz mono; asking for more would need a reflash, not a setting."
+    },
+    {
+      "key": "listen.mic_gain_db",
+      "scope": "box",
+      "type": "number",
+      "default": 30,
+      "min": 0,
+      "max": 60,
+      "unit": "dB",
+      "summary": "Microphone input gain, applied at the start of every recording.",
+      "guidance": "Raise it when customers stand back from the box and come through faint; lower it when close talkers clip and transcription turns to mush. Changing this invalidates listen.silence_peak — the noise floor scales with it."
+    },
+    {
+      "key": "session.absent_ms",
+      "scope": "box",
+      "type": "int",
+      "default": 30000,
+      "min": 5000,
+      "max": 600000,
+      "unit": "ms",
+      "summary": "How long with no sign of the customer before the box declares the session over and the order resets.",
+      "guidance": "Measured caution: the presence radar reports motion, not stillness, so someone standing quietly reads as absent for 10s+ at a time. Below ~20s this ends sessions with the customer still standing there, and their next small movement starts a fresh one and re-greets them. The timer is fed by taps and speech as well as radar."
+    },
+    {
+      "key": "screen.badge_hold_ms",
+      "scope": "box",
+      "type": "int",
+      "default": 1500,
+      "min": 300,
+      "max": 10000,
+      "unit": "ms",
+      "summary": "How long a status badge (SENT, ERROR) stays on the box screen.",
+      "guidance": "Purely cosmetic pacing. Long enough to read, short enough not to hide the reply behind it."
+    },
+    {
+      "key": "screen.help_max_ms",
+      "scope": "box",
+      "type": "int",
+      "default": 60000,
+      "min": 5000,
+      "max": 600000,
+      "unit": "ms",
+      "summary": "How long the help QR screen stays up after a double tap of RST before the box returns to normal.",
+      "guidance": "Long enough for someone to fetch a phone and scan; short enough that a box left on the help screen recovers itself."
+    },
+
+    {
+      "key": "pay.scan_timeout_ms",
+      "scope": "server",
+      "type": "int",
+      "default": 90000,
+      "min": 5000,
+      "max": 600000,
+      "unit": "ms",
+      "summary": "How long the counter camera watches for a payment QR before giving up on the pay flow.",
+      "guidance": "Long enough to fish a phone out of a pocket, short enough that a customer who walks off does not hold the box hostage."
+    },
+    {
+      "key": "pay.scan_interval_ms",
+      "scope": "server",
+      "type": "int",
+      "default": 1500,
+      "min": 250,
+      "max": 10000,
+      "unit": "ms",
+      "summary": "Gap between camera frames while watching for a payment QR.",
+      "guidance": "Each frame is a capture plus a decode, so this is a CPU-vs-latency trade. Below ~750ms the scans start overlapping on a slow machine and buy nothing."
+    },
+    {
+      "key": "pay.paid_linger_ms",
+      "scope": "server",
+      "type": "int",
+      "default": 4000,
+      "min": 500,
+      "max": 30000,
+      "unit": "ms",
+      "summary": "How long the PAID confirmation stays on screen before the box resets for the next customer.",
+      "guidance": "The customer needs to see that it worked. Too short reads as if the payment was ignored."
+    },
+    {
+      "key": "chat.history_max",
+      "scope": "server",
+      "type": "int",
+      "default": 12,
+      "min": 2,
+      "max": 60,
+      "unit": "messages",
+      "summary": "Turns of conversation kept for the local_llm backend before the oldest are dropped.",
+      "guidance": "Only affects the plain local-LLM path; a webhook agent keeps its own session state and ignores this. Raising it grows every prompt and slows replies on a small local model."
+    },
+    {
+      "key": "greeting.text",
+      "scope": "server",
+      "type": "string",
+      "default": "",
+      "max_length": 200,
+      "summary": "What the box says when a customer first walks up. Empty falls back to greeting_text in config.json.",
+      "guidance": "Spoken once and cached as audio, so a change costs one synthesis and then nothing. Keep it to a sentence — it plays before the customer has decided to engage."
+    },
+    {
+      "key": "adopt.sweep_ms",
+      "scope": "server",
+      "type": "int",
+      "default": 60000,
+      "min": 10000,
+      "max": 900000,
+      "unit": "ms",
+      "restart": true,
+      "summary": "How often mcp-core re-tells every known box where this server is.",
+      "guidance": "The cure for a box stuck on NO SERVER after the server's IP moved. Shorter recovers faster after a DHCP change and costs one tiny HTTP request per box per round."
+    },
+    {
+      "key": "discovery.stale_ms",
+      "scope": "server",
+      "type": "int",
+      "default": 90000,
+      "min": 10000,
+      "max": 900000,
+      "unit": "ms",
+      "summary": "How long an mDNS-announced box stays on the adoptable list after its last announcement.",
+      "guidance": "A box that is unplugged never says goodbye, so this is what eventually removes it. Long enough to survive a couple of missed multicast rounds."
+    },
+    {
+      "key": "discovery.requery_ms",
+      "scope": "server",
+      "type": "int",
+      "default": 30000,
+      "min": 5000,
+      "max": 600000,
+      "unit": "ms",
+      "restart": true,
+      "summary": "How often to re-ask the network which boxes are out there.",
+      "guidance": "Only a backstop — boxes announce themselves when they boot. Worth shortening on a network that drops multicast, which is most managed WiFi."
+    },
+    {
+      "key": "wshub.fail_window_ms",
+      "scope": "server",
+      "type": "int",
+      "default": 60000,
+      "min": 5000,
+      "max": 3600000,
+      "unit": "ms",
+      "summary": "Window over which failed reverse-channel authentications are counted per source IP.",
+      "guidance": "Brute-force throttling for the one endpoint that may be exposed publicly. A real box authenticates once and never fails, so this should never affect the fleet."
+    },
+    {
+      "key": "wshub.fail_max",
+      "scope": "server",
+      "type": "int",
+      "default": 10,
+      "min": 1,
+      "max": 1000,
+      "summary": "Failed authentications from one IP within the window before it is throttled.",
+      "guidance": "Behind a relay every client shares one bucket, so this is deliberately a global-ish cap rather than a per-client one."
+    },
+    {
+      "key": "spc.listen_margin_ms",
+      "scope": "server",
+      "type": "int",
+      "default": 15000,
+      "min": 2000,
+      "max": 120000,
+      "unit": "ms",
+      "summary": "Grace added to a Pi's listen deadline on top of the recording length it was asked for.",
+      "guidance": "The Pi cannot answer until it has finished recording, so its deadline is per-call. This margin covers uploading the WAV back over a slow link — raise it on a weak connection."
+    },
+    {
+      "key": "spc.timeout_look_ms",
+      "scope": "server",
+      "type": "int",
+      "default": 20000,
+      "min": 1000,
+      "max": 120000,
+      "unit": "ms",
+      "summary": "Deadline for a camera capture on a Pi, measured from mcp-core."
+    },
+    {
+      "key": "spc.timeout_speak_ms",
+      "scope": "server",
+      "type": "int",
+      "default": 60000,
+      "min": 1000,
+      "max": 300000,
+      "unit": "ms",
+      "summary": "Deadline for a Pi to synthesize and play a sentence, measured from mcp-core.",
+      "guidance": "Must stay comfortably above spc.speak_timeout_s on the Pi itself, or mcp-core gives up while the Pi is still talking."
+    },
+    {
+      "key": "spc.timeout_screen_ms",
+      "scope": "server",
+      "type": "int",
+      "default": 6000,
+      "min": 500,
+      "max": 60000,
+      "unit": "ms",
+      "summary": "Deadline for a face or panel update on a Pi, measured from mcp-core."
+    },
+
+    {
+      "key": "spc.look_timeout_s",
+      "scope": "device",
+      "type": "int",
+      "default": 15,
+      "min": 1,
+      "max": 120,
+      "unit": "s",
+      "summary": "How long the Pi itself allows a camera capture to run before killing it."
+    },
+    {
+      "key": "spc.speak_timeout_s",
+      "scope": "device",
+      "type": "int",
+      "default": 55,
+      "min": 1,
+      "max": 300,
+      "unit": "s",
+      "summary": "How long the Pi itself allows synthesis plus playback to run before killing it.",
+      "guidance": "Keep it below spc.timeout_speak_ms so the Pi is the one that gives up first and can report why."
+    },
+    {
+      "key": "spc.sense_timeout_s",
+      "scope": "device",
+      "type": "int",
+      "default": 5,
+      "min": 1,
+      "max": 60,
+      "unit": "s",
+      "summary": "How long the Pi allows a presence/sensor command to run."
+    },
+    {
+      "key": "spc.volume_timeout_s",
+      "scope": "device",
+      "type": "int",
+      "default": 5,
+      "min": 1,
+      "max": 60,
+      "unit": "s",
+      "summary": "How long the Pi allows a mixer volume command to run."
+    },
+    {
+      "key": "spc.listen_silence_s",
+      "scope": "device",
+      "type": "number",
+      "default": 1.2,
+      "min": 0.2,
+      "max": 10,
+      "unit": "s",
+      "summary": "The Pi's own auto-stop: silence after speech before it stops recording.",
+      "guidance": "The OrangePi equivalent of listen.silence_hold_ms. A caller that passes silence_s explicitly overrides this; it is the default when they do not."
+    },
+    {
+      "key": "spc.listen_timeout_s",
+      "scope": "device",
+      "type": "number",
+      "default": 12,
+      "min": 1,
+      "max": 120,
+      "unit": "s",
+      "summary": "Default hard cap on one listen turn on the Pi when the caller does not give one."
+    },
+
+    {
+      "key": "order.confirm_required",
+      "scope": "agent",
+      "type": "bool",
+      "default": true,
+      "summary": "Whether the order-taker must hear an explicit confirmation before finalizing.",
+      "guidance": "Turning this off makes a small model's premature 'confirmed' finalize a half-spoken order. It exists for kiosks where a screen tap is the only confirmation."
+    },
+    {
+      "key": "order.max_items",
+      "scope": "agent",
+      "type": "int",
+      "default": 5,
+      "min": 1,
+      "max": 20,
+      "unit": "items",
+      "summary": "Rows the order screen shows before it stops listing them.",
+      "guidance": "The box's 320x240 screen fits about five rows at a readable size. Raising this past what fits does not make the rest visible."
+    },
+    {
+      "key": "order.prep_minutes",
+      "scope": "agent",
+      "type": "int",
+      "default": 10,
+      "min": 0,
+      "max": 180,
+      "unit": "minutes",
+      "summary": "How long the customer is told their food will take.",
+      "guidance": "The one number in the whole conversation that changes with the queue rather than with the hardware. Raise it at lunch rush."
+    },
+    {
+      "key": "order.llm_temperature",
+      "scope": "agent",
+      "type": "number",
+      "default": 0,
+      "min": 0,
+      "max": 2,
+      "summary": "Sampling temperature for the order-extraction model.",
+      "guidance": "This is structured extraction, not writing. At the usual ~0.8 default a small model dropped items from orders it had just been read. Leave it at 0 unless you are deliberately experimenting."
+    },
+    {
+      "key": "order.currency",
+      "scope": "agent",
+      "type": "string",
+      "default": "RM",
+      "max_length": 8,
+      "summary": "Currency prefix printed before every price.",
+      "guidance": "Display only — it does no conversion. Prices themselves live in the menu."
+    }
+  ]
+}

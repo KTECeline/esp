@@ -1,0 +1,13 @@
+{
+  "name": "error",
+  "label": "Error",
+  "emoji": "😵",
+  "description": "Crossed-out eyes in red. For a failure someone in the room should notice.",
+  "eyes": {
+    "left": "cross",
+    "right": "cross"
+  },
+  "brow": "angry",
+  "mouth": "frown",
+  "ink": "#ff7a7a"
+}

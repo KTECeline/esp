@@ -1,0 +1,30 @@
+{
+  "_note": "What the face contract still fixes, now that expressions are data. Gazes and panel modes ARE still fixed here: they are drawn by branches compiled into both renderers, so adding one is a code change in two languages, and this file plus test/face-spec.test.mjs is what stops those branches drifting apart. Expressions are no longer fixed — they are JSON files on each device (spc-agent/expressions/*.json, plus /etc/spc/expressions and ~/.spc/expressions), loaded by spc_expressions.py and served from the device's GET /expressions. mcp-tools.js therefore validates gaze and panel mode against this file and does NOT validate expression at all; the device does that, because only the device knows what a user dropped on it.",
+
+  "_builtin_note": "builtin_expressions is the ten that ship, duplicated in spc_expressions.py's BUILTIN dict so a device that lost its expressions directory mid-deploy still boots its screen. It is NOT an enum — it is the floor every device is guaranteed to clear, and mcp-tools.js quotes it in spc_expression's description so a model has something safe to reach for without a lookup. A device may have more; spc_list_devices reports each one's actual list.",
+
+  "_geometry_note": "Shape names are the browser page's (spc_face.py), and an expression JSON's inline coordinates are in its 400x300 face box, because that is the space a user can look at while drawing one. spc_fb.py maps both onto framebuffer units — it calls a closed eye \"arc_down\" internally and scales canonical coordinates by a measured constant. The two builtin shape tables stay separate on purpose: they were hand-tuned, not derived from each other, and forcing them through one set of numbers would move faces that are already right.",
+
+  "builtin_expressions": [
+    "neutral",
+    "happy",
+    "listening",
+    "thinking",
+    "speaking",
+    "confused",
+    "sad",
+    "wink",
+    "sleeping",
+    "error"
+  ],
+
+  "shapes": {
+    "eyes": ["open", "wide", "narrow", "happy", "closed", "cross"],
+    "brows": ["flat", "raised", "angry", "sad", "none"],
+    "mouths": ["smile", "grin", "small", "flat", "frown", "open", "wave"]
+  },
+
+  "gazes": ["center", "left", "right", "up", "down"],
+
+  "panel_modes": ["message", "qr", "choices", "order", "blank"]
+}

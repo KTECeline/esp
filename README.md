@@ -30,7 +30,7 @@ The tree resolves paths from its own location, so it does **not** have to live a
 
 ## Quick reference
 
-```bash
+```bashget
 ./check_setup.sh                        # is everything installed?  (new machine)
 ./start_voice_assistant.sh [box_ip]     # start the whole stack
 ./check_health.sh                       # is everything running?    (before a demo)
@@ -137,6 +137,7 @@ what each machine actually *is*.
 | sense | `esp_sense` | `spc_sense` | Presence radar on a box; whatever is wired up on a Pi |
 | show | `esp_display` | — | Caption or itemized screen. Display only, no sound |
 | session | `esp_set_occupied` | — | Force a session start/end, bypassing the presence radar |
+| tune | `fleet_settings_list`, `fleet_settings_set`, `fleet_settings_reset` | (same tools) | The knobs that used to be constants — see [Runtime settings](#runtime-settings--tuning-the-fleet-without-a-reflash) |
 
 **The two listen tools are not the same shape, and the difference is real
 hardware, not an inconsistency.** A Pi records **on demand** — `spc_listen`
@@ -179,6 +180,49 @@ Claude Code, as one example client:
 claude mcp add --transport http mcp-core http://<mac-ip>:8000/mcp \
   --header "Authorization: Bearer $ESP_MCP_TOKEN"
 ```
+
+## Runtime settings — tuning the fleet without a reflash
+
+The numbers that decide how the box *feels* — how long it waits before it stops
+listening, how loud counts as speech, how long the payment QR window stays open,
+how long you tell the customer their food will take — used to be constants in
+three different languages: a `#define` in `listen_v2.c`, a `const` in
+`server.js`, a dict in `spc_agent.py`. Changing one meant an edit and a restart,
+and for the box ones a **reflash**. So in practice they never changed, and a
+voice-activity threshold measured once, in one room, on one day, became the
+answer for every box everywhere.
+
+They are settings now. One catalog
+([`mcp-core/settings-spec.json`](mcp-core/settings-spec.json)) declares each
+knob's range, default and meaning; one endpoint changes them; one push gets them
+onto the hardware.
+
+```bash
+curl -s localhost:8000/settings                # every knob, with its range and what it does
+curl -s -X PATCH localhost:8000/settings \
+     -d '{"listen.silence_hold_ms": 1800}'     # the box now waits longer before auto-stopping
+```
+
+The same three verbs are MCP tools (`fleet_settings_list`,
+`fleet_settings_set`, `fleet_settings_reset`), which is the point: **the agent
+can tune the box it is standing in front of.** A customer who keeps getting cut
+off mid-sentence is a `listen.silence_hold_ms` problem the agent can now fix
+during the conversation, rather than a bug report.
+
+What is *not* a setting: addresses, tokens, which backend, which camera, which
+speech engine. Those stay in `config.json`, because getting one wrong takes the
+fleet offline — and keeping them out of reach is exactly why the settings tools
+are safe to hand to a model.
+
+Changes are range-checked on the server, clamped **again** on the box and on the
+Pi (different bounds, different job: the server stops a silly number, the device
+stops an unusable one), saved, and pushed. A box that is switched off when you
+change something is not an error — the store is the source of truth and the
+adoption sweep catches it up, with `in_sync` in `GET /settings` telling you
+whether a change has actually landed on the glass.
+
+Full detail, including the four scopes and how to add a knob:
+[`mcp-core/README.md`](mcp-core/README.md#runtime-settings--the-knobs-and-who-may-turn-them).
 
 ## Speech engines — local or hosted, by config
 

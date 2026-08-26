@@ -9,8 +9,43 @@
 // server.js — server.js imports this file, so importing back would be circular.
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 import { asciiOneline, sendCaption, sendDisplay, sendSessionOverride } from "./boxes.js";
 import { wsHas } from "./ws-hub.js";
+
+// What is left of the fixed face vocabulary: gazes and panel modes, which are
+// still branches compiled into both renderers and so still have to agree.
+//
+// Expressions are NOT here any more. They are JSON files on each device, and
+// the device validates them — see the note in face-spec.json. All this file
+// still carries about them is `builtin_expressions`, the ten every device is
+// guaranteed to have, quoted into spc_expression's description as a safe
+// default rather than enforced as an enum.
+//
+// Read at import time and hard-failed on: face-spec.json ships in this
+// directory alongside this file, so its absence means a broken install, and a
+// server that came up anyway would register an expression enum it invented.
+const FACE_SPEC = (() => {
+  const specPath = join(dirname(fileURLToPath(import.meta.url)), "face-spec.json");
+  let spec;
+  try {
+    spec = JSON.parse(readFileSync(specPath, "utf8"));
+  } catch (err) {
+    throw new Error(
+      `Cannot read the face vocabulary at ${specPath}: ${err.message}. ` +
+      `It ships next to mcp-tools.js — restore it from the repo rather than ` +
+      `hardcoding expression names here.`
+    );
+  }
+  for (const key of ["builtin_expressions", "gazes", "panel_modes"]) {
+    if (!Array.isArray(spec[key]) || spec[key].length === 0) {
+      throw new Error(`face-spec.json is missing a non-empty "${key}" array.`);
+    }
+  }
+  return spec;
+})();
 
 // MCP clients consume tool failures through the protocol's own error shape, so
 // a raw JS throw escaping a handler is something a model can't reason about.
@@ -105,7 +140,8 @@ function resolveSpc(spc, cap, deviceId) {
   return { device };
 }
 
-export function createMcpServer({ boxes, speakToBox, vision, spc, transcribe, waitForTranscript }) {
+export function createMcpServer({ boxes, speakToBox, vision, spc, transcribe, waitForTranscript,
+                                  settings, settingsSync }) {
   const server = new McpServer({ name: "mcp-core", version: "1.0.0" });
 
   // ---- esp_list_boxes ------------------------------------------------------
@@ -512,7 +548,7 @@ export function createMcpServer({ boxes, speakToBox, vision, spc, transcribe, wa
       {
         title: "List OrangePi Devices",
         description:
-          "Lists every OrangePi (single-board computer) attached to this fleet, what each can do, and whether each is answering right now. Call this first to discover valid device_id values for the other spc tools.\n\nThese are NOT the ESP voice boxes — those are separate hardware with their own esp_* tools. A Pi is a small Linux machine that can have a microphone, a speaker, sensors and optionally a camera.\n\nArgs:\n  (none)\n\nReturns:\n  { \"devices\": [{ \"id\": string, \"name\": string, \"base_url\": string, \"capabilities\": string[], \"online\": boolean, \"reports\": string[]|null }] }\n\nExamples:\n  - Use when: you need to know which Pi to talk through, or whether one is reachable\n  - Use when: an spc tool failed and you want to know if the device is simply off\n  - Don't use when: you want the ESP boxes (use esp_list_boxes)\n\nError Handling:\n  - Never errors; an empty list means no Pi is configured in this deployment\n  - online=false means the Pi did not answer — powered off, spc-agent not running, or its Tailscale name no longer resolves\n  - `capabilities` is what this server is configured to expose; `reports` is what the Pi itself says it has. If they disagree, the hardware and the config are out of sync and the extra tools will fail\n  - reports is null for an offline device, since it could not be asked",
+          "Lists every OrangePi (single-board computer) attached to this fleet, what each can do, and whether each is answering right now. Call this first to discover valid device_id values for the other spc tools.\n\nThese are NOT the ESP voice boxes — those are separate hardware with their own esp_* tools. A Pi is a small Linux machine that can have a microphone, a speaker, sensors and optionally a camera.\n\nArgs:\n  (none)\n\nReturns:\n  { \"devices\": [{ \"id\": string, \"name\": string, \"base_url\": string, \"capabilities\": string[], \"online\": boolean, \"reports\": string[]|null, \"text\": { \"cjk_glyphs\": number, \"latin\": boolean, \"renderer\": string, \"note\": string }|absent }] }\n\nExamples:\n  - Use when: you need to know which Pi to talk through, or whether one is reachable\n  - Use when: an spc tool failed and you want to know if the device is simply off\n  - Don't use when: you want the ESP boxes (use esp_list_boxes)\n\nError Handling:\n  - Never errors; an empty list means no Pi is configured in this deployment\n  - online=false means the Pi did not answer — powered off, spc-agent not running, or its Tailscale name no longer resolves\n  - `capabilities` is what this server is configured to expose; `reports` is what the Pi itself says it has. If they disagree, the hardware and the config are out of sync and the extra tools will fail\n  - reports is null for an offline device, since it could not be asked\n  - `text` appears only for a device with a screen, and says what that screen can SPELL. A panel renders any character it has no glyph for as \"?\", silently. cjk_glyphs is a curated subset (roughly the common Chinese characters), NOT all of Unicode — Japanese kana and rarer hanzi are usually absent. Check it before writing non-Latin text to a panel, and read `undrawable` in spc_expression's reply to find out about one specific string",
         annotations: {
           readOnlyHint: true,
           destructiveHint: false,
@@ -530,7 +566,16 @@ export function createMcpServer({ boxes, speakToBox, vision, spc, transcribe, wa
               base_url: d.baseUrl,
               capabilities: d.capabilities,
               online: health.online,
-              reports: health.online ? (health.capabilities ?? []) : null
+              reports: health.online ? (health.capabilities ?? []) : null,
+              // What the screen can actually spell. Only devices with a screen
+              // send this, and only mid-conversation reachable ones — so it is
+              // omitted rather than nulled, keeping the common case (a box with
+              // no screen) exactly as terse as it was.
+              ...(health.text ? { text: health.text } : {}),
+              // What this Pi's screen can draw. Per-device because expressions
+              // are files a user can add, so this is the only way to find out
+              // about one that is not in the builtin ten.
+              ...(health.expressions ? { expressions: health.expressions } : {})
             };
           })
         );
@@ -653,7 +698,7 @@ export function createMcpServer({ boxes, speakToBox, vision, spc, transcribe, wa
       const SpcPanelInput = z
         .object({
           mode: z
-            .enum(["message", "qr", "choices", "order", "blank"])
+            .enum(FACE_SPEC.panel_modes)
             .describe("Which layout to draw: message (a line of text), qr (a scannable code), choices (large tiles), order (itemized list), blank (clear the panel, leaving only the face)."),
           title: z.string().max(60).optional().describe("The large line. Used by message, choices and order."),
           subtitle: z
@@ -705,11 +750,23 @@ export function createMcpServer({ boxes, speakToBox, vision, spc, transcribe, wa
             .optional()
             .describe("Which OrangePi's screen to change. Optional when only one configured device has one."),
           expression: z
-            .enum(["neutral", "happy", "listening", "thinking", "speaking", "confused", "sad", "wink", "sleeping", "error"])
+            // Not an enum. It used to be, sourced from face-spec.json, and that
+            // was right while the ten faces were compiled into both renderers.
+            // They are JSON files on the device now — a user adds one by dropping
+            // a file — so the valid set is per-device and changes without this
+            // process being told. An enum here would reject a face that is
+            // sitting on the glass. The device validates instead, and its error
+            // names what it actually has; spc_list_devices reports the same list
+            // so a model can look before it guesses.
+            .string()
             .optional()
-            .describe("The face in the upper half. Omit to leave the current face alone."),
+            .describe(
+              `The face in the upper half. Omit to leave the current face alone. ` +
+              `Every device draws at least these: ${FACE_SPEC.builtin_expressions.join(", ")}. ` +
+              `A device may have more — spc_list_devices reports each one's full list under "expressions".`
+            ),
           gaze: z
-            .enum(["center", "left", "right", "up", "down"])
+            .enum(FACE_SPEC.gazes)
             .optional()
             .describe("Where the eyes look. Omit for the expression's own default."),
           panel: SpcPanelInput.optional().describe("The lower half. Omit to leave whatever is already shown.")
@@ -721,7 +778,7 @@ export function createMcpServer({ boxes, speakToBox, vision, spc, transcribe, wa
         {
           title: "Set an OrangePi's Face and Screen",
           description:
-            "Drives the screen attached to an OrangePi. The screen has two halves and this one tool sets either or both: an animated FACE on top (eyes, brows, mouth) and a PANEL below (a message, a QR code, choice tiles, or an order summary).\n\nWhatever you leave out stays as it is. Send only `expression` to change the face while a QR code stays up for scanning; send only `panel` to change what is written without changing the mood. The face keeps blinking and breathing on its own between calls — you never need to call this to keep it alive.\n\nThis is the Pi's screen, not an ESP box's small LCD (that is esp_display), and it makes no sound (that is spc_speak). A natural turn is: set a listening face, listen, set a thinking face, then speak and show what you said.\n\nArgs:\n  - device_id (string, optional): target Pi; defaults to the only screen-equipped device\n  - expression (string, optional): neutral, happy, listening, thinking, speaking, confused, sad, wink, sleeping, error\n  - gaze (string, optional): center, left, right, up, down\n  - panel (object, optional): { mode } plus the fields that mode uses:\n      mode=message  title, subtitle\n      mode=qr       qr_data (required), qr_caption\n      mode=choices  title, subtitle, choices[{id,label,icon}]\n      mode=order    title, items[{name,qty,price}], total, note\n      mode=blank    clears the panel, leaving the face alone\n\nReturns:\n  { \"updated\": true, \"device_id\": string, \"expression\": string, \"panel_mode\": string, \"version\": number }\n\nExamples:\n  - Use when: you are about to listen and want the face to show it (expression=listening)\n  - Use when: showing a payment or menu QR the customer scans with their phone\n  - Use when: mirroring the sentence you are speaking, as panel.subtitle, so it can be read as well as heard\n  - Don't use when: you want the ESP box's screen (use esp_display), or you want sound (use spc_speak)\n\nError Handling:\n  - Returns an error naming valid ids if device_id is unknown, ambiguous, or has no screen\n  - Returns an error if neither expression, gaze nor panel is given — there would be nothing to change\n  - Returns an error if mode=qr arrives without qr_data, since there would be nothing to encode\n  - Returns an error explaining what to check if the Pi is unreachable\n  - Succeeds even if nobody is looking at the screen and even if no browser is currently showing it: the state is stored on the Pi and the panel picks it up when it next connects\n  - Prices and totals are shown exactly as given; this server never computes them",
+            "Drives the screen attached to an OrangePi. The screen has two halves and this one tool sets either or both: an animated FACE on top (eyes, brows, mouth) and a PANEL below (a message, a QR code, choice tiles, or an order summary).\n\nWhatever you leave out stays as it is. Send only `expression` to change the face while a QR code stays up for scanning; send only `panel` to change what is written without changing the mood. The face keeps blinking and breathing on its own between calls — you never need to call this to keep it alive.\n\nThis is the Pi's screen, not an ESP box's small LCD (that is esp_display), and it makes no sound (that is spc_speak). A natural turn is: set a listening face, listen, set a thinking face, then speak and show what you said.\n\nArgs:\n  - device_id (string, optional): target Pi; defaults to the only screen-equipped device\n  - expression (string, optional): the face. Every device has neutral, happy, listening, thinking, speaking, confused, sad, wink, sleeping, error. A device may have more — expressions are JSON files someone can add to a Pi, so call spc_list_devices and read its \"expressions\" list before assuming. An unknown name comes back as an error naming what that device actually has\n  - gaze (string, optional): center, left, right, up, down\n  - panel (object, optional): { mode } plus the fields that mode uses:\n      mode=message  title, subtitle\n      mode=qr       qr_data (required), qr_caption\n      mode=choices  title, subtitle, choices[{id,label,icon}]\n      mode=order    title, items[{name,qty,price}], total, note\n      mode=blank    clears the panel, leaving the face alone\n\nReturns:\n  { \"updated\": true, \"device_id\": string, \"expression\": string, \"panel_mode\": string, \"version\": number, \"undrawable\": string|absent, \"warning\": string|absent }\n\nExamples:\n  - Use when: you are about to listen and want the face to show it (expression=listening)\n  - Use when: showing a payment or menu QR the customer scans with their phone\n  - Use when: mirroring the sentence you are speaking, as panel.subtitle, so it can be read as well as heard\n  - Don't use when: you want the ESP box's screen (use esp_display), or you want sound (use spc_speak)\n\nError Handling:\n  - Returns an error naming valid ids if device_id is unknown, ambiguous, or has no screen\n  - Returns an error listing that device's expressions if `expression` is not one it has. That list is per-device and can grow without this server restarting, so trust the error over any list you remember\n  - Returns an error if neither expression, gaze nor panel is given — there would be nothing to change\n  - Returns an error if mode=qr arrives without qr_data, since there would be nothing to encode\n  - Returns an error explaining what to check if the Pi is unreachable\n  - Succeeds even if nobody is looking at the screen and even if no browser is currently showing it: the state is stored on the Pi and the panel picks it up when it next connects\n  - Prices and totals are shown exactly as given; this server never computes them\n  - The panel draws any character the screen has no glyph for as \"?\", and still reports success. When that happens the reply carries `undrawable` (those exact characters) and a `warning` — the panel IS up, so this is not an error, but the text on the glass is not what you sent. Re-send it in characters the screen covers. spc_list_devices `text` says what it has: Latin always, plus a curated Chinese subset if the device has one, so Japanese kana and rare hanzi are the usual casualties",
           inputSchema: SpcExpressionInput,
           annotations: {
             readOnlyHint: false,
@@ -748,16 +805,93 @@ export function createMcpServer({ boxes, speakToBox, vision, spc, transcribe, wa
             if (gaze !== undefined) patch.gaze = gaze;
             if (panel !== undefined) patch.panel = panel;
             const result = await device.display(patch);
-            console.log(`[${device.id}] spc_expression: ${result.expression} / ${result.panel_mode}`);
+            console.log(
+              `[${device.id}] spc_expression: ${result.expression} / ${result.panel_mode}` +
+              (result.undrawable ? ` [undrawable: ${result.undrawable}]` : "")
+            );
             return mcpJson({
               updated: true,
               device_id: device.id,
               expression: result.expression,
               panel_mode: result.panel_mode,
-              version: result.version
+              version: result.version,
+              // The panel went up either way; these characters are showing as
+              // '?' on it. Surfaced so a model can rewrite the text rather than
+              // believing it displayed something the glass cannot spell.
+              ...(result.undrawable
+                ? {
+                    undrawable: result.undrawable,
+                    warning:
+                      `This screen has no glyph for: ${result.undrawable}. ` +
+                      `Those characters are showing as "?". Re-send the panel using ` +
+                      `characters it covers — call spc_list_devices to see what it has.`
+                  }
+                : {})
             });
           } catch (err) {
             return mcpError(`Could not update the screen on "${device.id}": ${err.message}`);
+          }
+        }
+      );
+    }
+
+    if (spc.any("volume")) {
+      const SpcVolumeInput = z
+        .object({
+          device_id: z
+            .string()
+            .optional()
+            .describe("Which OrangePi's volume to read or change. Optional when only one configured device has a volume control; use spc_list_devices to find valid ids."),
+          level: z
+            .number()
+            .int()
+            .min(0)
+            .max(100)
+            .optional()
+            .describe("New loudness, 0-100. OMIT THIS to read the current level without changing anything.")
+        })
+        .strict();
+
+      server.registerTool(
+        "spc_volume",
+        {
+          title: "Read or Set an OrangePi's Speaker Volume",
+          description:
+            "Reads or changes how loud an OrangePi's speaker is, on a 0-100 scale.\n\nOmit `level` to READ the current volume and change nothing. Pass `level` to SET it. The value that comes back is what the hardware actually settled on, which can differ by a percent from what you asked for, so trust the response over your request.\n\nUse the read form first whenever someone asks for a relative change — \"turn it down a bit\", \"louder\" — because the same words mean different numbers depending on where it already is. A reasonable step is 15-20 points.\n\nThis changes playback loudness only. It does not affect the microphone, and it is not a mute for the screen (that is spc_expression).\n\nArgs:\n  - device_id (string, optional): target Pi; defaults to the only volume-capable device\n  - level (integer, optional): 0-100. Omit to read.\n\nReturns:\n  { \"device_id\": string, \"volume\": number, \"changed\": boolean, \"previous\": number|null }\n\nExamples:\n  - Use when: someone says it is too loud or too quiet\n  - Use when: a web UI or another tool needs to show the current level\n  - Use when: dropping the volume before speaking late at night, then restoring it\n  - Don't use when: you want silence for one utterance — simply do not call spc_speak\n  - Don't use when: the person is at an ESP box; these are different speakers in different places\n\nError Handling:\n  - Returns an error naming valid ids if device_id is unknown, ambiguous, or has no volume control\n  - Returns an error explaining what to check if the Pi is unreachable\n  - level is clamped to 0-100 rather than rejected, so 150 sets 100 and reports 100\n  - 0 is silence, not mute: the speaker is still selected and spc_speak still reports spoken=true, so a caller who set 0 and forgot is the usual reason for \"it says it spoke but I heard nothing\"\n  - A device can have a speaker but NO volume control, if its firmware exposes no mixer. Then this tool is absent for that device and loudness is fixed in hardware",
+          inputSchema: SpcVolumeInput,
+          annotations: {
+            readOnlyHint: false,
+            destructiveHint: false,
+            idempotentHint: true,
+            openWorldHint: false
+          }
+        },
+        async ({ device_id, level }) => {
+          const { device, error } = resolveSpc(spc, "volume", device_id);
+          if (error) return mcpError(error);
+          try {
+            // Read first even when setting: `previous` is what makes a relative
+            // follow-up ("a bit more") possible without a second round trip, and
+            // it is the only way the caller can tell a no-op from a real change.
+            const before = await device.getVolume();
+            if (level === undefined) {
+              return mcpJson({
+                device_id: device.id,
+                volume: before.volume,
+                changed: false,
+                previous: null
+              });
+            }
+            const after = await device.setVolume(level);
+            console.log(`[${device.id}] spc_volume: ${before.volume} -> ${after.volume}`);
+            return mcpJson({
+              device_id: device.id,
+              volume: after.volume,
+              changed: after.volume !== before.volume,
+              previous: before.volume
+            });
+          } catch (err) {
+            return mcpError(`Could not ${level === undefined ? "read" : "set"} the volume on "${device.id}": ${err.message}`);
           }
         }
       );
@@ -848,6 +982,120 @@ export function createMcpServer({ boxes, speakToBox, vision, spc, transcribe, wa
         }
       );
     }
+  }
+
+  // ---- fleet_settings_* ----------------------------------------------------
+  // The knobs that used to be constants, exposed so the agent can tune the
+  // hardware it is standing in front of.
+  //
+  // Registered only when a store was injected, following the same rule as the
+  // vision and spc tools: a tool that exists but cannot work is worse than a
+  // tool that is absent, because a model will keep trying it.
+  if (settings) {
+    server.registerTool(
+      "fleet_settings_list",
+      {
+        title: "List Fleet Settings",
+        description:
+          "Lists every runtime-tunable setting in the fleet: what it currently is, what it defaults to, the range it accepts, and what it actually controls. Call this before fleet_settings_set — the descriptions say what each knob does to the customer's experience, and the ranges are enforced.\n\nThese are behaviour knobs (how long to wait, how loud counts as speech, how many items fit on screen), not wiring. Addresses, tokens and which speech engine to use are NOT here; those live in config.json and are a human's job.\n\nArgs:\n  - scope (string, optional): filter to one of server, box, device, agent. Omit for all\n\nReturns:\n  { \"revision\": number, \"settings\": [{ \"key\", \"scope\", \"type\", \"value\", \"default\", \"min\", \"max\", \"unit\", \"modified\", \"summary\", \"guidance\" }], \"hardware\": [{ \"id\", \"name\", \"in_sync\" }] }\n\nWhat scope tells you:\n  - server: this server reads it live; a change applies to the next thing that uses it\n  - box: it lives on the ESP voice boxes and is pushed to them when changed\n  - device: it lives on an OrangePi and is pushed there when changed\n  - agent: this server does not use it at all; the ordering agent reads it\n\nExamples:\n  - Use when: you are about to change a setting and need its exact key and range\n  - Use when: someone asks why the box cuts them off, or waits too long, and you want to see the current tuning\n  - Don't use when: you want the fleet's addresses or hardware inventory (use esp_list_boxes / spc_list_devices)\n\nError Handling:\n  - Never errors; an unknown scope returns an error naming the valid ones\n  - modified=true means someone has changed that key from its shipped default\n  - hardware[].in_sync=false means a box has not yet acknowledged the current revision — usually it is switched off, and it will catch up on its own when it comes back",
+        inputSchema: z.object({
+          scope: z
+            .enum(["server", "box", "device", "agent"])
+            .optional()
+            .describe("Limit to one scope. Omit to list everything.")
+        }).strict(),
+        annotations: {
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false
+        }
+      },
+      async ({ scope }) =>
+        mcpJson({
+          revision: settings.revision,
+          settings: settings.describe(scope),
+          hardware: settingsSync ? settingsSync() : []
+        })
+    );
+
+    server.registerTool(
+      "fleet_settings_set",
+      {
+        title: "Change Fleet Settings",
+        description:
+          "Changes one or more runtime settings and, for anything that lives on hardware, pushes it to the boxes and Pis straight away. The change is saved, so it survives a restart.\n\nEvery value is range-checked against the catalog, and the whole change is all-or-nothing: if one key is rejected, nothing is applied and the error says which key and why. Call fleet_settings_list first for the exact key names, ranges, and what each one does.\n\nArgs:\n  - changes (object): { \"key\": value } for one or more keys, e.g. { \"listen.silence_hold_ms\": 1800 }\n  - reason (string, optional): why, for the server log. Worth sending — it is what makes an odd value understandable later\n\nReturns:\n  { \"revision\": number, \"changed\": [{ \"key\", \"scope\", \"from\", \"to\" }], \"unchanged\": [string], \"pushed_to_hardware\": boolean }\n\nExamples:\n  - Use when: the customer was cut off mid-sentence — raise listen.silence_hold_ms\n  - Use when: the box never stops recording in a noisy room — raise listen.silence_peak\n  - Use when: the kitchen is backed up — raise order.prep_minutes\n  - Use when: someone asks for a longer or shorter payment window — pay.scan_timeout_ms\n  - Don't use when: you need to change an address, a token, or which speech engine runs. Those are in config.json on purpose and are not settings\n\nError Handling:\n  - Returns an error naming the key and its valid range if a value is out of bounds; NOTHING is changed in that case, including the other keys in the same call\n  - Returns an error suggesting near-matching keys if a key does not exist\n  - Keys already at the requested value come back in `unchanged` and are not an error\n  - Succeeds even when a box is switched off: the change is stored here and delivered when that box next comes back. Check hardware[].in_sync in fleet_settings_list to see whether it has landed yet\n  - A setting marked takes_effect \"on the next mcp-core restart\" is saved but not live; the reply says so",
+        inputSchema: z.object({
+          changes: z
+            .record(z.string(), z.union([z.string(), z.number(), z.boolean()]))
+            .describe("Keys and their new values, e.g. { \"listen.silence_hold_ms\": 1800, \"order.prep_minutes\": 20 }"),
+          reason: z
+            .string()
+            .max(200)
+            .optional()
+            .describe("Why this is being changed. Logged next to the change.")
+        }).strict(),
+        annotations: {
+          readOnlyHint: false,
+          // Not destructive in the sense that matters: every change is bounded,
+          // reversible with fleet_settings_reset, and cannot break the fleet's
+          // ability to be reached — that is the reason wiring stays in
+          // config.json and out of this tool's reach.
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false
+        }
+      },
+      async ({ changes, reason }) => {
+        try {
+          const result = await settings.set(changes, { actor: `agent${reason ? ` (${reason})` : ""}` });
+          return mcpJson({
+            revision: result.revision,
+            changed: result.changed,
+            unchanged: result.unchanged ?? [],
+            pushed_to_hardware: result.changed.some((c) => c.scope === "box" || c.scope === "device")
+          });
+        } catch (err) {
+          return mcpError(err.message);
+        }
+      }
+    );
+
+    server.registerTool(
+      "fleet_settings_reset",
+      {
+        title: "Reset Fleet Settings to Defaults",
+        description:
+          "Puts settings back to the values the software ships with, and forgets the override. Use this to undo tuning that made things worse, rather than trying to remember what a value used to be.\n\nResetting is not the same as setting a key to today's default: a reset key FOLLOWS the default from then on, so a better default in a future version reaches this install. Writing the number back by hand would pin it forever.\n\nArgs:\n  - keys (array of strings, optional): which settings to reset\n  - all (boolean, optional): reset every setting that has been changed. Requires keys to be omitted\n\nReturns:\n  { \"revision\": number, \"changed\": [{ \"key\", \"scope\", \"from\", \"to\" }] }\n\nExamples:\n  - Use when: a tuning change made things worse and you want the known-good value back\n  - Use when: handing a box to someone else and you want it behaving as shipped\n  - Don't use when: you want a specific value (use fleet_settings_set)\n\nError Handling:\n  - Returns an error if neither keys nor all is given — resetting the whole fleet by accident is too easy otherwise\n  - Returns an error suggesting near-matching keys if a key does not exist\n  - Keys that were never changed are skipped silently; an empty `changed` list means there was nothing to undo",
+        inputSchema: z.object({
+          keys: z.array(z.string()).min(1).optional().describe("Setting keys to reset."),
+          all: z.boolean().optional().describe("Reset every changed setting. Cannot be combined with keys.")
+        }).strict(),
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false
+        }
+      },
+      async ({ keys, all }) => {
+        if (keys && all) {
+          return mcpError("Give either keys or all:true, not both — they mean different things.");
+        }
+        if (!keys && !all) {
+          return mcpError(
+            "Nothing to reset. Pass keys:[...] for specific settings, or all:true to clear every override. " +
+            "Use fleet_settings_list to see which settings are currently modified."
+          );
+        }
+        try {
+          const result = await settings.reset(all ? "all" : keys, { actor: "agent" });
+          return mcpJson({ revision: result.revision, changed: result.changed });
+        } catch (err) {
+          return mcpError(err.message);
+        }
+      }
+    );
   }
 
   return server;

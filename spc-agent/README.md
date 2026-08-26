@@ -8,9 +8,12 @@ Anything that answers those routes is a valid `spc` device. This implementation
 is a convenience, not a requirement — swap it for your own agent and mcp-core
 won't notice.
 
-Three files: `spc_agent.py` is the service, `spc_face.py` is the page it serves
-to a browser on an attached panel, and `spc_fb.py` draws that same screen
-straight to the framebuffer when there is no browser to serve it to.
+`spc_agent.py` is the service. `spc_face.py` is the page it serves to a browser
+on an attached panel, `spc_fb.py` draws that same screen straight to the
+framebuffer when there is no browser to serve it to, and `spc_faceparts.py` is
+the geometry both of them share. `spc_expressions.py` loads the faces, which are
+JSON files in `expressions/` — see [Adding a face](#adding-a-face). `spc_picker.py`
+is the page at `/faces` where you look at them and pick one.
 
 ## Install on the Pi
 
@@ -29,8 +32,9 @@ sudo apt install alsa-utils sox espeak-ng ffmpeg   # drop what you don't need
 | `ffmpeg` | `look` | no camera (`fswebcam` also works) |
 | a browser (`chromium`) | `screen` | only for `GET /face`; `spc_fb.py` needs nothing at all |
 
-Copy `spc_agent.py` **and `spc_face.py`** to the Pi, side by side, then check
-what it found:
+Copy `spc_agent.py` **and `spc_face.py`, `spc_faceparts.py`, `spc_picker.py`,
+`spc_expressions.py` and the `expressions/` directory** to the Pi, side by side,
+then check what it found:
 
 ```bash
 python3 spc_agent.py --help     # prints resolved config + detected capabilities
@@ -170,6 +174,45 @@ only the Pi knows when its own audio stopped.
 Records until you stop talking or `timeout_s` elapses. **204 means nobody
 spoke** — a normal outcome of listening, not an error.
 
+Both fields are optional. Leaving one out means "use this Pi's configured
+default" (`spc.listen_timeout_s` / `spc.listen_silence_s` below) rather than a
+number buried in the caller — so the auto-stop tuning has one home.
+
+### `GET /settings` → 200, `PATCH /settings` → 200
+
+The knobs mcp-core can change without anyone touching this Pi.
+
+```json
+{ "revision": 9,
+  "settings": { "spc.look_timeout_s": 15, "spc.speak_timeout_s": 55,
+                "spc.sense_timeout_s": 5, "spc.volume_timeout_s": 5,
+                "spc.listen_silence_s": 1.2, "spc.listen_timeout_s": 12 } }
+```
+
+`PATCH` takes the same shape and **merges**: keys left out keep their current
+values, which is what lets mcp-core push only the device-scoped subset without
+restating everything else. It answers with what changed, and with `ignored` —
+keys this build has no code for, reported rather than silently accepted, so a
+newer mcp-core pushing a knob this version predates shows up as a fact instead
+of a setting that appears to work and does nothing.
+
+Values are persisted to `~/.spc_settings.json` (or `SPC_SETTINGS_FILE`) so a reboot
+does not quietly revert to defaults while mcp-core still reports the tuned
+values. They are clamped here too, with **wider** bounds than the server's: the
+server's job is to stop someone typing a silly number, this side's is to stay
+usable even if the push came from something that miscalculated. A 0-second speak
+timeout would kill every sentence mid-word with no fix but SSH.
+
+`GET /health` reports `settings_rev` — the revision only, never the values,
+since `/health` is the one open route. That is enough for mcp-core to spot a Pi
+that came back from a reboot holding older tuning.
+
+Everything *else* about this Pi stays an environment variable. The split is
+deliberate: env vars describe what hardware this box **has** and are decided
+when the service is installed; settings are behaviour that depends on the room
+and the queue, and that someone at the counter has a real reason to change now.
+See [the fleet-wide settings docs](../mcp-core/README.md#runtime-settings--the-knobs-and-who-may-turn-them).
+
 Returns **audio, not text.** Transcription stays on mcp-core, where whisper.cpp
 and the Manglish bias prompt already live, so the Pi's mic and a box's mic are
 transcribed by the identical model with the identical prompt. Moving STT onto
@@ -199,6 +242,77 @@ Panel modes: `message` (`title`, `subtitle`), `qr` (`qr_data` required,
 `order` (`title`, `items[{name,qty,price}]`, `total`, `note`), `blank`.
 
 Choice tiles are **shown, not tappable** — the customer still answers out loud.
+
+An unknown `expression` is rejected with an error naming every face this
+particular device has, because that list is per-device: see below.
+
+### `GET /expressions` → 200
+
+Every face this device can draw, with the file each came from, the shape names a
+new one may use, the directories searched, and any file that failed to load.
+Both renderers fetch this; so does the picker. Not behind the token, for the same
+reason `/face` is not.
+
+### `POST /expressions/reload` → 200
+
+Rescan those directories. Returns `{"reloaded": true, "version": N,
+"expressions": [...], "problems": [...]}`. Both renderers are watching the
+version and redraw on their own, so a face added this way reaches the glass
+without restarting anything.
+
+Behind the token: this is what publishes a new face to a screen.
+
+### `GET /faces` → 200 `text/html`
+
+The picker. Every expression drawn at once with the same geometry the panel
+uses, click one to put it on the screen, plus the shape vocabulary and a
+copy-paste starter file. Open it on a laptop that can reach the Pi.
+
+## Adding a face
+
+A face is a JSON file. Drop one in `expressions/` beside `spc_agent.py`, or in
+`/etc/spc/expressions/`, or in `~/.spc/expressions/` — later directories win, so
+a file in your home overrides a shipped one of the same name, and deleting it
+puts the original back. The **filename** is the name `spc_expression` sends, so
+`pizza.json` becomes `pizza`.
+
+The easy way is to name shapes that already exist. Eyes: `open`, `wide`,
+`narrow`, `happy`, `closed`, `cross`. Brows: `flat`, `raised`, `angry`, `sad`,
+`none`. Mouths: `smile`, `grin`, `small`, `flat`, `frown`, `open`, `wave`.
+
+```json
+{ "name": "smug", "label": "Smug", "emoji": "😏",
+  "eyes": { "left": "narrow", "right": "narrow" },
+  "brow": "raised", "mouth": "small", "gaze": "right" }
+```
+
+Any part can carry geometry instead of a name, for a shape neither renderer has.
+Coordinates are relative to that part's own centre, in the browser page's
+400×300 face box — an eye is about 86 wide and 122 tall, a mouth about 112 wide.
+`spc_fb.py` transforms them into framebuffer units, so what `/faces` shows you is
+what lands on the glass.
+
+```json
+{ "name": "pizza", "label": "Pizza Time", "emoji": "🍕",
+  "eyes": {
+    "left":  { "line": [[0,-60],[46,46],[-46,46],[0,-60]] },
+    "right": { "line": [[0,-60],[46,46],[-46,46],[0,-60]] }
+  },
+  "brow": "raised",
+  "mouth": { "quad": [[-72,-8],[0,96],[72,-8]] },
+  "ink": "#ffb347" }
+```
+
+Shapes: `quad` (three points — start, control, end), `line` (two or more
+points), `rounded_rect` (`w`, `h`, `r`; eyes only), `cross` (`size`), and
+`paths` to combine several into one part. `ink` takes a hex colour and `blink:
+false` stops the idle blink for a face whose eyes are already shut.
+
+Then `curl -X POST localhost:8080/expressions/reload`, or press **Reload from
+disk** on `/faces`. A file that does not validate is reported there and in the
+agent's log, and is skipped — it never takes the rest of the faces down with it.
+Two worked examples live in `expressions/examples/`; copy one up a level to try
+it.
 
 ### `GET /face` → 200 `text/html`
 
@@ -306,6 +420,13 @@ nothing detecting the pause. `apt install sox`.
 **mcp-core says "offline" but `curl` from the Pi works** — check it from the
 *mcp-core machine*: `curl http://<host>:8080/health`. Almost always the
 Tailscale name, a firewall, or `SPC_HOST` bound to localhost.
+
+**`/faces` answers "picker page not installed"** — `spc_picker.py` and
+`spc_faceparts.py` have to sit beside `spc_agent.py`, same as `spc_face.py`.
+
+**A face you added does not appear** — check `GET /expressions`: a file that
+failed to validate is listed under `problems` with the reason. The commonest
+cause is a shape name that does not exist; the error names the ones that do.
 
 **`/face` answers "face page not installed"** — `spc_face.py` has to sit in the
 same directory as `spc_agent.py`; Python imports it by module name from beside

@@ -24,9 +24,16 @@ TARGET="${1:-orangepi@orangepi5max}"
 HOST="${TARGET#*@}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SRC="$HERE/spc-agent/spc_agent.py"
-# The face page ships beside the agent. It is a separate file only so the HTTP
-# service stays readable; both must land together, or /face serves an apology.
-FACE_SRC="$HERE/spc-agent/spc_face.py"
+# The screen ships beside the agent, as several modules that must land together.
+# spc_agent.py imports each by module name and Python looks beside the running
+# script, so a partial copy degrades quietly: a missing spc_faceparts.py makes
+# spc_face.py unimportable, which makes /face serve an apology, and a missing
+# spc_expressions.py leaves the agent unable to validate a face at all.
+SCREEN_SRCS="spc_face.py spc_faceparts.py spc_picker.py spc_expressions.py"
+# The faces themselves. A directory rather than a file, and the one piece of
+# this deploy that a user is expected to add to on the device — so it is copied
+# INTO place without deleting what is already there.
+EXPRESSIONS_SRC="$HERE/spc-agent/expressions"
 PORT=8080
 
 if [ ! -f "$SRC" ]; then
@@ -34,8 +41,19 @@ if [ ! -f "$SRC" ]; then
   echo "Run this from the laptop that holds the repo — not from the Pi."
   exit 1
 fi
-if [ ! -f "$FACE_SRC" ]; then
-  echo "Cannot find $FACE_SRC"
+# Every screen module, checked before the first scp rather than after it: a
+# partial copy is the failure mode that degrades quietly on the device (a
+# missing spc_faceparts.py makes spc_face.py unimportable, and /face then serves
+# an apology that says nothing about which file is absent).
+for f in $SCREEN_SRCS; do
+  if [ ! -f "$HERE/spc-agent/$f" ]; then
+    echo "Cannot find $HERE/spc-agent/$f"
+    echo "Run this from the laptop that holds the repo — not from the Pi."
+    exit 1
+  fi
+done
+if [ ! -d "$EXPRESSIONS_SRC" ]; then
+  echo "Cannot find $EXPRESSIONS_SRC — the shipped faces live there."
   echo "Run this from the laptop that holds the repo — not from the Pi."
   exit 1
 fi
@@ -92,11 +110,27 @@ sudo mkdir -p /opt/spc-agent
 sudo mv /tmp/spc_agent.py /opt/spc-agent/spc_agent.py
 sudo chmod 755 /opt/spc-agent/spc_agent.py
 
-# Must sit in the same directory: spc_agent.py imports it by module name, and
+# Must sit in the same directory: spc_agent.py imports them by module name, and
 # Python looks beside the script it is running.
-echo "--> Placing /opt/spc-agent/spc_face.py"
-sudo mv /tmp/spc_face.py /opt/spc-agent/spc_face.py
-sudo chmod 644 /opt/spc-agent/spc_face.py
+for f in spc_face.py spc_faceparts.py spc_picker.py spc_expressions.py; do
+  if [ -f "/tmp/$f" ]; then
+    echo "--> Placing /opt/spc-agent/$f"
+    sudo mv "/tmp/$f" "/opt/spc-agent/$f"
+    sudo chmod 644 "/opt/spc-agent/$f"
+  fi
+done
+
+# The shipped faces. Overwritten, because these are ours and a stale copy is a
+# face that no longer matches the code that draws it. Anything the user added
+# under a name we do not ship is left alone, and their own directories
+# (/etc/spc/expressions, ~/.spc/expressions) are never touched by this at all.
+if [ -d /tmp/spc-expressions ]; then
+  echo "--> Placing /opt/spc-agent/expressions/"
+  sudo mkdir -p /opt/spc-agent/expressions
+  sudo cp /tmp/spc-expressions/*.json /opt/spc-agent/expressions/
+  sudo chmod 644 /opt/spc-agent/expressions/*.json
+  rm -rf /tmp/spc-expressions
+fi
 
 echo "--> Packages"
 if [ "${SKIP_APT}" = "1" ]; then
@@ -208,7 +242,13 @@ ssh -M -S "$CTL" -o ControlPersist=180 -o StrictHostKeyChecking=accept-new -fN "
 
 echo "==> Copying files"
 scp -o ControlPath="$CTL" -q "$SRC" "$TARGET:/tmp/spc_agent.py" || exit 1
-scp -o ControlPath="$CTL" -q "$FACE_SRC" "$TARGET:/tmp/spc_face.py" || exit 1
+for f in $SCREEN_SRCS; do
+  scp -o ControlPath="$CTL" -q "$HERE/spc-agent/$f" "$TARGET:/tmp/$f" || exit 1
+done
+# -r, and only the top level: expressions/examples/ is documentation for someone
+# reading the repo, not faces the device should load.
+ssh -S "$CTL" "$TARGET" 'rm -rf /tmp/spc-expressions && mkdir -p /tmp/spc-expressions'
+scp -o ControlPath="$CTL" -q "$EXPRESSIONS_SRC"/*.json "$TARGET:/tmp/spc-expressions/" || exit 1
 scp -o ControlPath="$CTL" -q "$INSTALLER" "$TARGET:/tmp/spc_install.sh" || exit 1
 
 echo "==> Installing (sudo password prompt follows)"

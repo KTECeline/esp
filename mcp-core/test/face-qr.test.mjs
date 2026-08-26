@@ -127,29 +127,11 @@ test("the whole face page parses as JavaScript", () => {
   assert.doesNotThrow(() => new Function(script));
 });
 
-test("every expression the MCP tool offers is one the page can draw", () => {
-  // The enum in mcp-tools.js and the table in spc_face.py are two lists that
-  // have to agree; a name in one and not the other is a tool call that lands on
-  // a face which quietly falls back to neutral.
-  const face = readFileSync(facePath, "utf8");
-  const tools = readFileSync(join(here, "..", "mcp-tools.js"), "utf8");
-
-  const drawable = new Set(
-    face.slice(face.indexOf("const EXPRESSIONS = {"), face.indexOf("const GAZE = {"))
-      .matchAll(/^\s{2}(\w+):\s*\{/gm)
-  .map((m) => m[1]));
-  assert.ok(drawable.size >= 8, `expected the page to define many expressions, found ${drawable.size}`);
-
-  const offered = tools
-    .slice(tools.indexOf("const SpcExpressionInput"))
-    .match(/\.enum\(\[([^\]]*"neutral"[^\]]*)\]\)/s);
-  assert.ok(offered, "could not find the expression enum in mcp-tools.js");
-  for (const name of offered[1].match(/"(\w+)"/g).map((s) => s.slice(1, -1))) {
-    assert.ok(drawable.has(name), `mcp-tools.js offers "${name}" but spc_face.py cannot draw it`);
-  }
-
-  const gazes = face.slice(face.indexOf("const GAZE = {"), face.indexOf("const el ="));
-  for (const name of ["center", "left", "right", "up", "down"]) {
-    assert.match(gazes, new RegExp(`\\b${name}:`), `spc_face.py has no gaze "${name}"`);
-  }
-});
+// The expression/gaze agreement check that used to live here has moved to
+// face-spec.test.mjs. It compared two of the four places that carry the face
+// vocabulary — the enum here and the table in spc_face.py — by scraping the
+// enum's literal out of this file. That literal is gone: mcp-tools.js now reads
+// face-spec.json, so there is a named source to compare everything against
+// instead of two lists checked against each other. The replacement also covers
+// spc_agent.py and spc_fb.py, which this never did, and spc_fb.py is the
+// renderer actually on the glass.

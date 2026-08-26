@@ -1,0 +1,28 @@
+{
+  "name": "starstruck",
+  "label": "Starstruck",
+  "emoji": "🤩",
+  "description": "Four-pointed sparkles for eyes and a wide grin. Shows inline geometry: nothing here existed in either renderer's shape table.",
+
+  "_coordinates": "Every point is relative to the part's own centre, in the browser page's 400x300 face box. An eye there is about 86 wide and 122 tall, a mouth about 112 wide — start from those and the proportions come out right on the panel too.",
+
+  "eyes": {
+    "left": {
+      "line": [[0, -56], [13, -16], [54, 0], [13, 16], [0, 56], [-13, 16], [-54, 0], [-13, -16], [0, -56]]
+    },
+    "right": {
+      "line": [[0, -56], [13, -16], [54, 0], [13, 16], [0, 56], [-13, 16], [-54, 0], [-13, -16], [0, -56]]
+    }
+  },
+
+  "brow": "raised",
+
+  "mouth": {
+    "paths": [
+      { "quad": [[-64, -6], [0, 22], [64, -6]] },
+      { "quad": [[-64, -6], [0, 84], [64, -6]] }
+    ]
+  },
+
+  "ink": "#ffd166"
+}

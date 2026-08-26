@@ -1,0 +1,12 @@
+{
+  "name": "happy",
+  "label": "Happy",
+  "emoji": "😄",
+  "description": "Grinning, eyes arched, brows up.",
+  "eyes": {
+    "left": "happy",
+    "right": "happy"
+  },
+  "brow": "raised",
+  "mouth": "grin"
+}

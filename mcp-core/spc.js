@@ -14,7 +14,7 @@
 // service is a convenience, not a requirement.
 
 // Every capability a Pi may declare. Order matters only for log output.
-export const SPC_CAPABILITIES = ["look", "speak", "sense", "listen", "screen"];
+export const SPC_CAPABILITIES = ["look", "speak", "sense", "listen", "screen", "volume"];
 
 // Per-call budgets. These differ by an order of magnitude on purpose:
 // /speak blocks until the audio has finished playing out of the speaker, so a
@@ -22,18 +22,46 @@ export const SPC_CAPABILITIES = ["look", "speak", "sense", "listen", "screen"];
 // pin has no excuse to take more than a moment. One shared timeout would have
 // to be the largest of them, which turns a dead Pi into a 60s hang on a tool
 // the model expected to be instant.
-const TIMEOUTS = {
+//
+// These are the FALLBACKS. The ones a running mcp-core actually uses come from
+// the settings store (spc.timeout_*), which is wired in by createSpcRegistry —
+// so a Pi on a slow link can be given more room without a code change. They
+// stay here as literals so this module still works standalone: a test, or any
+// other importer of createSpcDevice, gets sane numbers without a store.
+const TIMEOUT_DEFAULTS = {
   health: 4000,
   look: 20000,
   speak: 60000,
   sense: 6000,
-  screen: 6000
+  screen: 6000,
+  volume: 6000,
+  // /listen is the exception: its duration is an argument, not a constant. The
+  // Pi is recording for up to timeout_s before it can answer at all, so the
+  // deadline is derived per call. This margin covers the WAV upload afterwards.
+  listenMargin: 15000
 };
 
-// /listen is the exception: its duration is an argument, not a constant. The Pi
-// is recording for up to timeout_s before it can answer at all, so the deadline
-// has to be derived per call. The margin covers the WAV upload on a slow link.
-const LISTEN_MARGIN_MS = 15000;
+// Set once by createSpcRegistry. A getter rather than a copied object so a
+// change to a timeout applies to the very next call, with no restart and no
+// need to rebuild the device objects.
+let fleetSettings = () => ({});
+
+// Settings keys are named for what they configure (spc.timeout_look_ms), not
+// for this table's shorthand, so the mapping is spelled out rather than
+// string-built — a typo'd key would otherwise silently fall back to the default
+// forever, and look exactly like a setting that does nothing.
+const TIMEOUT_KEYS = {
+  look: "spc.timeout_look_ms",
+  speak: "spc.timeout_speak_ms",
+  screen: "spc.timeout_screen_ms",
+  listenMargin: "spc.listen_margin_ms"
+};
+
+function timeoutFor(kind) {
+  const key = TIMEOUT_KEYS[kind];
+  const v = key ? fleetSettings()[key] : undefined;
+  return Number.isFinite(v) ? v : TIMEOUT_DEFAULTS[kind];
+}
 
 // Failures reach a language model as prose, so they say what to DO. "fetch
 // failed" is the single least useful string Node produces — it covers DNS
@@ -118,7 +146,7 @@ export function createSpcDevice(cfg) {
   // would make every caller wrap it in a try just to learn "no".
   device.health = async () => {
     try {
-      const body = await requestJson(device, "/health", { timeoutMs: TIMEOUTS.health });
+      const body = await requestJson(device, "/health", { timeoutMs: timeoutFor("health") });
       return { online: true, ...body };
     } catch (err) {
       return { online: false, error: err.message };
@@ -128,7 +156,7 @@ export function createSpcDevice(cfg) {
   // A JPEG frame, returned as a Buffer so the tool layer can hand it straight
   // to an image content block without a round trip through base64 and back.
   device.look = async () => {
-    const res = await request(device, "/look", { timeoutMs: TIMEOUTS.look });
+    const res = await request(device, "/look", { timeoutMs: timeoutFor("look") });
     const type = res.headers.get("content-type") || "";
     if (!type.startsWith("image/")) {
       throw new Error(`${device.id} answered /look with "${type || "no content-type"}" instead of an image.`);
@@ -145,10 +173,24 @@ export function createSpcDevice(cfg) {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ text }),
-      timeoutMs: TIMEOUTS.speak
+      timeoutMs: timeoutFor("speak")
     });
 
-  device.sense = async () => await requestJson(device, "/sense", { timeoutMs: TIMEOUTS.sense });
+  device.sense = async () => await requestJson(device, "/sense", { timeoutMs: timeoutFor("sense") });
+
+  // Playback loudness, 0-100. Read and write are separate calls rather than one
+  // "set and tell me" because a UI wants to draw the slider on load without
+  // moving anything, and an agent asked to "turn it down a bit" needs to know
+  // where it currently is before it can pick a smaller number.
+  device.getVolume = async () => await requestJson(device, "/volume", { timeoutMs: timeoutFor("volume") });
+
+  device.setVolume = async (level) =>
+    await requestJson(device, "/volume", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ level }),
+      timeoutMs: timeoutFor("volume")
+    });
 
   // Changes what is on the Pi's screen. The opposite of speak: it returns as
   // soon as the Pi has stored the new state, NOT when the glass has repainted.
@@ -163,7 +205,7 @@ export function createSpcDevice(cfg) {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(patch),
-      timeoutMs: TIMEOUTS.screen
+      timeoutMs: timeoutFor("screen")
     });
 
   // Returns raw WAV bytes, NOT a transcript, and that is the important part of
@@ -173,12 +215,26 @@ export function createSpcDevice(cfg) {
   // on the Pi would give two devices in one restaurant two different accents'
   // worth of accuracy, and would make the Manglish tuning work in one place
   // only — for a mic that is, in the end, just a microphone.
-  device.listen = async ({ timeoutS = 10, silenceS = 1.2 } = {}) => {
+  //
+  // Both durations are optional here and NOT defaulted to a constant: leaving
+  // them out means "use the Pi's own configured defaults" (spc.listen_*, pushed
+  // to it as device settings), so the auto-stop tuning has one home instead of
+  // a number here quietly overriding the one someone set on the device.
+  device.listen = async ({ timeoutS, silenceS } = {}) => {
+    const body = {};
+    if (Number.isFinite(timeoutS)) body.timeout_s = timeoutS;
+    if (Number.isFinite(silenceS)) body.silence_s = silenceS;
+    // The deadline still needs a number even when the Pi picks the duration.
+    // Falling back to the device-scoped setting keeps mcp-core's patience and
+    // the Pi's recording length moving together.
+    const budgetS = Number.isFinite(timeoutS)
+      ? timeoutS
+      : (fleetSettings()["spc.listen_timeout_s"] ?? 12);
     const res = await request(device, "/listen", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ timeout_s: timeoutS, silence_s: silenceS }),
-      timeoutMs: timeoutS * 1000 + LISTEN_MARGIN_MS
+      body: JSON.stringify(body),
+      timeoutMs: budgetS * 1000 + timeoutFor("listenMargin")
     });
     // 204 is the contract's "nobody said anything" — a normal outcome of
     // listening, not a failure, so it must not throw.
@@ -188,15 +244,38 @@ export function createSpcDevice(cfg) {
     return buf;
   };
 
+  // Hand the Pi the device-scoped runtime settings (its own listen auto-stop,
+  // its own per-command kill timeouts). JSON here, unlike the box's line
+  // protocol, because the other end is Python and parsing JSON is free there —
+  // the box's format is a concession to firmware with no JSON parser, not a
+  // style the whole fleet has to share.
+  //
+  // A Pi on old spc-agent answers 404, which surfaces as a plain HTTP error
+  // rather than something alarming: it simply keeps its built-in defaults.
+  device.pushSettings = async ({ revision, settings }) =>
+    await requestJson(device, "/settings", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ revision, settings }),
+      timeoutMs: timeoutFor("screen")
+    });
+
   return device;
 }
 
 // Small registry mirroring boxes.js's shape, so the tool layer can resolve an
 // spc device the same way it resolves a box.
-export function createSpcRegistry(deviceConfigs) {
+//
+// `getSettings` returns the whole settings map and is stashed module-wide, not
+// per device: every timeout here is a property of this server's patience, not
+// of one Pi, so per-device copies would be four places to keep in sync for no
+// gain. Optional — without it every timeout falls back to TIMEOUT_DEFAULTS.
+export function createSpcRegistry(deviceConfigs, getSettings) {
+  if (typeof getSettings === "function") fleetSettings = getSettings;
   const devices = deviceConfigs.map(createSpcDevice);
   return {
     devices,
+    pushSettings: (device, payload) => device.pushSettings(payload),
     byId: (id) => devices.find((d) => d.id === id) || null,
     // Any device declaring a capability. Tool registration is gated on this:
     // no Pi with a mic means no spc_listen tool at all, rather than a tool that

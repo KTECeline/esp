@@ -22,7 +22,9 @@ Nothing is fetched from the network, including the QR encoder, because the Pi
 this runs on may well have no route off the tailnet.
 """
 
-FACE_HTML = r"""<!doctype html>
+from spc_faceparts import FACE_PARTS_JS
+
+_FACE_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -111,8 +113,10 @@ FACE_HTML = r"""<!doctype html>
     50%      { transform: scaleY(1.35); }
   }
 
-  body[data-expression="error"]    { --ink: #ff7a7a; --glow: rgba(255, 122, 122, 0.5); }
-  body[data-expression="sleeping"] { --ink: #2a6f95; --glow: rgba(42, 111, 149, 0.35); }
+  /* An expression's colour comes from its JSON "ink" field, applied to the body
+     as an inline custom property by drawFace(). error's red and sleeping's blue
+     used to be two CSS rules keyed on those two names — which is precisely why
+     an eleventh face could not have had a colour of its own. */
 
   #zzz { opacity: 0; transition: opacity 600ms ease; }
   body[data-expression="sleeping"] #zzz { opacity: 1; }
@@ -577,86 +581,22 @@ const QR = (() => {
 // ---------------------------------------------------------------------------
 // The face
 // ---------------------------------------------------------------------------
-// Built rather than written out, because a hand-written rounded-rect path is
-// easy to get subtly off-centre — and an eye whose path is not centred on its
-// own origin drifts away from its brow and its highlights.
-function roundedEye(w, h, r) {
-  const x = -w / 2, y = -h / 2;
-  return `M${x + r} ${y}h${w - 2 * r}a${r} ${r} 0 0 1 ${r} ${r}` +
-         `v${h - 2 * r}a${r} ${r} 0 0 1 ${-r} ${r}` +
-         `h${-(w - 2 * r)}a${r} ${r} 0 0 1 ${-r} ${-r}` +
-         `v${-(h - 2 * r)}a${r} ${r} 0 0 1 ${r} ${-r}z`;
-}
-
-// Height matters twice over: it positions the highlights, and it decides how
-// close the mouth can sit without the smile touching the eyes.
-const EYE_SIZE = { open: [86, 122], wide: [96, 132], narrow: [86, 62] };
-
-const EYE = {
-  open:   roundedEye(...EYE_SIZE.open, 28),
-  wide:   roundedEye(...EYE_SIZE.wide, 32),
-  narrow: roundedEye(...EYE_SIZE.narrow, 26),
-  happy:  "M-52 26Q0-50 52 26",
-  closed: "M-52 0Q0 38 52 0",
-  cross:  "M-40-40 40 40M40-40-40 40"
-};
-// The eye paths are drawn around a notional origin and then translated, so both
-// eyes reuse one geometry and only their offset differs.
-const EYE_AT = { left: [128, 134], right: [272, 134] };
-
-const BROW = {
-  flat:   "M-54 0Q0-14 54 0",
-  raised: "M-56 6Q0-26 56 6",
-  angry:  "M-54-14Q0-2 54 18",
-  sad:    "M-54 14Q0-4 54-16",
-  none:   ""
-};
-const BROW_AT = { left: [128, 44], right: [272, 44] };
-
-const MOUTH = {
-  smile:  "M144 222Q200 274 256 222",
-  grin:   "M132 222Q200 300 268 222",
-  small:  "M164 226Q200 250 236 226",
-  flat:   "M162 232H238",
-  frown:  "M148 250Q200 202 252 250",
-  open:   "M168 226Q200 196 232 226Q200 272 168 226",
-  wave:   "M152 232Q176 210 200 232T248 232"
-};
-
-// One row per expression: which eye shape, which brow, which mouth, and whether
-// the eyes are mirrored. `mirror: false` is what makes a wink look like a wink
-// rather than two identical arcs.
-const EXPRESSIONS = {
-  neutral:   { eyeL: "open",   eyeR: "open",   brow: "flat",   mouth: "smile" },
-  happy:     { eyeL: "happy",  eyeR: "happy",  brow: "raised", mouth: "grin" },
-  listening: { eyeL: "wide",   eyeR: "wide",   brow: "raised", mouth: "small" },
-  thinking:  { eyeL: "narrow", eyeR: "open",   brow: "raised", mouth: "flat", gaze: "up" },
-  speaking:  { eyeL: "open",   eyeR: "open",   brow: "flat",   mouth: "open" },
-  confused:  { eyeL: "open",   eyeR: "narrow", brow: "raised", mouth: "wave" },
-  sad:       { eyeL: "narrow", eyeR: "narrow", brow: "sad",    mouth: "frown" },
-  wink:      { eyeL: "happy",  eyeR: "open",   brow: "raised", mouth: "grin" },
-  sleeping:  { eyeL: "closed", eyeR: "closed", brow: "none",   mouth: "flat" },
-  error:     { eyeL: "cross",  eyeR: "cross",  brow: "angry",  mouth: "frown" }
-};
-
-// Small on purpose: the whole eye moves, not a pupil inside it, so a large
-// offset walks the eyes into the brows.
-const GAZE = {
-  center: [0, 0], left: [-14, 0], right: [14, 0], up: [0, -6], down: [0, 6]
-};
+__FACE_PARTS__
 
 const el = (id) => document.getElementById(id);
 
 function setEye(which, shape) {
   const [cx, cy] = EYE_AT[which];
   const path = el(which === "left" ? "eyeLp" : "eyeRp");
-  path.setAttribute("d", EYE[shape]);
+  path.setAttribute("d", shapePath(shape, EYE) || "");
   path.setAttribute("transform", `translate(${cx} ${cy})`);
   // The two highlight dots only make sense on an eye with an inside, and they
   // are placed as fractions of it so a narrow eye does not wear them outside
-  // its own outline.
+  // its own outline. A custom rounded_rect eye gets them on the same terms.
   const glint = el(which === "left" ? "glintL" : "glintR");
-  const size = EYE_SIZE[shape];
+  const size = typeof shape === "string"
+    ? EYE_SIZE[shape]
+    : (shape && shape.rounded_rect ? [shape.rounded_rect.w, shape.rounded_rect.h] : null);
   glint.innerHTML = size
     ? `<circle cx="${cx - size[0] * 0.19}" cy="${cy - size[1] * 0.2}" r="9" class="glint"></circle>` +
       `<circle cx="${cx + size[0] * 0.12}" cy="${cy + size[1] * 0.03}" r="5" class="glint"></circle>`
@@ -666,24 +606,40 @@ function setEye(which, shape) {
 function setBrow(which, shape) {
   const [cx, cy] = BROW_AT[which];
   const path = el(which === "left" ? "browL" : "browR");
-  path.setAttribute("d", BROW[shape] || "");
+  path.setAttribute("d", shapePath(shape, BROW) || "");
   path.setAttribute("transform", `translate(${cx} ${cy})`);
 }
 
 let currentExpression = null;
 
+function faceSpec(expression) {
+  return EXPRESSIONS[expression] || EXPRESSIONS.neutral;
+}
+
 function drawFace(expression, gaze) {
-  const spec = EXPRESSIONS[expression] || EXPRESSIONS.neutral;
-  setEye("left", spec.eyeL);
-  setEye("right", spec.eyeR);
+  const spec = faceSpec(expression);
+  const eyes = spec.eyes || {};
+  setEye("left", eyes.left);
+  setEye("right", eyes.right);
   setBrow("left", spec.brow);
   setBrow("right", spec.brow);
-  el("mouth").setAttribute("d", MOUTH[spec.mouth]);
+  el("mouth").setAttribute("d", shapePath(spec.mouth, MOUTH) || "");
+  // Removed rather than set to "" for a named mouth, so the markup a builtin
+  // produces stays exactly what it has always been.
+  const shift = mouthTransform(spec.mouth);
+  if (shift) el("mouth").setAttribute("transform", shift);
+  else el("mouth").removeAttribute("transform");
   // An explicit gaze wins; "center" is the absence of one, so an expression
   // that looks somewhere by nature (thinking looks up) still gets to.
   const chosen = gaze && gaze !== "center" ? gaze : (spec.gaze || "center");
   const [gx, gy] = GAZE[chosen] || GAZE.center;
   el("pupils").setAttribute("transform", `translate(${gx} ${gy})`);
+  // An expression's colour is its own field now, so a user's file can be
+  // orange. The CSS rules that hardcoded error's red and sleeping's blue
+  // against those two names are gone; these two properties are what replaced
+  // them, and clearing them falls back to the stylesheet's cyan.
+  document.body.style.setProperty("--ink", spec.ink || "");
+  document.body.style.setProperty("--glow", spec.ink ? hexGlow(spec.ink) : "");
   document.body.dataset.expression = expression;
 }
 
@@ -711,7 +667,7 @@ function applyFace(expression, gaze) {
 function scheduleBlink() {
   const wait = 2600 + Math.random() * 4200;
   setTimeout(() => {
-    if (currentExpression !== "sleeping") blink(() => {});
+    if (faceSpec(currentExpression).blink !== false) blink(() => {});
     scheduleBlink();
   }, wait);
 }
@@ -796,6 +752,26 @@ function renderPanel(panel) {
 // ---------------------------------------------------------------------------
 let version = -1;
 let lastPanel = "";
+let catalogVersion = null;
+
+// The expressions this page can draw. Fetched rather than compiled in, so a
+// JSON file dropped on the device reaches the glass without redeploying this
+// page. A failure here is deliberately quiet: the fallback neutral defined at
+// the top still draws, and the next poll tries again.
+async function loadExpressions() {
+  try {
+    const res = await fetch("/expressions", { cache: "no-store" });
+    if (!res.ok) throw new Error(res.status);
+    const body = await res.json();
+    const next = {};
+    for (const spec of body.expressions || []) next[spec.name] = spec;
+    if (Object.keys(next).length) EXPRESSIONS = next;
+    catalogVersion = body.version ?? catalogVersion;
+    return true;
+  } catch (err) {
+    return false;
+  }
+}
 
 function apply(state) {
   applyFace(state.expression || "neutral", state.gaze || "center");
@@ -807,6 +783,17 @@ function apply(state) {
   version = state.version;
 }
 
+// Two triggers, because they cover different failures. The version stamp is the
+// normal path: someone added a file and hit Reload. The unknown-name check is
+// the race — a tool call naming a brand-new expression can reach this page
+// before its own poll has noticed the catalog moved, and re-fetching there
+// turns a defaulted neutral face into the right one.
+async function syncCatalog(state) {
+  const stale = state.expressions_version != null && state.expressions_version !== catalogVersion;
+  const unknown = state.expression && !EXPRESSIONS[state.expression];
+  if (stale || unknown) await loadExpressions();
+}
+
 async function follow() {
   for (;;) {
     try {
@@ -814,7 +801,9 @@ async function follow() {
       // tool call lands on the glass in about as long as it takes to draw.
       const res = await fetch(`/display/state?v=${version}`, { cache: "no-store" });
       if (!res.ok) throw new Error(res.status);
-      apply(await res.json());
+      const state = await res.json();
+      await syncCatalog(state);
+      apply(state);
       document.body.classList.remove("offline");
     } catch (err) {
       document.body.classList.add("offline");
@@ -833,8 +822,12 @@ window.addEventListener("resize", () => {
 });
 
 drawFace("neutral", "center");
+loadExpressions().then(() => drawFace("neutral", "center"));
 follow();
 </script>
 </body>
 </html>
 """
+
+# One copy of the geometry, two pages. See spc_faceparts.py.
+FACE_HTML = _FACE_HTML.replace("__FACE_PARTS__", FACE_PARTS_JS)

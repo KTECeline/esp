@@ -1,0 +1,13 @@
+{
+  "name": "thinking",
+  "label": "Thinking",
+  "emoji": "🤔",
+  "description": "One eye narrowed, looking up. Set this while you work.",
+  "eyes": {
+    "left": "narrow",
+    "right": "open"
+  },
+  "brow": "raised",
+  "mouth": "flat",
+  "gaze": "up"
+}

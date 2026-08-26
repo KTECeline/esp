@@ -37,27 +37,33 @@ export function setWsFleetToken(t) { fleetToken = t; }
 // local relay, so all bad actors share one bucket — that's deliberately
 // conservative (a global cap), not a bug: legitimate boxes essentially never
 // fail auth, so the bucket should stay empty regardless.
+// Defaults only. A running mcp-core reads wshub.fail_window_ms / wshub.fail_max
+// out of the settings store, wired in by startWsHub — an operator watching a
+// real attack should be able to tighten this without a restart, and a restart
+// is exactly what an attacker gets out of forcing one.
 const FAIL_WINDOW_MS = 60000;
 const FAIL_MAX = 10;
+let throttle = () => ({ windowMs: FAIL_WINDOW_MS, max: FAIL_MAX });
 const failures = new Map();   // ip -> { count, resetAt }
 
 function tooManyFailures(ip) {
   const f = failures.get(ip);
   if (!f) return false;
   if (Date.now() > f.resetAt) { failures.delete(ip); return false; }
-  return f.count >= FAIL_MAX;
+  return f.count >= throttle().max;
 }
 
 function noteFailure(ip) {
   const now = Date.now();
   const f = failures.get(ip);
   if (!f || now > f.resetAt) {
-    failures.set(ip, { count: 1, resetAt: now + FAIL_WINDOW_MS });
+    failures.set(ip, { count: 1, resetAt: now + throttle().windowMs });
     return;
   }
   f.count++;
-  if (f.count === FAIL_MAX) {
-    console.warn(`WS: ${FAIL_MAX} failed upgrades from ${ip} in under a minute — throttling it`);
+  const { windowMs, max } = throttle();
+  if (f.count === max) {
+    console.warn(`WS: ${max} failed upgrades from ${ip} within ${Math.round(windowMs / 1000)}s — throttling it`);
   }
 }
 
@@ -134,7 +140,8 @@ export function wsPush(boxId, path, body, headers = {}, timeoutMs = 60000) {
 // ---- Server -----------------------------------------------------------------
 // Attaches to the EXISTING http server rather than opening a second port, so
 // there's one thing to expose, one port in config, and one firewall story.
-export function startWsHub(httpServer, { path = "/ws" } = {}) {
+export function startWsHub(httpServer, { path = "/ws", throttleSettings } = {}) {
+  if (typeof throttleSettings === "function") throttle = throttleSettings;
   const wss = new WebSocketServer({ noServer: true });
 
   httpServer.on("upgrade", (req, socket, head) => {

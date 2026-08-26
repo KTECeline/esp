@@ -48,6 +48,8 @@ import time
 import urllib.error
 import urllib.request
 
+import spc_expressions
+
 try:
     from cjk_font_data import GLYPHS as _CJK_GLYPHS, CELL_W as _CJK_W, CELL_H as _CJK_H
     _CJK_CODEPOINTS = [cp for cp, _ in _CJK_GLYPHS]
@@ -107,9 +109,11 @@ FONT_PATH = os.environ.get("SPC_FB_FONT", "")
 
 # Same palette as the browser page, so the two renderers are recognisably the
 # same product. BGRA, because that is what a 32bpp Linux framebuffer wants.
-INK = (0x34, 0xD0, 0xFF)          # cyan, the face
-INK_ERROR = (0xFF, 0x7A, 0x7A)
-INK_SLEEP = (0x2A, 0x6F, 0x95)
+INK = (0x34, 0xD0, 0xFF)          # cyan, the default face
+# The red of "error" and the dim blue of "sleeping" used to live here as
+# INK_ERROR/INK_SLEEP, hardcoded against two expression names. They are now
+# the "ink" field of those expressions' JSON, so a user's own face can pick a
+# colour without editing this file, and hex_rgb below is what reads it.
 BG_FACE = (0x04, 0x08, 0x0F)
 BG_PANEL = (0x06, 0x0D, 0x1A)
 CARD_TOP = (0x14, 0x35, 0x6B)
@@ -118,6 +122,24 @@ TEXT = (0xEA, 0xF4, 0xFF)
 TEXT_DIM = (0xA9, 0xCD, 0xF0)
 TILE = (0xF2, 0xF7, 0xFF)
 TILE_INK = (0x10, 0x30, 0x5E)
+
+
+def hex_rgb(value, fallback=INK):
+    """"#ffb347" or "#fb3" -> (r, g, b). Falls back rather than raising.
+
+    spc_expressions.validate() has already rejected anything malformed before
+    a colour reaches here, so this is the belt to that braces: a face drawn in
+    the wrong colour is a far better outcome than a renderer that exits.
+    """
+    text = (value or "").lstrip("#")
+    if len(text) == 3:
+        text = "".join(c * 2 for c in text)
+    if len(text) != 6:
+        return fallback
+    try:
+        return tuple(int(text[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return fallback
 
 
 # ---------------------------------------------------------------------------
@@ -489,36 +511,39 @@ def load_font():
 # Geometry lives in portrait content pixels, sized off the screen so the same
 # code fills a 1080x1920 kiosk panel and a smaller one.
 
-EYE_SHAPE = {
-    "neutral":   ("open", "open"),
-    "happy":     ("arc_up", "arc_up"),
-    "listening": ("wide", "wide"),
-    "thinking":  ("narrow", "open"),
-    "speaking":  ("open", "open"),
-    "confused":  ("open", "narrow"),
-    "sad":       ("narrow", "narrow"),
-    "wink":      ("arc_up", "open"),
-    "sleeping":  ("arc_down", "arc_down"),
-    "error":     ("cross", "cross"),
-}
-BROW_SHAPE = {
-    "neutral": "flat", "happy": "raised", "listening": "raised", "thinking": "raised",
-    "speaking": "flat", "confused": "raised", "sad": "sad", "wink": "raised",
-    "sleeping": None, "error": "angry",
-}
-MOUTH_SHAPE = {
-    "neutral": "smile", "happy": "grin", "listening": "small", "thinking": "flat",
-    "speaking": "open", "confused": "wave", "sad": "frown", "wink": "grin",
-    "sleeping": "flat", "error": "frown",
-}
+# An expression is no longer a row in three tables here — it is a JSON file that
+# this, the browser page, and the agent's validation all read. spc_expressions.py
+# next door finds and checks them.
+#
+# Two things stay local, because they genuinely differ per renderer. First, the
+# builtin SHAPES: an "open" eye is 86x122 in the browser's 400x300 box and
+# 286x404 units here, and the two tables were hand-tuned rather than derived, so
+# forcing them through one set of numbers would move faces that are already
+# right. A JSON file names a shape; each renderer draws its own. Second, the
+# canonical->local transform below, for a shape that is not in either table.
+CANON = 3.31          # a builtin open eye: 86 wide there, 286*u here
+CANON_MOUTH_Y = 2.75  # the mouth sits in a shorter band here than in the browser
+
+# The names a JSON file uses are the browser page's, since that is where its
+# coordinates come from too. This is the only place the two shape vocabularies
+# have to meet.
+EYE_ALIAS = {"happy": "arc_up", "closed": "arc_down"}
+
+
+def _named(spec):
+    """The shape name in `spec`, or None when it carries geometry instead."""
+    return spec if isinstance(spec, str) else None
+
+
 GAZE = {"center": (0, 0), "left": (-0.036, 0), "right": (0.036, 0),
         "up": (0, -0.016), "down": (0, 0.016)}
 
 
 class Face:
-    def __init__(self, screen, font):
+    def __init__(self, screen, font, catalog=None):
         self.s = screen
         self.font = font
+        self.catalog = catalog or spc_expressions.load()
         W, H = screen.w, screen.h
         self.face_h = int(H * 0.45)
         self.u = W / 1080.0                      # everything below is drawn for
@@ -528,37 +553,111 @@ class Face:
         self.mouth_y = int(self.face_h * 0.76)
         self.eye_dx = int(232 * self.u)
 
+    # -- the catalog --------------------------------------------------------
+
+    def spec(self, expression):
+        """The expression to draw. Falls back to neutral, as it always has.
+
+        A name that isn't in the catalog is not a crash: the JSON file may have
+        been deleted under a running screen, and a defaulted face beats a black
+        one. The agent rejects unknown names at the door, so this is the rare
+        path, not the normal one.
+        """
+        return self.catalog.get(expression) or self.catalog.get("neutral") or spc_expressions.BUILTIN["neutral"]
+
+    def reload(self):
+        """Re-read the expression directories. Called when the agent says they changed."""
+        self.catalog = spc_expressions.load()
+        return self.catalog
+
     def ink(self, expression):
-        if expression == "error":
-            return INK_ERROR
-        if expression == "sleeping":
-            return INK_SLEEP
+        # An expression's own colour now comes from its JSON, so a user's file
+        # can be orange without editing this. error and sleeping still land on
+        # exactly the colours they always had -- those values moved into their
+        # JSON rather than being dropped.
+        chosen = self.spec(expression).get("ink")
+        if chosen:
+            return hex_rgb(chosen)
         return INK
 
+    # -- drawing ------------------------------------------------------------
+
     def draw(self, expression, gaze, blink=0.0):
-        s, u = self.s, self.u
+        s = self.s
+        spec = self.spec(expression)
         color = self.ink(expression)
         s.rect(0, 0, s.w, self.face_h, BG_FACE)
 
-        gx, gy = GAZE.get(gaze, (0, 0))
+        # An expression that looks somewhere by nature (thinking looks up) gets
+        # to, unless the caller asked for a direction of its own.
+        chosen = gaze if gaze and gaze != "center" else spec.get("gaze", "center")
+        gx, gy = GAZE.get(chosen, (0, 0))
         ox, oy = int(gx * s.w), int(gy * s.w)
-        left_shape, right_shape = EYE_SHAPE.get(expression, EYE_SHAPE["neutral"])
+
+        eyes = spec.get("eyes") or {}
         cx_l = s.w // 2 - self.eye_dx + ox
         cx_r = s.w // 2 + self.eye_dx + ox
         cy = self.eye_y + oy
+        self._eye(cx_l, cy, eyes.get("left", "open"), color, blink)
+        self._eye(cx_r, cy, eyes.get("right", "open"), color, blink)
 
-        for (cx, shape) in ((cx_l, left_shape), (cx_r, right_shape)):
-            self._eye(cx, cy, shape, color, blink)
-
-        brow = BROW_SHAPE.get(expression)
-        if brow:
-            for cx in (s.w // 2 - self.eye_dx + ox, s.w // 2 + self.eye_dx + ox):
+        brow = spec.get("brow", "none")
+        if brow != "none":
+            for cx in (cx_l, cx_r):
                 self._brow(cx, self.brow_y, brow, color)
 
-        self._mouth(MOUTH_SHAPE.get(expression, "smile"), color)
+        self._mouth(spec.get("mouth", "smile"), color)
 
-    def _eye(self, cx, cy, shape, color, blink):
+    # -- inline geometry ----------------------------------------------------
+    # Canonical coordinates are the browser page's, relative to the part's own
+    # centre. Scaled by CANON and dropped at (cx, cy); nothing else about a
+    # user's shape is reinterpreted.
+
+    def _geometry(self, shape, cx, cy, color, sx, sy, blink=0.0):
+        kind, body = next(iter(shape.items()))
+        u = self.u
+        pt = lambda p: (cx + p[0] * sx * u, cy + p[1] * sy * u)
+
+        if kind == "paths":
+            for part in body:
+                self._geometry(part, cx, cy, color, sx, sy, blink)
+            return
+
+        if kind == "quad":
+            self.s.stroke(quad(pt(body[0]), pt(body[1]), pt(body[2])), self.stroke_w, color)
+            return
+
+        if kind == "line":
+            self.s.stroke([pt(p) for p in body], self.stroke_w, color)
+            return
+
+        if kind == "rounded_rect":
+            # Squashed by a blink and hollowed out the same way a builtin eye
+            # is, so a custom eye blinks with the rest of the face instead of
+            # staring through it.
+            w = body["w"] * sx * u
+            h = max(6, body["h"] * sy * u * (1.0 - blink))
+            r = min(body.get("r", 0) * sx * u, h / 2)
+            self.s.round_rect(cx - w / 2, cy - h / 2, w, h, r, color)
+            inner = self.stroke_w
+            if w - 2 * inner > 8 and h - 2 * inner > 8:
+                self.s.round_rect(cx - w / 2 + inner, cy - h / 2 + inner,
+                                  w - 2 * inner, h - 2 * inner,
+                                  max(r - inner, 2), BG_FACE)
+            return
+
+        if kind == "cross":
+            a = body["size"] * sx * u
+            self.s.stroke([(cx - a, cy - a), (cx + a, cy + a)], self.stroke_w, color)
+            self.s.stroke([(cx + a, cy - a), (cx - a, cy + a)], self.stroke_w, color)
+
+    def _eye(self, cx, cy, spec, color, blink):
+        name = _named(spec)
+        if name is None:
+            return self._geometry(spec, cx, cy, color, CANON, CANON, blink)
+
         s, u = self.s, self.u
+        shape = EYE_ALIAS.get(name, name)
         squash = 1.0 - blink
         if shape in ("open", "wide", "narrow"):
             w = {"open": 286, "wide": 318, "narrow": 286}[shape] * u
@@ -588,21 +687,35 @@ class Face:
             s.stroke([(cx - a, cy - a), (cx + a, cy + a)], self.stroke_w, color)
             s.stroke([(cx + a, cy - a), (cx - a, cy + a)], self.stroke_w, color)
 
-    def _brow(self, cx, cy, shape, color):
+    def _brow(self, cx, cy, spec, color):
+        shape = _named(spec)
+        if shape is None:
+            return self._geometry(spec, cx, cy, color, CANON, CANON)
+
         u, w = self.u, 178 * self.u
+        # Named, not an else-chain. "angry" used to be the catch-all, which meant
+        # a brow nobody had implemented drew a perfectly convincing angry one —
+        # the silent wrong-face failure this whole contract exists to prevent.
+        # An unknown brow now draws nothing, which is visible and diagnosable.
         if shape == "flat":
             pts = quad((cx - w, cy), (cx, cy - 38 * u), (cx + w, cy))
         elif shape == "raised":
             pts = quad((cx - w, cy + 16 * u), (cx, cy - 70 * u), (cx + w, cy + 16 * u))
         elif shape == "sad":
             pts = quad((cx - w, cy + 38 * u), (cx, cy - 10 * u), (cx + w, cy - 43 * u))
-        else:  # angry
+        elif shape == "angry":
             pts = quad((cx - w, cy - 38 * u), (cx, cy - 5 * u), (cx + w, cy + 48 * u))
+        else:
+            return
         self.s.stroke(pts, self.stroke_w, color)
 
-    def _mouth(self, shape, color):
+    def _mouth(self, spec, color):
         s, u, y = self.s, self.u, self.mouth_y
         cx = s.w // 2
+        shape = _named(spec)
+        if shape is None:
+            return self._geometry(spec, cx, y, color, CANON, CANON_MOUTH_Y)
+
         if shape == "smile":
             pts = quad((cx - 186 * u, y), (cx, y + 140 * u), (cx + 186 * u, y))
         elif shape == "grin":
@@ -616,9 +729,14 @@ class Face:
         elif shape == "wave":
             pts = (quad((cx - 160 * u, y + 33 * u), (cx - 80 * u, y - 32 * u), (cx, y + 27 * u)) +
                    quad((cx, y + 27 * u), (cx + 80 * u, y + 86 * u), (cx + 160 * u, y + 33 * u)))
-        else:  # open — the speaking mouth
+        elif shape == "open":                    # the speaking mouth
             pts = (quad((cx - 106 * u, y + 12 * u), (cx, y - 70 * u), (cx + 106 * u, y + 12 * u)) +
                    quad((cx + 106 * u, y + 12 * u), (cx, y + 124 * u), (cx - 106 * u, y + 12 * u)))
+        else:
+            # Same reasoning as _brow: "open" was the catch-all, so an
+            # unimplemented mouth drew a talking one. A missing mouth is obvious;
+            # a wrong mouth is not.
+            return
         self.s.stroke(pts, self.stroke_w, color)
 
 
@@ -863,8 +981,13 @@ def main():
     follower = Follower()
     follower.start()
 
+    print(f"  faces {len(face.catalog.names())}: {', '.join(face.catalog.names())}", flush=True)
+    for problem in face.catalog.problems:
+        print(f"  ! {problem}", flush=True)
+
     screen.fill(BG_PANEL)
     drawn = None
+    seen_catalog = None
     next_blink = time.time() + 3
     # The framebuffer is shared with the kernel console, which will happily
     # paint over it — a stray kernel message, a getty waking up, or anyone
@@ -880,6 +1003,20 @@ def main():
             if time.time() >= next_heal:
                 drawn = None                      # force a full repaint
                 next_heal = time.time() + HEAL_EVERY
+            # The agent stamps the state with which generation of the expression
+            # directory it validated against. A user who drops in a new JSON and
+            # hits Reload changes that number, and this picks the file up without
+            # anyone restarting the screen — which on a wall-mounted panel with no
+            # keyboard is the difference between "add a face" and "go find a ladder".
+            catalog_version = state.get("expressions_version")
+            if catalog_version is not None and catalog_version != seen_catalog:
+                seen_catalog = catalog_version
+                loaded = face.reload()
+                drawn = None
+                print(f"expressions reloaded: {len(loaded.names())} available", flush=True)
+                for problem in loaded.problems:
+                    print(f"  ! {problem}", flush=True)
+
             if key != drawn:
                 t0 = time.time()
                 face.draw(state.get("expression", "neutral"), state.get("gaze", "center"))
@@ -896,7 +1033,7 @@ def main():
             # repainted, which is why this is affordable at all.
             if time.time() >= next_blink:
                 expression = state.get("expression", "neutral")
-                if expression != "sleeping":
+                if face.spec(expression).get("blink", True):
                     for amount in (0.55, 0.95, 0.55, 0.0):
                         face.draw(expression, state.get("gaze", "center"), blink=amount)
                         time.sleep(0.045)

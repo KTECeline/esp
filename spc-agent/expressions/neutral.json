@@ -1,0 +1,12 @@
+{
+  "name": "neutral",
+  "label": "Neutral",
+  "emoji": "🙂",
+  "description": "Resting face. What the panel shows when nothing else is happening.",
+  "eyes": {
+    "left": "open",
+    "right": "open"
+  },
+  "brow": "flat",
+  "mouth": "smile"
+}

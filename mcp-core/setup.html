@@ -1,0 +1,243 @@
+<!doctype html>
+<!--
+  Fleet setup page, served by mcp-core at GET /setup.
+
+  Deliberately one static file with no build step and no dependencies: it is
+  served by the same process it configures, on a machine that may be an
+  OrangePi with no npm install to spare, and it has to work on the day the
+  fleet is broken — which is the day a CDN you can't reach is worst.
+
+  It holds no secrets. The fleet token is typed in by the operator and kept in
+  sessionStorage (not localStorage) so closing the tab discards it; every call
+  below sends it as X-Fleet-Token, exactly as a box does.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fleet setup</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f7f9; --card: #fff; --fg: #14171a; --muted: #5b6570;
+    --line: #dfe3e8; --accent: #1668d8; --ok: #17794c; --warn: #8a5300; --err: #b3261e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14171a; --card: #1c2024; --fg: #e8eaed; --muted: #9aa4af;
+      --line: #2c3238; --accent: #6aa8ff; --ok: #52c793; --warn: #e0a95c; --err: #ef7a72;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 2rem 1rem; background: var(--bg); color: var(--fg);
+    font: 15px/1.55 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  }
+  main { max-width: 720px; margin: 0 auto; }
+  h1 { font-size: 1.4rem; margin: 0 0 .25rem; }
+  h2 { font-size: 1rem; margin: 2rem 0 .6rem; }
+  .sub { color: var(--muted); margin: 0 0 1.5rem; }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+    padding: .9rem 1rem; margin-bottom: .6rem;
+  }
+  .row { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; }
+  .grow { flex: 1; min-width: 0; }
+  .name { font-weight: 600; }
+  .meta { color: var(--muted); font-size: .85rem; font-variant-numeric: tabular-nums; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85em; }
+  button {
+    font: inherit; font-weight: 550; padding: .45rem .9rem; border-radius: 7px;
+    border: 1px solid var(--accent); background: var(--accent); color: #fff; cursor: pointer;
+  }
+  button.ghost { background: transparent; color: var(--muted); border-color: var(--line); }
+  button:disabled { opacity: .55; cursor: default; }
+  input {
+    font: inherit; padding: .45rem .6rem; border-radius: 7px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--fg);
+  }
+  .pill { font-size: .75rem; padding: .12rem .5rem; border-radius: 99px; border: 1px solid var(--line); color: var(--muted); }
+  .pill.ok { color: var(--ok); border-color: currentColor; }
+  .note { padding: .8rem 1rem; border-radius: 8px; border: 1px solid var(--line); margin-bottom: 1rem; }
+  .note.warn { color: var(--warn); }
+  .note.err { color: var(--err); }
+  .empty { color: var(--muted); font-style: italic; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Fleet setup</h1>
+  <p class="sub">Boxes announce themselves on this network. Add one and it is
+  pointed at this server immediately — no QR, no re-provisioning.</p>
+
+  <div id="auth" class="card" hidden>
+    <div class="row">
+      <label class="grow" for="tok">Fleet token <span class="meta">(the value of <code>ESP_FLEET_TOKEN</code>)</span></label>
+    </div>
+    <div class="row" style="margin-top:.5rem">
+      <input id="tok" class="grow" type="password" placeholder="paste token" autocomplete="off">
+      <button id="save">Unlock</button>
+    </div>
+  </div>
+
+  <div id="status"></div>
+
+  <h2>On this network</h2>
+  <div id="found"><p class="empty">Looking…</p></div>
+
+  <h2>In the fleet</h2>
+  <div id="fleet"><p class="empty">Looking…</p></div>
+
+  <h2>Add by address</h2>
+  <div class="card">
+    <p class="meta" style="margin:0 0 .6rem">
+      For a box on a subnet where multicast never arrives — the address shown on
+      the box's own screen.
+    </p>
+    <div class="row">
+      <input id="mid" placeholder="box id (e.g. BOX-C3B4)" autocomplete="off">
+      <input id="mip" placeholder="192.168.1.50" autocomplete="off">
+      <button id="madd">Add</button>
+    </div>
+  </div>
+</main>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+let token = sessionStorage.getItem("fleetToken") || "";
+
+// Every call carries the token the same way a box does. A 401 means the token
+// is wrong, not that the server is down — surfaced distinctly, because those
+// two look identical from a page that only reports "failed".
+async function api(path, opts = {}) {
+  const headers = Object.assign({}, opts.headers);
+  if (token) headers["X-Fleet-Token"] = token;
+  if (opts.body) headers["Content-Type"] = "application/json";
+  const res = await fetch(path, Object.assign({}, opts, { headers }));
+  let data = {};
+  try { data = await res.json(); } catch { /* non-JSON error page */ }
+  if (res.status === 401) { needToken(true); throw new Error("unauthorized"); }
+  if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+  return data;
+}
+
+function needToken(show) {
+  $("auth").hidden = !show;
+  if (show) $("tok").focus();
+}
+
+function note(kind, html) {
+  $("status").innerHTML = html ? '<div class="note ' + kind + '">' + html + "</div>" : "";
+}
+
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+  ));
+}
+
+function age(ms) {
+  const s = Math.round((Date.now() - ms) / 1000);
+  if (s < 5) return "just now";
+  if (s < 60) return s + "s ago";
+  return Math.round(s / 60) + "m ago";
+}
+
+async function refresh() {
+  let data;
+  try {
+    data = await api("/discover");
+  } catch (err) {
+    if (err.message !== "unauthorized") note("err", "Cannot reach mcp-core: " + esc(err.message));
+    return;
+  }
+  needToken(false);
+
+  // An empty list means two completely different things depending on this, so
+  // it is said out loud rather than left to be inferred from silence.
+  if (data.mdns === "failed") {
+    note("warn", "Discovery is not working on this network (" + esc(data.mdnsError || "mDNS unavailable") +
+      "). Boxes will not appear below — add them by address instead.");
+  } else if (data.mdns === "disabled") {
+    note("warn", "Discovery is switched off (<code>MDNS_DISABLE=1</code>). Add boxes by address.");
+  } else if (!data.serverUrl) {
+    note("err", "This machine has no usable LAN address, so a box cannot be pointed at it. " +
+      "Set <code>lan_ip</code> in config.json.");
+  } else {
+    note("", "");
+  }
+
+  const unregistered = (data.boxes || []).filter((b) => !b.registered);
+  $("found").innerHTML = unregistered.length ? unregistered.map((b) => `
+    <div class="card"><div class="row">
+      <div class="grow">
+        <div class="name">${esc(b.name)}</div>
+        <div class="meta">${esc(b.id)} &middot; ${esc(b.ip)}${b.fw ? " &middot; fw " + esc(b.fw) : ""} &middot; seen ${esc(age(b.lastSeen))}</div>
+      </div>
+      <button data-add="${esc(b.id)}">Add</button>
+    </div></div>`).join("")
+    : '<p class="empty">No new boxes announcing themselves right now.</p>';
+
+  const fleet = data.boxes ? data.boxes.filter((b) => b.registered) : [];
+  const known = await api("/health").then((h) => h.boxes || []).catch(() => []);
+  $("fleet").innerHTML = known.length ? known.map((b) => {
+    const live = fleet.find((f) => f.id === b.id);
+    return `
+    <div class="card"><div class="row">
+      <div class="grow">
+        <div class="name">${esc(b.name)}</div>
+        <div class="meta">${esc(b.id)} &middot; ${esc(b.ip)} &middot; via ${esc(b.channel)}</div>
+      </div>
+      ${live ? '<span class="pill ok">visible</span>' : '<span class="pill">not seen</span>'}
+      <button class="ghost" data-forget="${esc(b.id)}">Forget</button>
+    </div></div>`;
+  }).join("") : '<p class="empty">No boxes in the fleet yet.</p>';
+}
+
+async function adopt(box_id, ip, name) {
+  const body = JSON.stringify(ip ? { box_id, ip, name } : { box_id });
+  try {
+    const r = await api("/adopt", { method: "POST", body });
+    note("", "Added <b>" + esc(r.name || r.box_id) + "</b> and pointed it at <code>" + esc(r.serverUrl) + "</code>.");
+  } catch (err) {
+    if (err.message !== "unauthorized") note("warn", esc(err.message));
+  }
+  refresh();
+}
+
+document.addEventListener("click", (e) => {
+  const add = e.target.closest("[data-add]");
+  if (add) { add.disabled = true; adopt(add.dataset.add); return; }
+  const forget = e.target.closest("[data-forget]");
+  if (forget) {
+    forget.disabled = true;
+    api("/forget", { method: "POST", body: JSON.stringify({ box_id: forget.dataset.forget }) })
+      .catch((err) => { if (err.message !== "unauthorized") note("warn", esc(err.message)); })
+      .then(refresh);
+  }
+});
+
+$("save").onclick = () => {
+  token = $("tok").value.trim();
+  sessionStorage.setItem("fleetToken", token);
+  $("tok").value = "";
+  refresh();
+};
+$("tok").addEventListener("keydown", (e) => { if (e.key === "Enter") $("save").click(); });
+
+$("madd").onclick = () => {
+  const id = $("mid").value.trim();
+  const ip = $("mip").value.trim();
+  if (!id || !ip) { note("warn", "Both a box id and an address are needed."); return; }
+  $("mid").value = ""; $("mip").value = "";
+  adopt(id, ip, id);
+};
+
+refresh();
+// Boxes appear when they boot, which is usually while someone is watching this
+// page waiting for exactly that.
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>
