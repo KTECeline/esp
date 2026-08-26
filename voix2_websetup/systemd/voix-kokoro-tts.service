@@ -1,0 +1,22 @@
+[Unit]
+Description=Voix Kokoro TTS server (kokoro_server.py)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=voix
+WorkingDirectory=%h/esp
+Environment=HOME=%h
+Environment=KOKORO_PORT=8880
+# Real FastAPI app that speaks the openai_tts shape directly (JSON in, raw
+# audio bytes out) — no separate wrapper process like Piper/MOSS-TTS-Nano
+# needed. Runs under its own venv (setup-server.js's /api/download/tts
+# kokoro branch creates it at ~/esp/kokoro-tts/.venv), not the system
+# python3, since it needs torch + kokoro + misaki[zh] installed.
+ExecStart=%h/esp/kokoro-tts/.venv/bin/python %h/esp/kokoro_server.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

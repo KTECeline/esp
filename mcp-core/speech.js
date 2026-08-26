@@ -135,12 +135,21 @@ export function needsLocalEngine(speech) {
 }
 
 // Bound once at startup so call sites stay `transcribe(path)` / `synthesize(text)`
-// and never branch on provider type.
+// and never branch on provider type. `deps.getLanguage`, if given, is read on
+// EVERY transcribe() call (not just once here) so the settings store's live
+// speech.language override — a runtime knob the agent can flip via
+// fleet_settings_set, see mcp-core/settings-spec.json — takes effect on the
+// very next transcription instead of needing a restart. Optional and falls
+// back to the boot-time speech.stt.language so any other caller of this
+// module keeps working unchanged.
 export function createSpeechEngine(speech, deps) {
   const stt = STT_PROVIDERS[speech.stt.type];
   const tts = TTS_PROVIDERS[speech.tts.type];
   return {
-    transcribe: (wavPath) => stt.fn(wavPath, speech.stt, deps),
+    transcribe: (wavPath) => stt.fn(wavPath, {
+      ...speech.stt,
+      language: deps.getLanguage ? deps.getLanguage() : speech.stt.language
+    }, deps),
     synthesize: (text) => tts.fn(text, speech.tts, deps),
     describe: () => `stt=${speech.stt.type} tts=${speech.tts.type}`
   };

@@ -1,0 +1,24 @@
+[Unit]
+Description=Voix setup wizard web server (setup-server.js)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=voix
+WorkingDirectory=%h/esp
+Environment=HOME=%h
+# setup-server.js shells out to bare commands (openclaw, ollama, npm, git,
+# cmake, nmcli, pip) that rely on PATH lookup rather than a full path.
+# systemd gives this service a minimal default PATH
+# (/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin), which can
+# be narrower than the voix user's interactive SSH shell PATH. If a step
+# that works fine over SSH fails here with ENOENT/"command not found", add
+# an Environment=PATH=... line covering wherever those binaries actually
+# live on this box (not set here since that wasn't confirmed).
+ExecStart=/usr/bin/node %h/esp/setup-server.js
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

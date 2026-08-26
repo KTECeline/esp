@@ -1,0 +1,48 @@
+[Unit]
+Description=Voix chromium for OpenClaw's attach-only browser tool
+# Deliberately NOT --headless, unlike the manual chromium-browser example in
+# docs.openclaw.ai/tools/browser-linux-troubleshooting's "Solution 2" —
+# headless mode itself is what's broken on this box's chromium build (see
+# voix-xvfb.service). This runs chromium normally against the Xvfb virtual
+# display (DISPLAY=:99) instead, then OpenClaw is told to attach to it
+# (browser.attachOnly: true, set in setup-server.js's
+# ensureOpenclawBrowserConfig()) rather than launch its own browser.
+After=voix-xvfb.service
+Requires=voix-xvfb.service
+
+[Service]
+Type=simple
+User=voix
+WorkingDirectory=%h/esp
+Environment=HOME=%h
+Environment=DISPLAY=:99
+# --remote-debugging-port=18800 and --user-data-dir=.../openclaw/user-data
+# are not arbitrary: 18800 is the fixed port OpenClaw's attach-only mode
+# expects for a local browser (confirmed against docs.openclaw.ai — local
+# openclaw-driver profiles auto-assign cdpPort/cdpUrl to this convention;
+# only remote CDP setups set those manually), and .../openclaw/user-data is
+# the exact managed-profile path OpenClaw's browser tool expects, not a
+# throwaway profile dir. Changing either without changing the other side
+# (OpenClaw's config) will make attachOnly silently fail to find this
+# browser.
+ExecStart=/usr/bin/chromium --no-sandbox --disable-gpu --remote-debugging-port=18800 --user-data-dir=%h/.openclaw/browser/openclaw/user-data about:blank
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+
+# Manual install steps (first deploy only — after an edit to this file,
+# just `sudo systemctl daemon-reload && sudo systemctl restart voix-browser`).
+# Requires systemd/voix-xvfb.service already installed and running (see its
+# own install steps) — this unit Requires= it and will fail to start
+# otherwise:
+#   sudo cp systemd/voix-browser.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now voix-browser.service
+#   curl http://127.0.0.1:18800/json/version   # expect a real Chrome/1xx response
+# Then confirm OpenClaw itself is set to attach to this chromium instead of
+# trying (and failing) to launch its own — ensureOpenclawBrowserConfig() in
+# setup-server.js sets this as part of the normal OpenClaw connect/setup
+# flow, not this unit, so check it separately after that flow has run:
+#   openclaw config get browser.attachOnly   # expect "true"

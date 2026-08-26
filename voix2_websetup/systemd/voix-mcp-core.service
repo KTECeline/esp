@@ -1,0 +1,34 @@
+[Unit]
+Description=Voix mcp-core server (mcp-core/server.js)
+After=network-online.target
+Wants=network-online.target
+# No After=/Requires= on voix-ollama/voix-kokoro-tts/voix-openclaw-bridge:
+# mcp-core's own backend priority list already falls through when one of
+# them is down, so this doesn't need to wait on any of them specifically —
+# network-online.target is enough ordering.
+
+[Service]
+Type=simple
+User=voix
+WorkingDirectory=%h/esp
+Environment=HOME=%h
+# .env is bash-export style (`export KEY=value` — see setup-server.js's own
+# readEnvFile()), which EnvironmentFile= does not understand: per
+# systemd.exec(5), each line is split at its first "=" with no special
+# case for a leading "export " token, so an unstripped line would define a
+# variable literally named "export MCP_ACCESS_KEY" instead of
+# MCP_ACCESS_KEY — mcp-core would come up with the real var simply unset,
+# no error. This reads a derived, stripped copy instead. Regenerate it
+# whenever .env changes (a new key appended by setup-server.js, a token
+# rotated, etc.) and restart this unit to pick it up. Run this as (or
+# sudo -u) the voix service user so ~ resolves to the same %h this unit
+# itself uses below — board-independent, same command on OrangePi or Radxa:
+#   sed 's/^export //' ~/esp/.env > ~/esp/.env.systemd
+#   systemctl restart voix-mcp-core
+EnvironmentFile=%h/esp/.env.systemd
+ExecStart=/usr/bin/node %h/esp/mcp-core/server.js
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

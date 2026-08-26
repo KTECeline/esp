@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Wi-Fi Setup</title>
+<style>
+  :root{
+    --bg:#f4f6f8;
+    --card:#ffffff;
+    --text:#1c2530;
+    --muted:#5b6572;
+    --border:#e2e6ea;
+    --primary:#2563eb;
+    --primary-dark:#1d4ed8;
+    --success:#16a34a;
+    --danger:#dc2626;
+    --shadow: 0 1px 2px rgba(20,20,43,.04), 0 8px 24px rgba(20,20,43,.06);
+    --radius: 14px;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#0f1420;
+      --card:#161d2b;
+      --text:#e8ecf3;
+      --muted:#9aa5b4;
+      --border:#262f42;
+      --primary:#5b8bf5;
+      --primary-dark:#4573e0;
+      --success:#3ecf72;
+      --danger:#f26a6a;
+      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.35);
+    }
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background:var(--bg);
+    color:var(--text);
+    min-height:100vh;
+    display:flex;
+    justify-content:center;
+    padding: 32px 16px 80px;
+  }
+  .app{ width:100%; max-width:440px; }
+  .brand{ display:flex; align-items:center; gap:12px; margin-bottom:24px; }
+  .brand-mark{
+    width:40px;height:40px;border-radius:10px;
+    background:linear-gradient(135deg,var(--primary),#7c3aed);
+    display:flex;align-items:center;justify-content:center;
+    color:white;font-size:20px;flex-shrink:0;
+  }
+  .brand-text h1{font-size:17px;margin:0;}
+  .brand-text p{font-size:13px;color:var(--muted);margin:2px 0 0;}
+
+  .section{
+    background:var(--card);
+    border:1px solid var(--border);
+    border-radius:var(--radius);
+    box-shadow:var(--shadow);
+    padding:26px;
+  }
+  .sub{ color:var(--muted); font-size:14px; line-height:1.5; margin:0 0 20px; }
+
+  .field-label{ display:block; font-size:13.5px; font-weight:600; margin:16px 0 6px; }
+  .field-label:first-of-type{ margin-top:0; }
+  input[type=text], input[type=password]{
+    width:100%;
+    padding:11px 13px;
+    border-radius:9px;
+    border:1.5px solid var(--border);
+    background:var(--bg);
+    color:var(--text);
+    font-size:14.5px;
+    font-family:inherit;
+    outline:none;
+    transition:border-color .15s ease;
+  }
+  input:focus{ border-color:var(--primary); }
+  .hint{ font-size:12px; color:var(--muted); margin-top:5px; }
+
+  .pw-wrap{ position:relative; }
+  .pw-toggle{
+    position:absolute;right:10px;top:50%;transform:translateY(-50%);
+    background:none;border:none;color:var(--muted);cursor:pointer;font-size:12.5px;
+    font-family:inherit;padding:4px 6px;
+  }
+
+  button.primary{
+    width:100%;
+    background:var(--primary);
+    color:white;
+    border:none;
+    padding:13px 22px;
+    border-radius:10px;
+    font-size:14.5px;
+    font-weight:600;
+    cursor:pointer;
+    font-family:inherit;
+    margin-top:20px;
+    transition:background .15s ease, transform .1s ease;
+  }
+  button.primary:hover{ background:var(--primary-dark); }
+  button.primary:active{ transform:scale(.98); }
+  button.primary:disabled{ opacity:.45; cursor:not-allowed; }
+
+  button.secondary{
+    width:100%;
+    background:none;
+    border:1.5px solid var(--border);
+    color:var(--text);
+    padding:11px 22px;
+    border-radius:10px;
+    font-size:14px;
+    font-weight:600;
+    cursor:pointer;
+    font-family:inherit;
+    margin-top:10px;
+  }
+
+  .status-panel{ text-align:center; padding:8px 0 4px; }
+  .spinner{
+    width:30px;height:30px;
+    border-radius:50%;
+    border:3px solid var(--border);
+    border-top-color:var(--primary);
+    margin:0 auto 16px;
+    animation:spin .8s linear infinite;
+  }
+  @keyframes spin{ to{ transform:rotate(360deg); } }
+  .status-title{ font-size:15px; font-weight:600; margin-bottom:6px; }
+  .status-title.fail{ color:var(--danger); }
+  .status-title.ok{ color:var(--success); }
+  .status-detail{ font-size:13.5px; color:var(--muted); line-height:1.55; }
+
+  .copy-box{
+    display:flex;
+    align-items:center;
+    gap:8px;
+    background:var(--bg);
+    border:1px solid var(--border);
+    border-radius:9px;
+    padding:10px 12px;
+    margin-top:16px;
+    font-size:13.5px;
+    word-break:break-all;
+    text-align:left;
+  }
+  .copy-box a{ color:var(--primary); text-decoration:none; flex:1; }
+  .copy-btn{
+    flex-shrink:0;
+    background:none;
+    border:1.5px solid var(--border);
+    color:var(--text);
+    border-radius:7px;
+    padding:6px 10px;
+    font-size:12.5px;
+    font-family:inherit;
+    cursor:pointer;
+  }
+  .collapsed{ display:none; }
+</style>
+</head>
+<body>
+
+<div class="app">
+  <div class="brand">
+    <div class="brand-mark">📶</div>
+    <div class="brand-text">
+      <h1>Wi-Fi Setup</h1>
+      <p>Connect this device to your Wi-Fi network</p>
+    </div>
+  </div>
+
+  <div class="section">
+    <form id="wifiForm">
+      <p class="sub">Enter your Wi-Fi network name and password below. This device will use it to connect.</p>
+
+      <span class="field-label">Network name (SSID)</span>
+      <input type="text" id="ssidInput" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" required maxlength="32" placeholder="e.g. MyShop-WiFi">
+
+      <span class="field-label">Password</span>
+      <div class="pw-wrap">
+        <input type="password" id="passwordInput" autocomplete="off" placeholder="Leave blank for an open network">
+        <button class="pw-toggle" type="button" id="pwToggleBtn">Show</button>
+      </div>
+      <div class="hint">8+ characters, or blank if this network has no password.</div>
+
+      <button class="primary" type="submit" id="connectBtn">Connect</button>
+    </form>
+
+    <div class="status-panel collapsed" id="statusPanel"></div>
+  </div>
+</div>
+
+<script>
+function escapeHtml(s){
+  return (s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+function copyToClipboard(text, btn){
+  const done = () => {
+    const original = btn.textContent;
+    btn.textContent = 'Copied!';
+    setTimeout(() => { btn.textContent = original; }, 1200);
+  };
+  if (navigator.clipboard && window.isSecureContext){
+    navigator.clipboard.writeText(text).then(done);
+    return;
+  }
+  // Fallback: navigator.clipboard needs a secure context, but this page is
+  // served over plain http:// on the hotspot, where it's unavailable.
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand('copy'); } catch (e) {}
+  document.body.removeChild(ta);
+  done();
+}
+
+document.getElementById('pwToggleBtn').onclick = () => {
+  const input = document.getElementById('passwordInput');
+  const btn = document.getElementById('pwToggleBtn');
+  const showing = input.type === 'text';
+  input.type = showing ? 'password' : 'text';
+  btn.textContent = showing ? 'Show' : 'Hide';
+};
+
+const form = document.getElementById('wifiForm');
+const statusPanel = document.getElementById('statusPanel');
+
+function showStatus(html){
+  form.classList.add('collapsed');
+  statusPanel.classList.remove('collapsed');
+  statusPanel.innerHTML = html;
+}
+function showForm(){
+  form.classList.remove('collapsed');
+  statusPanel.classList.add('collapsed');
+  document.getElementById('connectBtn').disabled = false;
+}
+
+function showConnecting(){
+  showStatus(`
+    <div class="spinner"></div>
+    <div class="status-title">Connecting…</div>
+    <div class="status-detail">This may take a moment. Your phone may briefly lose its connection to this device while it switches networks — that's expected.</div>
+  `);
+}
+function showReconnecting(){
+  showStatus(`
+    <div class="spinner"></div>
+    <div class="status-title">Almost there…</div>
+    <div class="status-detail">Waiting for your phone to rejoin your Wi-Fi network, then checking for the device automatically.</div>
+  `);
+}
+function showError(message){
+  showStatus(`
+    <div class="status-title fail">✕ Couldn't connect</div>
+    <div class="status-detail">${escapeHtml(message)}</div>
+    <button class="secondary" id="tryAgainBtn" type="button">Try again</button>
+  `);
+  document.getElementById('tryAgainBtn').onclick = showForm;
+}
+function showLostConnection(){
+  showStatus(`
+    <div class="status-title">Connection to this device was lost</div>
+    <div class="status-detail">
+      This is expected if it's switching networks now. Wait about a minute, then:
+      <ul style="text-align:left;margin:10px 0 0;padding-left:20px;">
+        <li>If it connected successfully, reconnect your phone to your own Wi-Fi and check your router's device list for this device's new address.</li>
+        <li>If it's still on "VoiceKiosk-Setup", reconnect to that network and try again.</li>
+      </ul>
+    </div>
+  `);
+}
+function showFallbackLink(url){
+  showStatus(`
+    <div class="status-title">Connected — one more step</div>
+    <div class="status-detail">Couldn't automatically confirm and redirect. Reconnect your phone to your own Wi-Fi, then open this address:</div>
+    <div class="copy-box">
+      <a href="${escapeHtml(url)}">${escapeHtml(url)}</a>
+      <button class="copy-btn" id="copyLinkBtn" type="button">Copy</button>
+    </div>
+  `);
+  document.getElementById('copyLinkBtn').onclick = (e) => copyToClipboard(url, e.currentTarget);
+}
+
+// Deliberately doesn't rely on CORS: `no-cors` still rejects on a genuine
+// network failure (host unreachable, connection refused/timed out) and
+// resolves (with an opaque, unreadable response) once a request actually
+// reaches the box — which is all that's needed here: not the response
+// body, just proof the phone can now reach that address.
+function probeOnce(url){
+  return new Promise((resolve) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3000);
+    fetch(url, { mode: 'no-cors', cache: 'no-store', signal: controller.signal })
+      .then(() => { clearTimeout(timer); resolve(true); })
+      .catch(() => { clearTimeout(timer); resolve(false); });
+  });
+}
+
+async function pollAddress(address, port){
+  const url = `http://${address}:${port}/`;
+  const deadline = Date.now() + 60000;
+  while (Date.now() < deadline){
+    if (await probeOnce(url)){
+      window.location.href = url;
+      return;
+    }
+    await sleep(2000);
+  }
+  showFallbackLink(url);
+}
+
+form.onsubmit = async (e) => {
+  e.preventDefault();
+  const ssid = document.getElementById('ssidInput').value.trim();
+  const password = document.getElementById('passwordInput').value;
+  if (!ssid) return;
+  if (password && password.length < 8){
+    showError('Password must be at least 8 characters, or blank for an open network.');
+    return;
+  }
+
+  document.getElementById('connectBtn').disabled = true;
+  showConnecting();
+
+  const port = window.location.port || '80';
+  let data;
+  try {
+    const res = await fetch('/api/wifi/connect', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ssid, password }),
+    });
+    data = await res.json();
+  } catch (err) {
+    // The most likely cause: this device's Wi-Fi radio left the hotspot to
+    // try the new network, taking the phone's connection to this very page
+    // down with it, mid-request — not necessarily a real failure.
+    showLostConnection();
+    return;
+  }
+
+  if (!data.success){
+    showError(data.error || 'Could not connect.');
+    return;
+  }
+
+  showReconnecting();
+  await pollAddress(data.newAddress, port);
+};
+</script>
+
+</body>
+</html>

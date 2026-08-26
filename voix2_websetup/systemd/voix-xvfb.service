@@ -1,0 +1,33 @@
+[Unit]
+Description=Voix virtual X11 display for chromium (Xvfb :99)
+# This box's chromium package has no headless ozone platform compiled in at
+# all — both --headless and --headless=new fail identically with "FATAL:
+# Invalid ozone platform: headless" (confirmed via manual testing on this
+# box, not a flag/config issue — it's a build limitation of this specific
+# Debian ARM64 chromium package). Xvfb gives chromium a real, if invisible,
+# X11 display to run against instead of headless mode, per
+# docs.openclaw.ai/tools/browser-linux-troubleshooting's "Solution 2"
+# (confirmed live: chromium launched this way against :99 responds
+# correctly on its remote-debugging port). voix-browser.service requires
+# this unit to already be up before it starts.
+
+[Service]
+Type=simple
+User=voix
+WorkingDirectory=%h/esp
+Environment=HOME=%h
+ExecStart=/usr/bin/Xvfb :99 -screen 0 1280x1024x24
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+
+# Manual install steps (first deploy only — after an edit to this file,
+# just `sudo systemctl daemon-reload && sudo systemctl restart voix-xvfb`):
+#   sudo cp systemd/voix-xvfb.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now voix-xvfb.service
+#   systemctl status voix-xvfb.service   # expect "active (running)"
+# Install systemd/voix-browser.service after this one is confirmed
+# running — it Requires= this unit and will fail to start otherwise.

@@ -145,6 +145,15 @@
       "guidance": "Spoken once and cached as audio, so a change costs one synthesis and then nothing. Keep it to a sentence — it plays before the customer has decided to engage."
     },
     {
+      "key": "speech.language",
+      "scope": "server",
+      "type": "string",
+      "default": "",
+      "max_length": 10,
+      "summary": "Language hint sent to the STT engine. Empty falls back to speech.stt.language in config.json; \"auto\" lets the engine detect; a code (e.g. \"en\", \"zh\", \"ms\") biases toward one language.",
+      "guidance": "Automatic language detection is unreliable on short, noisy kiosk utterances — switch this when a box gets a run of customers ordering in one language (part of the Manglish/BM handling). Applies to the very next transcription, no restart needed."
+    },
+    {
       "key": "adopt.sweep_ms",
       "scope": "server",
       "type": "int",

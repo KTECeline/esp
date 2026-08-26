@@ -189,7 +189,12 @@ function extractStructured(result) {
 const USES_LOCAL_ENGINE = needsLocalEngine(config.speech);
 const speech = createSpeechEngine(config.speech, {
   get mcpClient() { return mcpClient; },
-  extractStructured
+  extractStructured,
+  // Same three-tier fallback as greetingText() above: an untouched setting
+  // (empty string) defers to config.json's boot-time value, so existing
+  // installs that already customized speech.stt.language see no change
+  // until something — the agent, or a human — actually sets speech.language.
+  getLanguage: () => settings.get("speech.language") || config.speech.stt.language || "auto"
 });
 
 // Bound once so the tool layer never sees camera flags — null when no camera is

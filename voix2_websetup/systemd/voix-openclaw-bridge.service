@@ -1,0 +1,24 @@
+[Unit]
+Description=Voix OpenClaw agent bridge (openclaw-agent-bridge.js)
+
+[Service]
+Type=simple
+User=voix
+WorkingDirectory=%h/esp
+Environment=HOME=%h
+# openclaw-agent-bridge.js now shells out to the bare `openclaw` command
+# (session reset, see resetOpenClawSession() in that file) rather than only
+# making HTTP calls like before. systemd gives this service a minimal
+# default PATH (/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin),
+# which can be narrower than the voix user's interactive SSH shell PATH —
+# same caveat voix-setup-server.service already documents for its own
+# openclaw/ollama/npm/git/cmake/nmcli/pip calls. If session resets start
+# failing here with ENOENT/"command not found" despite `openclaw` working
+# over SSH, add an Environment=PATH=... line covering wherever it actually
+# lives on this box (not set here since that wasn't confirmed).
+ExecStart=/usr/bin/node %h/esp/openclaw-agent-bridge.js
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

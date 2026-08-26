@@ -1,0 +1,1667 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Voice Kiosk Setup</title>
+<style>
+  :root{
+    --bg:#f4f6f8;
+    --card:#ffffff;
+    --text:#1c2530;
+    --muted:#5b6572;
+    --border:#e2e6ea;
+    --primary:#2563eb;
+    --primary-dark:#1d4ed8;
+    --primary-light:#eaf0fe;
+    --success:#16a34a;
+    --success-light:#eafaf0;
+    --danger:#dc2626;
+    --shadow: 0 1px 2px rgba(20,20,43,.04), 0 8px 24px rgba(20,20,43,.06);
+    --radius: 14px;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#0f1420;
+      --card:#161d2b;
+      --text:#e8ecf3;
+      --muted:#9aa5b4;
+      --border:#262f42;
+      --primary:#5b8bf5;
+      --primary-dark:#4573e0;
+      --primary-light:#1b2740;
+      --success:#3ecf72;
+      --success-light:#12291d;
+      --danger:#f26a6a;
+      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.35);
+    }
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background:var(--bg);
+    color:var(--text);
+    min-height:100vh;
+    display:flex;
+    justify-content:center;
+    padding: 32px 16px 80px;
+  }
+  .app{
+    width:100%;
+    max-width:640px;
+  }
+  .brand{
+    display:flex;
+    align-items:center;
+    gap:12px;
+    margin-bottom:28px;
+  }
+  .brand-mark{
+    width:40px;height:40px;border-radius:10px;
+    background:linear-gradient(135deg,var(--primary),#7c3aed);
+    display:flex;align-items:center;justify-content:center;
+    color:white;font-size:20px;flex-shrink:0;
+  }
+  .brand-text h1{font-size:17px;margin:0;}
+  .brand-text p{font-size:13px;color:var(--muted);margin:2px 0 0;}
+
+  .section{
+    background:var(--card);
+    border:1px solid var(--border);
+    border-radius:var(--radius);
+    box-shadow:var(--shadow);
+    padding:28px;
+    margin-bottom:18px;
+    position:relative;
+    transition:opacity .2s ease;
+  }
+  .collapsed{display:none;}
+
+  .subsection{
+    margin-top:22px;
+    padding-top:22px;
+    border-top:1px solid var(--border);
+  }
+  .subsection-title{
+    font-size:15px;
+    margin:0 0 4px;
+  }
+
+  .section-head{
+    display:flex;
+    align-items:center;
+    gap:12px;
+    margin-bottom:8px;
+  }
+  .section-num{
+    display:none;
+  }
+
+  h2{
+    font-size:19px;
+    margin:0;
+  }
+  .sub{
+    color:var(--muted);
+    font-size:14.5px;
+    line-height:1.5;
+    margin:0 0 20px;
+  }
+  .sub-indent{margin-left:40px;}
+
+  .choice-grid{
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:12px;
+    margin-bottom:8px;
+  }
+  .choice-card{
+    border:1.5px solid var(--border);
+    border-radius:12px;
+    padding:16px;
+    cursor:pointer;
+    text-align:left;
+    background:transparent;
+    color:var(--text);
+    font-family:inherit;
+    transition:border-color .15s ease, background .15s ease;
+  }
+  .choice-card:hover{border-color:var(--primary);}
+  .choice-card.selected{
+    border-color:var(--primary);
+    background:var(--primary-light);
+  }
+  .choice-card:disabled{opacity:.4;cursor:not-allowed;}
+  .choice-card:disabled:hover{border-color:var(--border);}
+  .choice-card .icon{font-size:22px;margin-bottom:8px;display:block;}
+  .choice-card .title{font-weight:600;font-size:15px;margin-bottom:4px;}
+  .choice-card .desc{font-size:12.5px;color:var(--muted);line-height:1.4;}
+  .choice-card .model-note{font-size:11px;color:var(--muted);font-style:italic;margin-top:6px;}
+
+  .provider-list{
+    display:flex;
+    flex-direction:column;
+    border:1.5px solid var(--border);
+    border-radius:12px;
+    overflow:hidden;
+    margin-bottom:8px;
+  }
+  .provider-row{
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+    gap:12px;
+    width:100%;
+    padding:11px 16px;
+    cursor:pointer;
+    text-align:left;
+    background:transparent;
+    color:var(--text);
+    font-family:inherit;
+    border:none;
+    border-bottom:1.5px solid var(--border);
+    transition:background .15s ease;
+  }
+  .provider-row:last-child{border-bottom:none;}
+  .provider-row:hover{background:var(--primary-light);}
+  .provider-row.selected{background:var(--primary-light);}
+  .provider-row .name-wrap{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;}
+  .provider-row .name{font-weight:600;font-size:14.5px;}
+  .provider-row .desc{font-size:12.5px;color:var(--muted);}
+  .provider-row .check{font-size:15px;font-weight:700;color:var(--primary);width:16px;flex-shrink:0;text-align:center;}
+
+  .preview-btn{
+    background:none;
+    border:1.5px solid var(--border);
+    color:var(--text);
+    border-radius:8px;
+    padding:8px 10px;
+    font-size:12.5px;
+    cursor:pointer;
+    font-family:inherit;
+    transition:border-color .15s ease, color .15s ease;
+  }
+  .preview-btn:hover{border-color:var(--primary);color:var(--primary);}
+
+  .lang-check{
+    display:flex;
+    align-items:center;
+    gap:8px;
+    font-size:14.5px;
+    padding:8px 0;
+    cursor:pointer;
+  }
+  .preview-row{
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+    gap:10px;
+    padding:9px 0;
+    border-bottom:1px solid var(--border);
+    font-size:14px;
+  }
+  .preview-row:last-child{border-bottom:none;}
+
+  .field-label{
+    display:block;
+    font-size:13.5px;
+    font-weight:600;
+    margin:16px 0 6px;
+  }
+  .field-label:first-of-type{margin-top:0;}
+  input[type=text], input[type=email], input[type=tel], input[type=password], select{
+    width:100%;
+    padding:11px 13px;
+    border-radius:9px;
+    border:1.5px solid var(--border);
+    background:var(--bg);
+    color:var(--text);
+    font-size:14.5px;
+    font-family:inherit;
+    outline:none;
+    transition:border-color .15s ease;
+  }
+  input:focus, select:focus{border-color:var(--primary);}
+  .hint{font-size:12px;color:var(--muted);margin-top:5px;}
+
+  .pw-wrap{position:relative;}
+  .pw-toggle{
+    position:absolute;right:10px;top:50%;transform:translateY(-50%);
+    background:none;border:none;color:var(--muted);cursor:pointer;font-size:12.5px;
+    font-family:inherit;padding:4px 6px;
+  }
+
+  .api-key-row{display:flex;gap:8px;align-items:center;}
+  .api-key-row .pw-wrap{flex:1;}
+  .key-remove{
+    background:none;
+    border:1.5px solid var(--border);
+    color:var(--muted);
+    border-radius:8px;
+    width:38px;height:38px;
+    flex-shrink:0;
+    cursor:pointer;
+    font-size:14px;
+    font-family:inherit;
+  }
+  .key-remove:hover{border-color:var(--danger);color:var(--danger);}
+
+  .info-box{
+    background:var(--primary-light);
+    border:1px solid var(--border);
+    border-radius:10px;
+    padding:14px 16px;
+    font-size:13.5px;
+    color:var(--text);
+    line-height:1.55;
+    margin-bottom:4px;
+  }
+  .info-box b{color:var(--primary);}
+
+  .btn-row{
+    display:flex;
+    justify-content:flex-end;
+    align-items:center;
+    margin-top:18px;
+    gap:10px;
+  }
+  .btn-row.spread{justify-content:space-between;}
+  button.primary{
+    background:var(--primary);
+    color:white;
+    border:none;
+    padding:12px 22px;
+    border-radius:10px;
+    font-size:14.5px;
+    font-weight:600;
+    cursor:pointer;
+    font-family:inherit;
+    transition:background .15s ease, transform .1s ease;
+  }
+  button.primary:hover{background:var(--primary-dark);}
+  button.primary:active{transform:scale(.98);}
+  button.primary:disabled{opacity:.45;cursor:not-allowed;}
+  button.ghost{
+    background:none;
+    border:none;
+    color:var(--muted);
+    font-size:14px;
+    cursor:pointer;
+    font-family:inherit;
+    padding:12px 8px;
+  }
+  button.ghost:hover{color:var(--text);}
+
+  .test-panel{
+    border:1.5px dashed var(--border);
+    border-radius:10px;
+    padding:20px;
+    text-align:center;
+    margin-bottom:4px;
+  }
+  .spinner{
+    width:28px;height:28px;
+    border-radius:50%;
+    border:3px solid var(--border);
+    border-top-color:var(--primary);
+    margin:0 auto 12px;
+    animation:spin .8s linear infinite;
+  }
+  @keyframes spin{to{transform:rotate(360deg);}}
+  .test-result{font-size:14px;font-weight:600;}
+  .test-result.ok{color:var(--success);}
+  .test-result.fail{color:var(--danger);}
+  .test-log{
+    text-align:left;
+    font-size:12.5px;
+    color:var(--muted);
+    background:var(--bg);
+    border-radius:8px;
+    padding:12px 14px;
+    margin-top:14px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    line-height:1.7;
+  }
+  .test-log .ok-line::before{content:"✓ ";color:var(--success);}
+
+  .summary-list{list-style:none;padding:0;margin:0 0 4px;}
+  .summary-list li{
+    display:flex;
+    justify-content:space-between;
+    gap:12px;
+    padding:11px 0;
+    border-bottom:1px solid var(--border);
+    font-size:14px;
+  }
+  .summary-list li:last-child{border-bottom:none;}
+  .summary-list .k{color:var(--muted);}
+  .summary-list .v{font-weight:600;text-align:right;}
+  .summary-list .v.missing{color:var(--danger);font-weight:500;}
+
+  .final-panel{text-align:center;padding:12px 0 4px;}
+  .final-icon{
+    width:64px;height:64px;border-radius:50%;
+    background:var(--success-light);
+    color:var(--success);
+    display:flex;align-items:center;justify-content:center;
+    font-size:32px;margin:0 auto 18px;
+  }
+
+  @media (max-width:480px){
+    .choice-grid{grid-template-columns:1fr;}
+    .section{padding:20px;}
+    .sub-indent{margin-left:0;}
+  }
+</style>
+</head>
+<body>
+
+<div class="app">
+  <div class="brand">
+    <div class="brand-mark">🎙️</div>
+    <div class="brand-text">
+      <h1>Voice Kiosk Setup</h1>
+    </div>
+  </div>
+
+  <!-- 0. Brain device -->
+  <div class="section" id="brainDeviceSection">
+    <div class="section-head">
+      <div class="section-num" id="brainDeviceNum">1</div>
+      <h2>Which brain is this?</h2>
+    </div>
+    <p class="sub sub-indent">Tell us which board is running the voice engine on this box, so the rest of setup matches its hardware.</p>
+    <div class="choice-grid">
+      <button class="choice-card" data-device="orangepi">
+        <span class="icon">🟠</span>
+        <div class="title">OrangePi</div>
+        <div class="desc">This box's brain is an OrangePi single-board computer.</div>
+      </button>
+      <button class="choice-card" data-device="radxa">
+        <span class="icon">🔷</span>
+        <div class="title">Radxa</div>
+        <div class="desc">This box's brain is a Radxa single-board computer.</div>
+      </button>
+    </div>
+    <div id="brainDeviceStatus" style="margin-top:8px;"></div>
+  </div>
+
+  <!-- 1. Download -->
+  <div class="section" id="downloadSection">
+    <div class="section-head">
+      <div class="section-num" id="downloadNum">1</div>
+      <h2>Set up voice system</h2>
+    </div>
+    <p class="sub sub-indent">This connects the box to the voice engine.</p>
+    <div class="test-panel" id="downloadPanel">
+      <button class="primary" id="pullBtn">Set up now</button>
+      <div class="hint" style="margin-top:10px;">Takes about 2 minutes.</div>
+    </div>
+  </div>
+
+  <!-- 2. Voice model -->
+  <div class="section" id="voiceModelSection">
+    <div class="section-head">
+      <div class="section-num" id="voiceModelNum">2</div>
+      <h2>Choose your voice experience</h2>
+    </div>
+    <p class="sub sub-indent">Pick how your assistant listens and how it sounds when it replies.</p>
+
+    <!-- STT: Step 1 — Choose -->
+    <span class="field-label">How fast should it listen?</span>
+    <div class="choice-grid">
+      <button class="choice-card" data-stt="whisper-base">
+        <span class="icon">🎧</span>
+        <div class="title">Quick Response</div>
+        <div class="desc">Faster replies. Best for quiet environments.</div>
+        <div class="model-note">(Whisper Base)</div>
+      </button>
+      <button class="choice-card" data-stt="whisper-small">
+        <span class="icon">🎧</span>
+        <div class="title">Better Accuracy</div>
+        <div class="desc">Understands speech better in noisy environments. Ideal for busy restaurants or crowded places.</div>
+        <div class="model-note">(Whisper Small)</div>
+      </button>
+      <button class="choice-card" data-stt="whisper-medium">
+        <span class="icon">🎧</span>
+        <div class="title">High Accuracy</div>
+        <div class="desc">Handles heavy accents and background noise well. Slower than Better Accuracy.</div>
+        <div class="model-note">(Whisper Medium)</div>
+      </button>
+      <button class="choice-card" data-stt="custom">
+        <span class="icon">🎧</span>
+        <div class="title">Setup your own STT</div>
+        <div class="desc">Bring your own speech recognition model instead of a preset.</div>
+        <div class="model-note">(Custom)</div>
+      </button>
+    </div>
+
+    <!-- STT: Step 2 & 3 — Download / Complete -->
+    <div class="subsection collapsed" id="sttDownloadStep">
+      <div class="test-panel" id="sttDownloadPanel"></div>
+    </div>
+
+    <!-- TTS: Step 1 — Choose voice style -->
+    <span class="field-label">Choose your assistant's voice</span>
+    <div class="choice-grid">
+      <button class="choice-card" data-tts="piper">
+        <span class="icon">🔊</span>
+        <div class="title">Standard Voice</div>
+        <div class="desc">Clear and natural. Loads faster.</div>
+        <div class="model-note">(Piper)</div>
+      </button>
+      <button class="choice-card" data-tts="kokoro">
+        <span class="icon">🔊</span>
+        <div class="title">Premium Voice</div>
+        <div class="desc">Richer and more expressive. Slightly longer processing time.</div>
+        <div class="model-note">(Kokoro)</div>
+      </button>
+    </div>
+
+    <!-- TTS: Step 2 — Voice gender -->
+    <div class="subsection collapsed" id="ttsGenderStep">
+      <h3 class="subsection-title">Voice gender</h3>
+      <label class="lang-check"><input type="radio" name="ttsGender" data-gender="female" checked> Female</label>
+      <label class="lang-check"><input type="radio" name="ttsGender" data-gender="male"> Male</label>
+    </div>
+
+    <!-- TTS: Step 3 — Choose language(s) -->
+    <div class="subsection collapsed" id="ttsLanguageStep">
+      <h3 class="subsection-title">Choose language(s)</h3>
+      <p class="sub" style="margin-bottom:10px;">Select every language your customers might order in.</p>
+      <label class="lang-check"><input type="checkbox" data-lang="en"> English</label>
+      <label class="lang-check"><input type="checkbox" data-lang="zh"> 中文</label>
+    </div>
+
+    <!-- TTS: Step 4 — Preview -->
+    <div class="subsection collapsed" id="ttsPreviewStep">
+      <h3 class="subsection-title">Preview</h3>
+      <div id="ttsPreviewList"></div>
+    </div>
+
+    <!-- TTS: Step 5 & 6 — Download / Complete -->
+    <div class="subsection collapsed" id="ttsDownloadStep">
+      <div class="test-panel" id="ttsDownloadPanel"></div>
+    </div>
+  </div>
+
+  <!-- 3. Agent -->
+  <div class="section" id="aiSection">
+    <div class="section-head">
+      <div class="section-num" id="aiNum">4</div>
+      <h2>Connect your assistant's brain</h2>
+    </div>
+    <p class="sub sub-indent">Choose whether this box connects to an agent running elsewhere, or runs its own AI model locally.</p>
+
+    <div class="choice-grid">
+      <button class="choice-card selected" data-agent-mode="remote">
+        <span class="icon">🌐</span>
+        <div class="title">Remote Agent</div>
+        <div class="desc">Connects to an agent already running elsewhere via MCP.</div>
+      </button>
+      <button class="choice-card" data-agent-mode="local">
+        <span class="icon">💻</span>
+        <div class="title">Local Agent</div>
+        <div class="desc">Runs the AI brain on this box — choose a Cloud or Local model below.</div>
+      </button>
+    </div>
+
+    <!-- Remote Agent: MCP connection details (auto-loaded) -->
+    <div class="subsection" id="remoteAgentStep">
+      <div class="test-panel" id="connectAgentPanel">
+        <div class="spinner"></div>
+        <div style="color:var(--muted);font-size:14px;">Loading connection details…</div>
+      </div>
+    </div>
+
+    <!-- Local Agent: OpenClaw must be installed before "Choose your LLM" is usable -->
+    <div class="subsection collapsed" id="localAgentStep">
+      <h3 class="subsection-title">Setup OpenClaw</h3>
+      <p class="sub" style="margin-bottom:14px;">OpenClaw needs to be installed on this box before you can choose a model for it to use.</p>
+      <div class="test-panel" id="openclawSetupPanel">
+        <button class="primary" id="setupOpenclawBtn" type="button">Setup OpenClaw</button>
+      </div>
+      <div id="openclawMcpStatus" style="margin-top:10px;">
+        <div class="hint">Box tools (esp_speak, esp_display, esp_list_boxes): not yet connected to OpenClaw</div>
+        <button class="ghost" id="connectOpenclawMcpBtn" type="button" style="padding-left:0;">Connect box tools to OpenClaw</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Choose your LLM (only relevant when Local Agent is selected) -->
+  <div class="section collapsed" id="llmSection">
+    <div class="section-head">
+      <div class="section-num" id="llmNum">5</div>
+      <h2>Choose your LLM</h2>
+    </div>
+    <p class="sub sub-indent">This decides where the AI brain that powers your assistant runs.</p>
+    <div class="choice-grid">
+      <button class="choice-card" data-mode="cloud">
+        <span class="icon">☁️</span>
+        <div class="title">Cloud Model</div>
+        <div class="desc">Faster replies. Needs a paid API key and internet, billed monthly.</div>
+      </button>
+      <button class="choice-card" data-mode="local">
+        <span class="icon">💻</span>
+        <div class="title">Local Model</div>
+        <div class="desc">Free forever, works offline. Slightly slower replies.</div>
+      </button>
+    </div>
+
+    <!-- Model provider + API key(s) (only shown for Cloud) -->
+    <div class="subsection collapsed" id="apikeySection">
+      <h3 class="subsection-title">Choose your model provider</h3>
+      <p class="sub" style="margin-bottom:14px;">The provider your AI brain will use to run Cloud mode.</p>
+      <div id="providerGrid"></div>
+
+      <div class="subsection collapsed" id="providerKeyStep">
+        <div class="section-head" style="margin-bottom:4px;justify-content:space-between;">
+          <h3 class="subsection-title" id="apiKeyTitle" style="margin:0;">Enter your API Key</h3>
+          <a class="preview-btn" id="getApiKeyLink" href="#" target="_blank" rel="noopener" style="text-decoration:none;">Get API Key ↗</a>
+        </div>
+        <p class="sub" id="apiKeySub" style="margin-bottom:14px;"></p>
+        <div id="apiKeyList"></div>
+        <button class="ghost" id="addApiKeyBtn" type="button" style="padding-left:0;">+ Add another key</button>
+        <div class="test-panel" id="verifyPanel" style="margin-top:16px;"></div>
+      </div>
+    </div>
+
+    <!-- Local model download (only shown for Local) -->
+    <div class="subsection collapsed" id="localModelSection">
+      <h3 class="subsection-title">Choose your local model</h3>
+      <p class="sub" style="margin-bottom:14px;">This model runs entirely on the box — no internet or API key needed.</p>
+
+      <button class="choice-card" id="recommendedModelCard" data-local-model="qwen2.5:3b" type="button" style="width:100%;">
+        <span class="icon">⭐</span>
+        <div class="title">Qwen2.5 3B <span style="font-weight:600;color:var(--success);font-size:11px;">— tested &amp; works on this device</span></div>
+        <div class="desc">Our recommended default. Good accuracy for order-taking, runs comfortably without slowing the box down.</div>
+      </button>
+
+      <button class="ghost" id="browseModelsToggle" type="button" style="padding-left:0;margin-top:6px;">▸ Browse more models</button>
+
+      <div class="subsection collapsed" id="browseModelsPanel" style="margin-top:14px;padding-top:0;border-top:none;">
+        <p class="sub" style="margin-bottom:10px;">Search the Ollama model library. Results are flagged by whether they'll actually run on this device, so you won't be misled by a model that's too large.</p>
+        <label for="modelSearchInput" class="field-label" style="margin-top:0;">Search models</label>
+        <input type="text" id="modelSearchInput" placeholder="Search models, e.g. “llama”, “gemma”, “deepseek”">
+        <div id="modelSearchResults" style="margin-top:6px;"></div>
+      </div>
+
+      <div class="test-panel" id="localModelPanel" style="margin-top:16px;"></div>
+    </div>
+  </div>
+
+
+  <!-- 4. Test -->
+  <div class="section" id="testSection">
+    <div class="section-head">
+      <div class="section-num" id="testNum">4</div>
+      <h2>Choose the box and test run</h2>
+    </div>
+    <p class="sub sub-indent">Pick which box (or boxes) should say something out loud, to confirm everything is wired up correctly.</p>
+    <div class="test-panel" id="lanAddressPanel" style="margin-bottom:16px;">
+      <div class="spinner"></div>
+      <div style="color:var(--muted);font-size:14px;">Detecting this box's network address…</div>
+    </div>
+    <div id="boxListPanel" style="margin-bottom:16px;">
+      <div style="color:var(--muted);font-size:13px;">Looking for boxes…</div>
+    </div>
+    <div class="test-panel" id="testPanel">
+      <button class="primary" id="runTestBtn" disabled>Run test</button>
+    </div>
+  </div>
+
+  <!-- 5. Review & Save -->
+  <div class="section" id="reviewSection">
+    <div class="section-head">
+      <div class="section-num" id="reviewNum">5</div>
+      <h2>Review & save</h2>
+    </div>
+    <p class="sub sub-indent" id="reviewSub">This updates live as you fill in the sections above. Once everything looks right, save to apply your settings — the box will restart and be ready to use.</p>
+    <ul class="summary-list" id="summaryList"></ul>
+    <div id="saveArea">
+      <div class="btn-row">
+        <button class="primary" id="saveBtn" disabled>Save & Restart</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ---------------------------------------------------------------
+// Connect, STT download, TTS download, local model download, provider
+// verify, Run test, and Save all call this box's setup-server backend
+// directly (same server serving this page, board-agnostic — see the "Which
+// brain is this?" section above)
+// (see BACKEND_URL below). Save commits the selected model (openclaw
+// models set) and, for agentMode === 'local', wires config.json's
+// backends.agent.webhook_url at the OpenClaw agent bridge and actually
+// restarts the voice assistant stack (start_voice_assistant.sh) — the
+// "restart" copy on this screen (reviewSub/saveBtn text, updateSummary(),
+// the saveBtn handler) is genuinely true for that path now. agentMode
+// === 'remote' still has no backend wiring of its own in /api/save, so
+// its copy is intentionally softer until that path is built out too. The
+// box-connected preview sounds are still simulated with a timeout,
+// pending their own backend wiring.
+// ---------------------------------------------------------------
+
+const state = {
+  brainDevice: null,   // 'orangepi' | 'radxa' — which SBC this box's brain runs on
+  mcpPulled: false,
+  sttModel: null,      // 'whisper-base' | 'whisper-small' | 'whisper-medium' | 'custom'
+  sttDownloaded: false,
+  sttCustomSource: '', // HuggingFace repo id or direct model URL, only used when sttModel === 'custom'
+  ttsModel: null,      // 'piper' | 'kokoro'
+  ttsVoiceGender: 'female', // 'female' | 'male'
+  ttsLanguages: [],    // subset of ['en', 'zh']
+  ttsDownloaded: false,
+  agentMode: 'remote',  // 'remote' | 'local' — which brain setup path the customer is on
+  agentConnected: false, // true once the MCP connection details finish loading
+  openclawReady: false,  // true once Setup OpenClaw succeeds — gates llmSection when agentMode === 'local'
+  webhookUrl: '',       // MCP URL, auto-loaded (read-only, no longer user-entered)
+  webhookToken: '',     // MCP token, auto-loaded (read-only, no longer user-entered)
+  aiMode: null,        // 'cloud' | 'local' — only meaningful when agentMode === 'local'
+  cloudProvider: null,  // id from PROVIDERS, only meaningful when aiMode === 'cloud'
+  apiKeyVerified: false,
+  apiKeys: [''],
+  localModel: null,        // id, e.g. 'qwen2.5:3b' — either the default recommendation or an Ollama library search pick
+  localModelName: null,    // display name matching localModel
+  localModelDownloaded: false,
+  testPassed: false,
+  selectedBoxes: [],   // box_id list the customer checked in the Test section
+};
+
+function escapeHtml(s){
+  return (s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function renderErrorPanel(panel, { title, hint, onRetry }){
+  panel.innerHTML = `
+    <div class="test-result fail">✕ ${escapeHtml(title)}</div>
+    <div class="hint" style="margin-top:6px;">${escapeHtml(hint)}</div>
+    <div class="btn-row" style="justify-content:center;margin-top:14px;">
+      <button class="primary" id="retryBtn-${panel.id}" type="button">Retry</button>
+    </div>
+  `;
+  document.getElementById(`retryBtn-${panel.id}`).onclick = onRetry;
+}
+function maskKey(k){
+  if (!k) return '—';
+  return k.length <= 4 ? '••••' : '•'.repeat(Math.max(4, k.length - 4)) + k.slice(-4);
+}
+function copyToClipboard(text, btn){
+  const done = () => {
+    const original = btn.textContent;
+    btn.textContent = 'Copied!';
+    setTimeout(() => { btn.textContent = original; }, 1200);
+  };
+  if (navigator.clipboard && window.isSecureContext){
+    navigator.clipboard.writeText(text).then(done);
+    return;
+  }
+  // Fallback: navigator.clipboard needs a secure context, but this page is
+  // typically served over plain http:// on the LAN, where it's unavailable.
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand('copy'); } catch (e) {}
+  document.body.removeChild(ta);
+  done();
+}
+
+// --- Renumber sections, skipping any that are collapsed ---
+function renumber(){
+  const order = ['brainDeviceSection','downloadSection','voiceModelSection','aiSection','llmSection','testSection','reviewSection'];
+  const numIds = {brainDeviceSection:'brainDeviceNum', downloadSection:'downloadNum', voiceModelSection:'voiceModelNum', aiSection:'aiNum', llmSection:'llmNum', testSection:'testNum', reviewSection:'reviewNum'};
+  let n = 1;
+  order.forEach(id => {
+    const section = document.getElementById(id);
+    if (section.classList.contains('collapsed')) return;
+    document.getElementById(numIds[id]).textContent = n;
+    n++;
+  });
+}
+
+function isReady(){
+  const base = !!state.brainDevice
+    && state.mcpPulled
+    && state.sttDownloaded
+    && state.ttsDownloaded;
+
+  // apiKeyVerified alone gates the cloud-mode check, not apiKeys text —
+  // verification can only ever be true because a real key exists somewhere
+  // (entered this session, or already on file from a status restore), so
+  // requiring apiKeys text too would wrongly block Save after a restore,
+  // where that text is deliberately never repopulated.
+  const agentReady = state.agentMode === 'remote'
+    ? state.agentConnected
+    : (state.aiMode
+        && (state.aiMode !== 'cloud' || (state.cloudProvider && state.apiKeyVerified))
+        && (state.aiMode !== 'local' || state.localModelDownloaded));
+
+  return base && agentReady && state.testPassed;
+}
+
+const deviceLabels = { 'orangepi': 'OrangePi', 'radxa': 'Radxa' };
+const sttLabels = { 'whisper-base': 'Quick Response', 'whisper-small': 'Better Accuracy', 'whisper-medium': 'High Accuracy', 'custom': 'Custom STT' };
+const ttsLabels = { 'piper': 'Standard Voice', 'kokoro': 'Premium Voice' };
+const genderLabels = { 'female': 'Female', 'male': 'Male' };
+const languageLabels = { 'en': 'English', 'zh': '中文' };
+// Local models run on-device, so only small parameter counts are safe to
+// recommend. 3B is the size we've actually tested and confirmed working;
+// anything past this margin gets flagged rather than silently offered.
+const RUNNABLE_MAX_B = 4;
+function modelIsRunnable(sizeB){ return sizeB <= RUNNABLE_MAX_B; }
+
+// Stand-in for a live search against Ollama's model library
+// (https://ollama.com/library). THIS IS A MOCK LIST — no network call is
+// made. The real integration should query Ollama's library search/tags
+// endpoints and keep this same { id, name, sizeB, desc } shape so the
+// runnable-size check below doesn't need to change.
+const OLLAMA_LIBRARY_MOCK = [
+  { id: 'qwen2.5:3b', name: 'Qwen2.5 3B', sizeB: 3, desc: 'Recommended default — tested and confirmed working on this device.' },
+  { id: 'qwen2.5:0.5b', name: 'Qwen2.5 0.5B', sizeB: 0.5, desc: 'Tiny and fast, lower accuracy.' },
+  { id: 'qwen2.5:1.5b', name: 'Qwen2.5 1.5B', sizeB: 1.5, desc: 'Light and quick, a step up from 0.5B.' },
+  { id: 'qwen2.5:7b', name: 'Qwen2.5 7B', sizeB: 7, desc: 'More capable, but heavier than this device is tested for.' },
+  { id: 'qwen2.5:14b', name: 'Qwen2.5 14B', sizeB: 14, desc: 'High accuracy, needs far more memory than this device has.' },
+  { id: 'llama3.2:1b', name: 'Llama 3.2 1B', sizeB: 1, desc: "Meta's smallest Llama." },
+  { id: 'llama3.2:3b', name: 'Llama 3.2 3B', sizeB: 3, desc: 'Balanced small Llama.' },
+  { id: 'llama3.1:8b', name: 'Llama 3.1 8B', sizeB: 8, desc: 'Popular general-purpose model, too large for this device.' },
+  { id: 'gemma2:2b', name: 'Gemma 2 2B', sizeB: 2, desc: "Google's compact model." },
+  { id: 'gemma2:9b', name: 'Gemma 2 9B', sizeB: 9, desc: 'Larger Gemma variant.' },
+  { id: 'phi3:mini', name: 'Phi-3 Mini', sizeB: 3.8, desc: "Microsoft's small, efficient model." },
+  { id: 'mistral:7b', name: 'Mistral 7B', sizeB: 7, desc: 'Fast general-purpose model.' },
+  { id: 'deepseek-r1:1.5b', name: 'DeepSeek-R1 1.5B', sizeB: 1.5, desc: 'Small reasoning-focused model.' },
+  { id: 'deepseek-r1:7b', name: 'DeepSeek-R1 7B', sizeB: 7, desc: 'Reasoning-focused model.' },
+  { id: 'codellama:7b', name: 'Code Llama 7B', sizeB: 7, desc: 'Tuned for code, not order-taking.' },
+];
+
+// Model Providers OpenClaw itself supports for Cloud mode. THIS IS A MOCK LIST.
+// In the real integration this must come from OpenClaw (e.g. its provider
+// registry / `openclaw config providers list`), not be hardcoded here —
+// a separate frontend list will drift out of sync with what the backend
+// actually accepts.
+const PROVIDERS = [
+  { id: 'ollama-cloud', name: 'Ollama Cloud', recommended: true, desc: 'Easiest to set up and scales with you. Good default for most restaurants.', keyUrl: 'https://ollama.com/settings/keys' },
+  { id: 'openai', name: 'OpenAI', desc: 'GPT models.', keyUrl: 'https://platform.openai.com/api-keys' },
+  { id: 'anthropic', name: 'Anthropic', desc: 'Claude models.', keyUrl: 'https://console.anthropic.com/settings/keys' },
+  { id: 'google', name: 'Google Gemini', desc: 'Gemini models.', keyUrl: 'https://aistudio.google.com/apikey' },
+  { id: 'groq', name: 'Groq', desc: 'Ultra-fast inference.', keyUrl: 'https://console.groq.com/keys' },
+  { id: 'openrouter', name: 'OpenRouter', desc: 'One key, routes to many models.', keyUrl: 'https://openrouter.ai/keys' },
+];
+
+function updateSummary(){
+  const rows = [];
+  rows.push(['Brain device', state.brainDevice ? deviceLabels[state.brainDevice] : null]);
+  rows.push(['Voice engine', state.mcpPulled ? 'Ready ✓' : null]);
+  rows.push(['How it listens', state.sttModel ? sttLabels[state.sttModel] + (state.sttDownloaded ? ' — ready ✓' : ' — not downloaded yet') : null]);
+  rows.push(['How it talks back', state.ttsModel ? `${ttsLabels[state.ttsModel]} — ${genderLabels[state.ttsVoiceGender]}` + (state.ttsLanguages.length ? ` (${state.ttsLanguages.map(l => languageLabels[l]).join(', ')})` : '') + (state.ttsDownloaded ? ' — ready ✓' : ' — not downloaded yet') : null]);
+  rows.push(['Assistant brain', state.agentMode === 'remote'
+    ? (state.agentConnected ? 'MCP connection details are ready ✓' : null)
+    : (state.aiMode ? (state.aiMode === 'cloud' ? 'Cloud Model' : 'Local Model') : null)]);
+  if (state.agentMode === 'local' && state.aiMode === 'cloud'){
+    const provider = PROVIDERS.find(p => p.id === state.cloudProvider);
+    rows.push(['Model provider', provider ? provider.name : null]);
+    // filled.length gates the label text (there's nothing to mask if no key
+    // text is loaded), but must NOT gate whether "verified" shows — after a
+    // status restore, apiKeys stays empty on purpose (the raw key is never
+    // restorable, see applyStatus's comment) while apiKeyVerified can still
+    // be true. state.apiKeyVerified is the actual source of truth here, same
+    // as renderVerifyPanel() already uses for the panel above this summary.
+    const filled = state.apiKeys.filter(k => k.trim());
+    const apiKeyValue = filled.length
+      ? maskKey(filled[0]) + (filled.length > 1 ? ` (+${filled.length - 1} more)` : '') + (state.apiKeyVerified ? ' — verified ✓' : '')
+      : (state.apiKeyVerified ? 'On file — verified ✓' : null);
+    rows.push(['API key', apiKeyValue]);
+  }
+  if (state.agentMode === 'local' && state.aiMode === 'local'){
+    rows.push(['Local model', state.localModel ? (state.localModelName + (state.localModelDownloaded ? ' — downloaded ✓' : ' — not downloaded yet')) : null]);
+  }
+  rows.push(['Setup test', state.testPassed ? 'Passed ✓' : null]);
+
+  document.getElementById('summaryList').innerHTML = rows.map(([k, v]) => `
+    <li><span class="k">${k}</span><span class="v ${v ? '' : 'missing'}">${v ? escapeHtml(v) : 'Not set yet'}</span></li>
+  `).join('');
+
+  document.getElementById('saveBtn').disabled = !isReady();
+
+  // Only agentMode === 'local' actually restarts anything server-side now
+  // (setup-server.js's /api/save wires the OpenClaw agent bridge and runs
+  // start_voice_assistant.sh for that path — see its handleSave comment).
+  // agentMode === 'remote' has no backend wiring of its own yet, so its
+  // copy stays honest about that instead of promising a restart.
+  const restarts = state.agentMode === 'local';
+  document.getElementById('reviewSub').textContent = restarts
+    ? 'This updates live as you fill in the sections above. Once everything looks right, save to apply your settings — the box will restart and be ready to use.'
+    : 'This updates live as you fill in the sections above. Once everything looks right, save to apply your settings.';
+  document.getElementById('saveBtn').textContent = restarts ? 'Save & Restart' : 'Save';
+}
+
+// --- Brain device (OrangePi / Radxa) ---
+async function selectBrainDevice(device, cardEl){
+  const statusEl = document.getElementById('brainDeviceStatus');
+  document.querySelectorAll('#brainDeviceSection [data-device]').forEach(c => c.classList.toggle('selected', c === cardEl));
+  statusEl.innerHTML = `<div class="hint">Saving…</div>`;
+  try {
+    const res = await fetch(`${BACKEND_URL}/api/set-device`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ device }),
+    });
+    const data = await res.json();
+    if (!data.success) throw new Error(data.error || 'Failed to save');
+    state.brainDevice = device;
+    statusEl.innerHTML = `<div class="hint" style="color:var(--success);">✓ Saved</div>`;
+    updateSummary();
+  } catch (e) {
+    state.brainDevice = null;
+    document.querySelectorAll('#brainDeviceSection [data-device]').forEach(c => c.classList.remove('selected'));
+    statusEl.innerHTML = `<div class="hint" style="color:var(--danger);">✕ Couldn't save: ${escapeHtml(String(e.message || e))}</div>`;
+    updateSummary();
+  }
+}
+document.querySelectorAll('#brainDeviceSection [data-device]').forEach(el => {
+  el.onclick = () => selectBrainDevice(el.dataset.device, el);
+});
+
+// --- Voice engine setup ---
+async function runConnect(){
+  const panel = document.getElementById('downloadPanel');
+  panel.innerHTML = `<div class="spinner"></div><div style="color:var(--muted);font-size:14px;">Setting up voice engine…</div>`;
+  try {
+    const res = await fetch(`${BACKEND_URL}/api/connect`, { method: 'POST' });
+    const data = await res.json();
+    if (!data.success) throw new Error(data.error || 'Setup failed');
+    state.mcpPulled = true;
+    panel.innerHTML = `
+      <div class="test-result ok">✓ Voice engine ready</div>
+      <div class="test-log">${(data.logs || []).map(l => `<div class="ok-line">${escapeHtml(String(l))}</div>`).join('')}</div>
+    `;
+    updateSummary();
+  } catch (e) {
+    renderErrorPanel(panel, {
+      title: "Couldn't set up voice engine",
+      hint: String(e.message || e),
+      onRetry: runConnect,
+    });
+  }
+}
+document.getElementById('pullBtn').onclick = runConnect;
+
+// --- Voice model: shared helpers ---
+function speak(text, { pitch, rate, lang }){
+  if (!('speechSynthesis' in window)) return;
+  window.speechSynthesis.cancel();
+  // Chrome silently drops an utterance queued in the same tick as cancel() —
+  // deferring to the next tick avoids that race.
+  setTimeout(() => {
+    const utter = new SpeechSynthesisUtterance(text);
+    utter.pitch = pitch;
+    utter.rate = rate;
+    if (lang) utter.lang = lang;
+    window.speechSynthesis.speak(utter);
+  }, 50);
+}
+function voiceParams(model){
+  // Gender isn't simulated here — the setup-server holds distinct female/male
+  // voice models, so this browser preview only differs by engine (Piper/Kokoro).
+  return model === 'kokoro' ? { pitch: 1.15, rate: 0.95 } : { pitch: 1, rate: 1.05 };
+}
+
+// --- STT: Step 1 Choose -> Step 2 Preview -> Step 3/4 Download/Complete ---
+function renderSttDownloadPanel(){
+  const panel = document.getElementById('sttDownloadPanel');
+  if (state.sttDownloaded){
+    panel.innerHTML = `
+      <div class="test-result ok">✓ Speech recognition ready</div>
+      <div class="test-log"><div class="ok-line">${sttLabels[state.sttModel]} installed</div></div>
+    `;
+    return;
+  }
+  const isCustom = state.sttModel === 'custom';
+  const sourceFieldHtml = isCustom ? `
+    <label for="sttCustomSourceInput" class="field-label" style="margin-top:0;">Model source</label>
+    <input type="text" id="sttCustomSourceInput" placeholder="HuggingFace repo (e.g. ggerganov/whisper.cpp) or a direct .bin/.gguf URL" value="${escapeHtml(state.sttCustomSource)}">
+    <p class="hint" style="margin-bottom:14px;">Must be a whisper.cpp-compatible model — this box runs Whisper under the hood.</p>
+  ` : '';
+  panel.innerHTML = `${sourceFieldHtml}<button class="primary" id="sttDownloadBtn" ${isCustom && !state.sttCustomSource.trim() ? 'disabled' : ''}>Download Speech Recognition</button>`;
+  if (isCustom){
+    document.getElementById('sttCustomSourceInput').oninput = (e) => {
+      state.sttCustomSource = e.target.value;
+      document.getElementById('sttDownloadBtn').disabled = !state.sttCustomSource.trim();
+    };
+  }
+  document.getElementById('sttDownloadBtn').onclick = async () => {
+    panel.innerHTML = `<div class="spinner"></div><div style="color:var(--muted);font-size:14px;">Setting up speech recognition…</div>`;
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/download/stt`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(isCustom ? { model: 'custom', source: state.sttCustomSource.trim() } : { model: state.sttModel }),
+      });
+      const data = await res.json();
+      if (!data.success) throw new Error(data.error || 'Failed');
+      state.sttDownloaded = true;
+      panel.innerHTML = `
+        <div class="test-result ok">✓ Speech recognition ready</div>
+        <div class="test-log">${(data.logs || []).map(l => `<div class="ok-line">${escapeHtml(String(l))}</div>`).join('')}</div>
+      `;
+      updateSummary();
+    } catch (e) {
+      renderErrorPanel(panel, {
+        title: "Couldn't set up speech recognition",
+        hint: String(e.message || e),
+        onRetry: () => document.getElementById('sttDownloadBtn')?.click() || renderSttDownloadPanel(),
+      });
+    }
+  };
+}
+document.querySelectorAll('#voiceModelSection [data-stt]').forEach(el => {
+  el.onclick = () => {
+    state.sttModel = el.dataset.stt;
+    state.sttDownloaded = false;
+    document.querySelectorAll('#voiceModelSection [data-stt]').forEach(c => c.classList.toggle('selected', c === el));
+    document.getElementById('sttDownloadStep').classList.remove('collapsed');
+    renderSttDownloadPanel();
+    updateSummary();
+  };
+});
+
+// --- TTS: Step 1 Choose voice -> Step 2 Gender -> Step 3 Languages -> Step 4 Preview -> Step 5/6 Download/Complete ---
+document.querySelectorAll('#ttsGenderStep input[type=radio]').forEach(r => {
+  r.onchange = () => {
+    state.ttsVoiceGender = r.dataset.gender;
+    state.ttsDownloaded = false;
+    updateSummary();
+  };
+});
+function renderTtsPreviewList(){
+  const list = document.getElementById('ttsPreviewList');
+  list.innerHTML = state.ttsLanguages.map(lang => `
+    <div class="preview-row">
+      <span>${languageLabels[lang]}</span>
+      <button class="preview-btn" data-preview-lang="${lang}" type="button">▶️ Preview</button>
+    </div>
+  `).join('');
+  list.querySelectorAll('[data-preview-lang]').forEach(btn => {
+    btn.onclick = () => {
+      const lang = btn.dataset.previewLang;
+      const text = lang === 'zh' ? '订单已确认,谢谢!' : 'Order confirmed, thank you!';
+      speak(text, { ...voiceParams(state.ttsModel), lang: lang === 'zh' ? 'zh-CN' : 'en-US' });
+    };
+  });
+}
+function renderTtsDownloadPanel(){
+  const panel = document.getElementById('ttsDownloadPanel');
+  if (state.ttsDownloaded){
+    panel.innerHTML = `
+      <div class="test-result ok">✓ Voice ready</div>
+      <div class="test-log">${state.ttsLanguages.map(l => `<div class="ok-line">${languageLabels[l]} voice installed</div>`).join('')}</div>
+    `;
+    return;
+  }
+  panel.innerHTML = `<button class="primary" id="ttsDownloadBtn">Download Voice</button>`;
+  document.getElementById('ttsDownloadBtn').onclick = async () => {
+    panel.innerHTML = `<div class="spinner"></div><div style="color:var(--muted);font-size:14px;">Setting up voice output…</div>`;
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/download/tts`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: state.ttsModel, gender: state.ttsVoiceGender, languages: state.ttsLanguages }),
+      });
+      const data = await res.json();
+      if (!data.success) throw new Error(data.error || 'Failed');
+      state.ttsDownloaded = true;
+      panel.innerHTML = `
+        <div class="test-result ok">✓ Voice ready</div>
+        <div class="test-log">${(data.logs || []).map(l => `<div class="ok-line">${escapeHtml(String(l))}</div>`).join('')}</div>
+      `;
+      updateSummary();
+    } catch (e) {
+      renderErrorPanel(panel, {
+        title: "Couldn't set up voice output",
+        hint: String(e.message || e),
+        onRetry: () => document.getElementById('ttsDownloadBtn')?.click() || renderTtsDownloadPanel(),
+      });
+    }
+  };
+}
+document.querySelectorAll('#voiceModelSection [data-tts]').forEach(el => {
+  el.onclick = () => {
+    state.ttsModel = el.dataset.tts;
+    state.ttsLanguages = [];
+    state.ttsDownloaded = false;
+    document.querySelectorAll('#voiceModelSection [data-tts]').forEach(c => c.classList.toggle('selected', c === el));
+    document.querySelectorAll('#ttsLanguageStep input[type=checkbox]').forEach(cb => { cb.checked = false; });
+    document.getElementById('ttsGenderStep').classList.remove('collapsed');
+    document.getElementById('ttsLanguageStep').classList.remove('collapsed');
+    document.getElementById('ttsPreviewStep').classList.add('collapsed');
+    document.getElementById('ttsDownloadStep').classList.add('collapsed');
+    updateSummary();
+  };
+});
+document.querySelectorAll('#ttsLanguageStep input[type=checkbox]').forEach(cb => {
+  cb.onchange = () => {
+    const lang = cb.dataset.lang;
+    if (cb.checked){
+      if (!state.ttsLanguages.includes(lang)) state.ttsLanguages.push(lang);
+    } else {
+      state.ttsLanguages = state.ttsLanguages.filter(l => l !== lang);
+    }
+    state.ttsDownloaded = false;
+    const hasLangs = state.ttsLanguages.length > 0;
+    renderTtsPreviewList();
+    document.getElementById('ttsPreviewStep').classList.toggle('collapsed', !hasLangs);
+    document.getElementById('ttsDownloadStep').classList.toggle('collapsed', !hasLangs);
+    if (hasLangs) renderTtsDownloadPanel();
+    updateSummary();
+  };
+});
+
+// --- Connect your assistant's brain: MCP connection details (auto-loaded) ---
+async function loadAgentConnection(){
+  const panel = document.getElementById('connectAgentPanel');
+
+  if (window.location.protocol === 'file:'){
+    panel.innerHTML = `
+      <div class="test-result fail">✕ Can't load connection details</div>
+      <div class="hint" style="margin-top:6px;">This page must be opened through the setup server (http://…), not opened directly as a file.</div>
+    `;
+    return;
+  }
+
+  panel.innerHTML = `<div class="spinner"></div><div style="color:var(--muted);font-size:14px;">Loading connection details…</div>`;
+  try {
+    const res = await fetch(`${BACKEND_URL}/api/mcp-connection-info`);
+    const data = await res.json();
+    if (!data.success) throw new Error(data.error || 'Could not load connection details');
+    // Does NOT set state.agentMode — this call just pre-fills the Remote
+    // panel's connection details so they're ready if/when that mode is
+    // selected. It used to force agentMode back to 'remote' unconditionally,
+    // which silently clobbered a 'local' mode restored from /api/status (or
+    // picked by the customer) once this fetch resolved.
+    state.webhookUrl = data.url;
+    state.webhookToken = data.key;
+    state.agentConnected = true;
+    renderAgentConnectionPanel();
+    updateSummary();
+  } catch (e) {
+    renderErrorPanel(panel, {
+      title: "Couldn't load connection details",
+      hint: String(e.message || e),
+      onRetry: loadAgentConnection,
+    });
+  }
+}
+function renderAgentConnectionPanel(){
+  const panel = document.getElementById('connectAgentPanel');
+  panel.innerHTML = `
+    <div class="preview-row">
+      <span>MCP URL</span>
+      <span style="display:flex;align-items:center;gap:8px;">
+        <span style="word-break:break-all;">${escapeHtml(state.webhookUrl)}</span>
+        <button class="preview-btn" id="mcpUrlCopyBtn" type="button">Copy</button>
+      </span>
+    </div>
+    <div class="preview-row">
+      <span>Token</span>
+      <span style="display:flex;align-items:center;gap:8px;">
+        <span id="mcpTokenValue" style="word-break:break-all;">${escapeHtml(maskKey(state.webhookToken))}</span>
+        <button class="preview-btn" id="mcpTokenToggleBtn" type="button">Show</button>
+        <button class="preview-btn" id="mcpTokenCopyBtn" type="button">Copy</button>
+      </span>
+    </div>
+    <div class="test-result ok" style="margin-top:10px;">✓ Ready</div>
+  `;
+  let tokenVisible = false;
+  document.getElementById('mcpTokenToggleBtn').onclick = () => {
+    tokenVisible = !tokenVisible;
+    document.getElementById('mcpTokenValue').textContent = tokenVisible ? state.webhookToken : maskKey(state.webhookToken);
+    document.getElementById('mcpTokenToggleBtn').textContent = tokenVisible ? 'Hide' : 'Show';
+  };
+  document.getElementById('mcpUrlCopyBtn').onclick = (e) => copyToClipboard(state.webhookUrl, e.currentTarget);
+  document.getElementById('mcpTokenCopyBtn').onclick = (e) => copyToClipboard(state.webhookToken, e.currentTarget);
+}
+
+// --- Choose your LLM: Cloud vs Local ---
+document.querySelectorAll('#aiSection [data-agent-mode]').forEach(el => {
+  el.onclick = () => {
+    state.agentMode = el.dataset.agentMode;
+    document.querySelectorAll('#aiSection [data-agent-mode]').forEach(c => c.classList.toggle('selected', c === el));
+    document.getElementById('remoteAgentStep').classList.toggle('collapsed', state.agentMode !== 'remote');
+    document.getElementById('localAgentStep').classList.toggle('collapsed', state.agentMode !== 'local');
+    document.getElementById('llmSection').classList.toggle('collapsed', !(state.agentMode === 'local' && state.openclawReady));
+    renumber();
+    updateSummary();
+  };
+});
+
+// --- Local Agent: connect this box's mcp-core tools (esp_speak/esp_display/
+// esp_list_boxes) into OpenClaw as an MCP client. setup-server.js already
+// does this automatically every time "Setup OpenClaw" succeeds (server-side
+// self-heal, non-fatal there) — this panel just surfaces that state and
+// gives a manual retry (e.g. if mcp-core wasn't running yet the first time).
+async function runConnectOpenclawMcp(){
+  const box = document.getElementById('openclawMcpStatus');
+  box.innerHTML = `<div class="hint">Connecting box tools to OpenClaw…</div>`;
+  try {
+    const res = await fetch(`${BACKEND_URL}/api/connect-openclaw`, { method: 'POST' });
+    const data = await res.json();
+    if (!data.success) throw new Error(data.error || 'Connection failed');
+    const tools = data.tools || [];
+    const toolNote = tools.length ? ` — ${tools.length} tool${tools.length === 1 ? '' : 's'} (${tools.map(escapeHtml).join(', ')})` : '';
+    box.innerHTML = `
+      <div class="hint">✓ Box tools connected to OpenClaw${toolNote}</div>
+      <button class="ghost" id="connectOpenclawMcpBtn" type="button" style="padding-left:0;">Reconnect</button>
+    `;
+  } catch (e) {
+    box.innerHTML = `
+      <div class="hint" style="color:var(--danger);">✕ Box tools not connected: ${escapeHtml(String(e.message || e))}</div>
+      <button class="ghost" id="connectOpenclawMcpBtn" type="button" style="padding-left:0;">Retry</button>
+    `;
+  }
+  document.getElementById('connectOpenclawMcpBtn').onclick = runConnectOpenclawMcp;
+}
+document.getElementById('connectOpenclawMcpBtn').onclick = runConnectOpenclawMcp;
+
+// --- Local Agent: Setup OpenClaw (gates "Choose your LLM" below) ---
+async function runSetupOpenclaw(){
+  const panel = document.getElementById('openclawSetupPanel');
+  panel.innerHTML = `<div class="spinner"></div><div style="color:var(--muted);font-size:14px;">Setting up OpenClaw…</div>`;
+  try {
+    const res = await fetch(`${BACKEND_URL}/api/setup-openclaw`, { method: 'POST' });
+    const data = await res.json();
+    if (!data.success) throw new Error(data.error || 'Setup failed');
+    state.openclawReady = true;
+    panel.innerHTML = `
+      <div class="test-result ok">✓ OpenClaw ready</div>
+      <div class="hint" style="margin-top:6px;">${escapeHtml(data.alreadyInstalled ? `Already installed (${data.version})` : `Installed (${data.version})`)}</div>
+    `;
+    document.getElementById('llmSection').classList.toggle('collapsed', !(state.agentMode === 'local' && state.openclawReady));
+    renumber();
+    updateSummary();
+    runConnectOpenclawMcp(); // reflects setup-server.js's own self-heal above; not awaited so this panel doesn't block on it
+  } catch (e) {
+    state.openclawReady = false;
+    renderErrorPanel(panel, {
+      title: "Couldn't set up OpenClaw",
+      hint: String(e.message || e),
+      onRetry: runSetupOpenclaw,
+    });
+  }
+}
+document.getElementById('setupOpenclawBtn').onclick = runSetupOpenclaw;
+
+document.querySelectorAll('#llmSection [data-mode]').forEach(el => {
+  el.onclick = () => {
+    state.aiMode = el.dataset.mode;
+    document.querySelectorAll('#llmSection [data-mode]').forEach(c => c.classList.toggle('selected', c === el));
+    document.getElementById('apikeySection').classList.toggle('collapsed', state.aiMode !== 'cloud');
+    document.getElementById('localModelSection').classList.toggle('collapsed', state.aiMode !== 'local');
+    if (state.aiMode === 'local' && !state.localModel) selectLocalModel('qwen2.5:3b', 'Qwen2.5 3B');
+    renumber();
+    updateSummary();
+  };
+});
+
+// --- Model provider (Cloud mode: Provider -> API key -> Verify -> Complete) ---
+function renderProviderGrid(){
+  const grid = document.getElementById('providerGrid');
+  grid.innerHTML = `<div class="provider-list">${PROVIDERS.map(p => `
+    <button class="provider-row${state.cloudProvider === p.id ? ' selected' : ''}" data-provider="${p.id}" type="button">
+      <span class="name-wrap">
+        <span class="name">${escapeHtml(p.name)}</span>
+        ${p.recommended ? '<span style="font-weight:600;color:var(--primary);font-size:11px;">(Recommended)</span>' : ''}
+        <span class="desc">${escapeHtml(p.desc)}</span>
+      </span>
+      <span class="check">${state.cloudProvider === p.id ? '✓' : ''}</span>
+    </button>
+  `).join('')}</div>`;
+  grid.querySelectorAll('[data-provider]').forEach(el => {
+    el.onclick = () => {
+      state.cloudProvider = el.dataset.provider;
+      state.apiKeyVerified = false;
+      renderProviderGrid();
+      renderProviderKeyStep();
+      document.getElementById('providerKeyStep').classList.remove('collapsed');
+      updateSummary();
+    };
+  });
+}
+
+function renderProviderKeyStep(){
+  const p = PROVIDERS.find(pr => pr.id === state.cloudProvider);
+  if (!p) return;
+  document.getElementById('apiKeyTitle').textContent = `Enter your ${p.name} API Key`;
+  document.getElementById('apiKeySub').textContent = `Connects your AI brain to ${p.name}. Add more than one if you want a backup ready in case you switch accounts or misplace a key.`;
+  const link = document.getElementById('getApiKeyLink');
+  link.href = p.keyUrl;
+  link.textContent = `Get API Key ↗`;
+  renderApiKeys();
+  renderVerifyPanel();
+}
+
+// --- API key(s), scoped to the selected provider ---
+function renderApiKeys(){
+  const list = document.getElementById('apiKeyList');
+  list.innerHTML = state.apiKeys.map((key, i) => `
+    <label class="field-label">API key${state.apiKeys.length > 1 ? ' ' + (i + 1) : ''}</label>
+    <div class="api-key-row">
+      <div class="pw-wrap">
+        <input type="password" class="apiKeyInput" data-idx="${i}" placeholder="sk-••••••••••••••••" value="${escapeHtml(key)}">
+        <button class="pw-toggle" data-idx="${i}" type="button">Show</button>
+      </div>
+      ${state.apiKeys.length > 1 ? `<button class="key-remove" data-idx="${i}" type="button" title="Remove this key">✕</button>` : ''}
+    </div>
+  `).join('');
+
+  list.querySelectorAll('.apiKeyInput').forEach(inp => {
+    inp.oninput = () => {
+      state.apiKeys[+inp.dataset.idx] = inp.value;
+      state.apiKeyVerified = false;
+      renderVerifyPanel();
+      updateSummary();
+    };
+  });
+  list.querySelectorAll('.pw-toggle').forEach(btn => {
+    btn.onclick = () => {
+      const inp = list.querySelector(`.apiKeyInput[data-idx="${btn.dataset.idx}"]`);
+      const showing = inp.type === 'text';
+      inp.type = showing ? 'password' : 'text';
+      btn.textContent = showing ? 'Show' : 'Hide';
+    };
+  });
+  list.querySelectorAll('.key-remove').forEach(btn => {
+    btn.onclick = () => {
+      state.apiKeys.splice(+btn.dataset.idx, 1);
+      state.apiKeyVerified = false;
+      renderApiKeys();
+      renderVerifyPanel();
+      updateSummary();
+    };
+  });
+}
+document.getElementById('addApiKeyBtn').onclick = () => {
+  state.apiKeys.push('');
+  state.apiKeyVerified = false;
+  renderApiKeys();
+  renderVerifyPanel();
+};
+
+// --- Verify ---
+function renderVerifyPanel(){
+  const panel = document.getElementById('verifyPanel');
+  // Checked before the "any key text entered" guard below: a status-restored
+  // verification has apiKeyVerified true with no key text loaded into the
+  // form (the backend never echoes a saved key back), so it must still show
+  // as connected rather than falling through to the empty/blank branch.
+  if (state.apiKeyVerified){
+    const p = PROVIDERS.find(pr => pr.id === state.cloudProvider);
+    panel.innerHTML = `
+      <div class="test-result ok">✓ Connected to ${escapeHtml(p ? p.name : '')}</div>
+      <div class="test-log"><div class="ok-line">API key verified, model list retrieved</div></div>
+    `;
+    return;
+  }
+  if (!state.apiKeys.some(k => k.trim())){
+    panel.innerHTML = '';
+    return;
+  }
+  panel.innerHTML = `<button class="primary" id="verifyKeyBtn" type="button">Verify</button>`;
+  document.getElementById('verifyKeyBtn').onclick = runVerify;
+}
+// Backend note: /api/verify-key writes the key into OpenClaw's own env
+// file (~/.openclaw/.env) as that provider's env var, then runs
+// `openclaw models status --probe-provider <id>` to make OpenClaw prove
+// the key actually authenticates — not just that it was saved. Applies
+// the same way to every id in PROVIDERS above.
+async function runVerify(){
+  const panel = document.getElementById('verifyPanel');
+  const p = PROVIDERS.find(pr => pr.id === state.cloudProvider);
+  panel.innerHTML = `<div class="spinner"></div><div style="color:var(--muted);font-size:14px;">Verifying key…</div>`;
+  try {
+    const key = state.apiKeys.find(k => k.trim());
+    const res = await fetch(`${BACKEND_URL}/api/verify-key`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider: state.cloudProvider, key }),
+    });
+    const data = await res.json();
+    if (!data.success) throw new Error(data.error || 'Verification failed');
+    state.apiKeyVerified = true;
+    renderVerifyPanel();
+    updateSummary();
+  } catch (e) {
+    renderErrorPanel(panel, {
+      title: `Key rejected by ${p ? p.name : 'the provider'}`,
+      hint: "Double-check the key was copied correctly and hasn't expired, then try again.",
+      onRetry: runVerify,
+    });
+  }
+}
+
+// --- Local model ---
+function renderLocalModelPanel(){
+  const panel = document.getElementById('localModelPanel');
+  if (!state.localModel){
+    panel.innerHTML = '';
+    return;
+  }
+  if (state.localModelDownloaded){
+    panel.innerHTML = `<div class="test-result ok">✓ ${escapeHtml(state.localModelName)} downloaded</div>`;
+    return;
+  }
+  panel.innerHTML = `<button class="primary" id="downloadLocalModelBtn">Download ${escapeHtml(state.localModelName)}</button>`;
+  document.getElementById('downloadLocalModelBtn').onclick = async () => {
+    panel.innerHTML = `<div class="spinner"></div><div style="color:var(--muted);font-size:14px;">Downloading ${escapeHtml(state.localModelName)}…</div>`;
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/models/download`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: state.localModel }),
+      });
+      const data = await res.json();
+      if (!data.success) throw new Error(data.error || 'Download failed');
+      state.localModelDownloaded = true;
+      panel.innerHTML = `<div class="test-result ok">✓ ${escapeHtml(state.localModelName)} downloaded</div>`;
+      updateSummary();
+    } catch (e) {
+      renderErrorPanel(panel, {
+        title: "Couldn't download model",
+        hint: String(e.message || e),
+        onRetry: () => document.getElementById('downloadLocalModelBtn')?.click(),
+      });
+    }
+  };
+}
+function selectLocalModel(id, name){
+  state.localModel = id;
+  state.localModelName = name;
+  state.localModelDownloaded = false;
+  document.getElementById('recommendedModelCard').classList.toggle('selected', id === 'qwen2.5:3b');
+  renderLocalModelPanel();
+  updateSummary();
+}
+document.getElementById('recommendedModelCard').onclick = () => selectLocalModel('qwen2.5:3b', 'Qwen2.5 3B');
+
+// --- Browse more models (mock Ollama library search) ---
+document.getElementById('browseModelsToggle').onclick = () => {
+  const toggle = document.getElementById('browseModelsToggle');
+  const collapsed = document.getElementById('browseModelsPanel').classList.toggle('collapsed');
+  toggle.textContent = collapsed ? '▸ Browse more models' : '▾ Browse more models';
+};
+function renderModelSearchResults(matches, query){
+  const results = document.getElementById('modelSearchResults');
+  if (!matches.length){
+    results.innerHTML = `<div style="color:var(--muted);font-size:13px;padding:8px 0;">No models found for "${escapeHtml(query)}".</div>`;
+    return;
+  }
+  results.innerHTML = matches.map(m => {
+    const runnable = modelIsRunnable(m.sizeB);
+    return `
+      <div class="preview-row" style="align-items:flex-start;">
+        <div>
+          <div style="font-weight:600;font-size:14px;">${escapeHtml(m.name)} <span style="font-weight:400;color:var(--muted);font-size:12px;">${m.sizeB}B</span></div>
+          <div style="font-size:12.5px;color:var(--muted);margin-top:2px;">${escapeHtml(m.desc)}</div>
+          <div style="font-size:12px;margin-top:4px;${runnable ? 'color:var(--success);' : 'color:var(--danger);'}">${runnable ? '✅ Runs well on this device' : '⚠️ Too large for this device — may be slow or fail to load'}</div>
+        </div>
+        <button class="preview-btn" data-pick="${m.id}" type="button" style="flex-shrink:0;">${runnable ? 'Use this' : 'Use anyway'}</button>
+      </div>
+    `;
+  }).join('');
+  results.querySelectorAll('[data-pick]').forEach(btn => {
+    btn.onclick = () => {
+      const model = OLLAMA_LIBRARY_MOCK.find(m => m.id === btn.dataset.pick);
+      selectLocalModel(model.id, model.name);
+    };
+  });
+}
+let modelSearchDebounce = null;
+document.getElementById('modelSearchInput').oninput = (e) => {
+  const query = e.target.value.trim();
+  const results = document.getElementById('modelSearchResults');
+  clearTimeout(modelSearchDebounce);
+  if (!query){
+    results.innerHTML = '';
+    return;
+  }
+  results.innerHTML = `<div style="color:var(--muted);font-size:13px;padding:8px 0;">Searching Ollama library…</div>`;
+  modelSearchDebounce = setTimeout(() => {
+    const q = query.toLowerCase();
+    const matches = OLLAMA_LIBRARY_MOCK.filter(m => m.name.toLowerCase().includes(q) || m.id.toLowerCase().includes(q));
+    renderModelSearchResults(matches, query);
+  }, 450);
+};
+
+// --- Test (live: calls the setup-server backend on this box) ---
+const BACKEND_URL = window.location.origin;
+
+// --- Computer address (LAN IPv4 for a new box's WiFi setup) ---
+// Shown unconditionally, independent of loadBoxList() below — a box has to
+// be pointed at this address during its own WiFi setup before it can ever
+// register and show up in that list, so this can't be gated behind one
+// already existing.
+function renderLanAddressPanel(address){
+  const panel = document.getElementById('lanAddressPanel');
+  panel.innerHTML = `
+    <div class="preview-row">
+      <span>When setting up a new box's Wi-Fi, use this as the <b>Computer address</b>: <span style="word-break:break-all;">${escapeHtml(address)}</span></span>
+      <button class="preview-btn" id="lanAddressCopyBtn" type="button">Copy</button>
+    </div>
+  `;
+  document.getElementById('lanAddressCopyBtn').onclick = (e) => copyToClipboard(address, e.currentTarget);
+}
+async function loadLanAddress(){
+  const panel = document.getElementById('lanAddressPanel');
+  panel.innerHTML = `<div class="spinner"></div><div style="color:var(--muted);font-size:14px;">Detecting this box's network address…</div>`;
+  try {
+    const res = await fetch(`${BACKEND_URL}/api/lan-address`);
+    const data = await res.json();
+    if (!data.success) throw new Error(data.error || "Could not determine this box's network address");
+    renderLanAddressPanel(data.address);
+  } catch (e) {
+    renderErrorPanel(panel, {
+      title: "Couldn't detect this box's network address",
+      hint: String(e.message || e),
+      onRetry: loadLanAddress,
+    });
+  }
+}
+
+async function loadBoxList(){
+  const panel = document.getElementById('boxListPanel');
+  try {
+    const res = await fetch(`${BACKEND_URL}/api/boxes`);
+    const data = await res.json();
+    if (!data.success) throw new Error(data.error || 'Could not load boxes');
+    if (!data.boxes.length){
+      panel.innerHTML = `<div style="color:var(--muted);font-size:13px;">No boxes found. Make sure at least one box is powered on and connected.</div>`;
+      return;
+    }
+    panel.innerHTML = data.boxes.map(b => `
+      <label class="lang-check">
+        <input type="checkbox" class="boxCheck" data-id="${escapeHtml(b.id)}" data-name="${escapeHtml(b.name)}" ${b.online ? '' : 'disabled'}>
+        <span>${escapeHtml(b.name)} <span style="color:${b.online ? 'var(--success)' : 'var(--danger)'};font-size:12px;">${b.online ? '● online' : '● offline'}</span></span>
+      </label>
+    `).join('');
+    panel.querySelectorAll('.boxCheck').forEach(cb => {
+      cb.onchange = () => {
+        state.selectedBoxes = Array.from(panel.querySelectorAll('.boxCheck:checked')).map(c => c.dataset.id);
+        document.getElementById('runTestBtn').disabled = state.selectedBoxes.length === 0;
+      };
+    });
+  } catch (e) {
+    panel.innerHTML = `<div style="color:var(--danger);font-size:13px;">Couldn't load boxes: ${escapeHtml(String(e.message || e))}</div>`;
+  }
+}
+
+async function runBoxTest(){
+  const panel = document.getElementById('testPanel');
+  panel.innerHTML = `<div class="spinner"></div><div style="color:var(--muted);font-size:14px;">Contacting box…</div>`;
+  try {
+    const res = await fetch(`${BACKEND_URL}/api/test`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ boxIds: state.selectedBoxes }),
+    });
+    const data = await res.json();
+    if (!data.success) throw new Error(data.error || 'Test failed');
+    state.testPassed = true;
+    panel.innerHTML = `
+      <div class="test-result ok">✓ Box responded successfully</div>
+      <div class="test-log">${(data.logs || []).map(l => `<div class="ok-line">${escapeHtml(String(l))}</div>`).join('')}</div>
+    `;
+    updateSummary();
+  } catch (e) {
+    renderErrorPanel(panel, {
+      title: "Box didn't respond",
+      hint: 'Make sure the box is powered on, connected to Wi-Fi, and within range, then try again.',
+      onRetry: runBoxTest,
+    });
+  }
+}
+document.getElementById('runTestBtn').onclick = runBoxTest;
+
+// --- Save (live: calls this box's setup-server backend) ---
+document.getElementById('saveBtn').onclick = async () => {
+  // agentMode === 'local' is the only path /api/save actually restarts
+  // anything for (see updateSummary()'s matching comment) — copy here
+  // mirrors that rather than promising a restart that doesn't happen.
+  const restarts = state.agentMode === 'local';
+  const area = document.getElementById('saveArea');
+  area.innerHTML = `<div class="test-panel"><div class="spinner"></div><div style="color:var(--muted);font-size:14px;">${restarts ? 'Applying settings and restarting box…' : 'Saving your settings…'}</div></div>`;
+  try {
+    const res = await fetch(`${BACKEND_URL}/api/save`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(state),
+    });
+    const data = await res.json();
+    if (!data.success) throw new Error(data.error);
+    document.querySelector('.app').innerHTML = `
+      <div class="section final-panel">
+        <div class="final-icon">✓</div>
+        <h2>You're all set!</h2>
+        <p class="sub">${restarts ? 'The box has restarted and is ready to take voice orders.' : 'Your settings have been saved.'}</p>
+        <button class="primary" onclick="location.reload()">Start over</button>
+      </div>
+    `;
+  } catch (e) {
+    area.innerHTML = `<div class="test-panel"><div class="test-result fail">✕ Couldn't save settings</div><div class="hint">${escapeHtml(String(e.message))}</div><button class="primary" id="retrySave" style="margin-top:10px;">Retry</button></div>`;
+    document.getElementById('retrySave').onclick = () => document.getElementById('saveBtn').click();
+  }
+};
+
+// --- Initial status check: restores already-completed steps after a reload ---
+// Renders each confirmed-done section straight into its normal "success"
+// panel (same markup its own action handler produces), not the initial
+// empty state — so a hard refresh no longer forces re-clicking through
+// steps the backend already finished. Anything /api/status doesn't confirm
+// is left at its default, unchanged initial render.
+function applyStatus(status){
+  if (status.brainDevice){
+    state.brainDevice = status.brainDevice;
+    document.querySelectorAll('#brainDeviceSection [data-device]').forEach(c => c.classList.toggle('selected', c.dataset.device === status.brainDevice));
+    document.getElementById('brainDeviceStatus').innerHTML = `<div class="hint" style="color:var(--success);">✓ Saved</div>`;
+  }
+
+  if (status.voiceEngineReady){
+    state.mcpPulled = true;
+    document.getElementById('downloadPanel').innerHTML = `<div class="test-result ok">✓ Voice engine ready</div>`;
+  }
+
+  if (status.sttModel){
+    state.sttModel = status.sttModel;
+    state.sttDownloaded = true;
+    document.querySelectorAll('#voiceModelSection [data-stt]').forEach(c => c.classList.toggle('selected', c.dataset.stt === status.sttModel));
+    document.getElementById('sttDownloadStep').classList.remove('collapsed');
+    renderSttDownloadPanel();
+  }
+
+  if (status.ttsModel){
+    state.ttsModel = status.ttsModel;
+    state.ttsDownloaded = true;
+    document.querySelectorAll('#voiceModelSection [data-tts]').forEach(c => c.classList.toggle('selected', c.dataset.tts === status.ttsModel));
+    document.getElementById('ttsDownloadStep').classList.remove('collapsed');
+    renderTtsDownloadPanel();
+  }
+
+  state.openclawReady = !!status.openclawReady;
+  if (state.openclawReady){
+    document.getElementById('openclawSetupPanel').innerHTML = `<div class="test-result ok">✓ OpenClaw ready</div>`;
+    // /api/connect-openclaw is idempotent (mcp set + doctor --probe), so
+    // it's safe to re-run here just to refresh this status after a page
+    // reload — no separate "is it connected" status field needed for this.
+    runConnectOpenclawMcp();
+  }
+
+  state.agentMode = status.agentMode === 'local' ? 'local' : 'remote';
+  document.querySelectorAll('#aiSection [data-agent-mode]').forEach(c => c.classList.toggle('selected', c.dataset.agentMode === state.agentMode));
+  document.getElementById('remoteAgentStep').classList.toggle('collapsed', state.agentMode !== 'remote');
+  document.getElementById('localAgentStep').classList.toggle('collapsed', state.agentMode !== 'local');
+  document.getElementById('llmSection').classList.toggle('collapsed', !(state.agentMode === 'local' && state.openclawReady));
+
+  if (state.agentMode === 'local' && status.cloudProvider && status.apiKeyVerified){
+    state.aiMode = 'cloud';
+    state.cloudProvider = status.cloudProvider;
+    state.apiKeyVerified = true;
+    document.querySelectorAll('#llmSection [data-mode]').forEach(c => c.classList.toggle('selected', c.dataset.mode === 'cloud'));
+    document.getElementById('apikeySection').classList.remove('collapsed');
+    document.getElementById('localModelSection').classList.add('collapsed');
+
+    // #providerGrid starts empty in the static HTML (unlike the hardcoded
+    // Remote/Local Agent buttons above) — its cards don't exist until
+    // renderProviderGrid() builds them, so build it first, then mark the
+    // matching card selected the same explicit way the Agent cards are,
+    // rather than leaving the selection as an incidental side effect of
+    // that render.
+    renderProviderGrid();
+    document.querySelectorAll('#providerGrid [data-provider]').forEach(c => c.classList.toggle('selected', c.dataset.provider === state.cloudProvider));
+    document.getElementById('providerKeyStep').classList.remove('collapsed');
+
+    // renderProviderKeyStep() -> renderVerifyPanel() shows "✓ Connected" off
+    // state.apiKeyVerified alone (see renderVerifyPanel's reordering above)
+    // — no key text required. state.apiKeys is deliberately left untouched
+    // (still ['']): the raw key is written straight to OpenClaw's own
+    // credential store and never persisted anywhere this app can read back,
+    // so there is nothing to restore into the input field, by design.
+    renderProviderKeyStep();
+  } else if (state.agentMode === 'local' && status.localModelDownloaded && status.localModel){
+    state.aiMode = 'local';
+    const mock = OLLAMA_LIBRARY_MOCK.find(m => m.id === status.localModel);
+    state.localModel = status.localModel;
+    state.localModelName = mock ? mock.name : status.localModel;
+    state.localModelDownloaded = true;
+    document.querySelectorAll('#llmSection [data-mode]').forEach(c => c.classList.toggle('selected', c.dataset.mode === 'local'));
+    document.getElementById('apikeySection').classList.add('collapsed');
+    document.getElementById('localModelSection').classList.remove('collapsed');
+    document.getElementById('recommendedModelCard').classList.toggle('selected', status.localModel === 'qwen2.5:3b');
+    renderLocalModelPanel();
+  }
+}
+
+async function loadInitialStatus(){
+  try {
+    const res = await fetch(`${BACKEND_URL}/api/status`);
+    const status = await res.json();
+    if (status && status.success !== false) applyStatus(status);
+  } catch (e) {
+    // Best-effort only — if this fails the wizard just starts fresh, same as before this existed.
+  }
+}
+
+(async () => {
+  await loadInitialStatus();
+  renderProviderGrid();
+  renumber();
+  updateSummary();
+  loadBoxList();
+  loadAgentConnection();
+  loadLanAddress();
+})();
+</script>
+
+</body>
+</html>

@@ -1,0 +1,48 @@
+[Unit]
+# RETIRED from production startup — kept only so start_voice_assistant.sh
+# still has a way to be run by hand for manual/dev use. Root cause: this
+# unit only supervises whether the SCRIPT ran once, not whether the
+# processes it nohup's are still alive — when those processes died for
+# real on this box, systemd kept reporting the unit healthy and nothing
+# auto-recovered. Superseded by voix-mcp-core.service, voix-kokoro-tts.service,
+# and the existing voix-piper-wrapper.service/voix-openclaw-bridge.service,
+# each directly ExecStart'ing and Restart=always-supervising its own
+# process. Ollama is intentionally not among them — it already gets its
+# own Restart=always supervision from its official installer's "ollama"
+# unit. See the manual install steps for how this unit was disabled.
+Description=Voix voice assistant stack launcher (start_voice_assistant.sh) [RETIRED]
+# start_voice_assistant.sh backgrounds Ollama, MOSS-TTS, the demo
+# restaurant agent, and mcp-core via `nohup ... &`, then prints a status
+# summary and exits on its own — see the Type=oneshot note below for why
+# that matters here.
+#
+# This ordering is load-bearing, not cosmetic: the script unconditionally
+# tries to start a demo agent (agents/restaurant/agent.js) that binds port
+# 4000 — the same port voix-openclaw-bridge.service needs. Starting the
+# bridge first makes the demo agent's bind attempt fail harmlessly instead
+# of the other way around. This is the exact manual "always start the
+# bridge first" step that used to depend on someone remembering it over
+# SSH — After=+Requires= makes systemd enforce it every boot instead.
+After=voix-openclaw-bridge.service
+Requires=voix-openclaw-bridge.service
+
+[Service]
+# The script is expected to launch background processes and then exit 0 —
+# that's success, not a crash. Type=oneshot + RemainAfterExit=yes tells
+# systemd exactly that, so a normal exit is treated as "done launching" and
+# won't trigger a restart that would relaunch a duplicate, stacked set of
+# nohup'd processes on top of the previous batch.
+Type=oneshot
+RemainAfterExit=yes
+User=voix
+WorkingDirectory=%h/esp
+Environment=HOME=%h
+# /bin/bash assumed (standard on Debian/Armbian-based boards); not
+# confirmed on this specific box the way /usr/bin/node was — check `which
+# bash` and adjust this path if the unit fails to start.
+ExecStart=/bin/bash %h/esp/start_voice_assistant.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
