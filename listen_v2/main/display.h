@@ -73,8 +73,12 @@ typedef struct {
 void display_order(const order_screen_t *s);
 
 // Live-caption screen: a rounded speaker pill ("YOU"/"BOX") tinted `bar`, then
-// the text word-wrapped inside a raised card. Used to show what was heard /
-// what is being said in realtime.
+// the text word-wrapped inside a raised card. Showed what was heard / what is
+// being said in realtime.
+//
+// CURRENTLY UNUSED: subtitles are deliberately off on this box — do_caption()
+// in listen_v2.c is a no-op and playback shows a wordless "SPEAKING" pill. Kept
+// here so re-enabling captions is a one-line change, not a rewrite.
 void display_caption(const char *speaker, uint16_t bar, const char *text);
 
 // On-screen buttons. Only the order screen draws a pair now — display_hit_test()

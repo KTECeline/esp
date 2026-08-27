@@ -32,7 +32,7 @@ typedef struct {
 } playback_task_args_t;
 
 typedef struct {
-    char reply_txt[256];   // X-Reply-Text: show as a BOX caption, linger after
+    char reply_txt[256];   // X-Reply-Text: still parsed, no longer drawn (captions off)
     bool quiet;            // X-Quiet:  mid-chunk of a pipelined reply, leave the screen alone
     bool final;            // X-Final:  last chunk, linger then READY
     bool auto_listen;      // X-Auto-Listen: start a listen turn once playback ends

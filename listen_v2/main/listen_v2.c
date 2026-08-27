@@ -753,7 +753,9 @@ static void record_toggle_and_send(const char *rec_line2)
         (uint32_t)SAMPLE_RATE * (uint32_t)set.max_record_seconds * (BITS_PER_SAMPLE / 8) * CHANNELS;
     ESP_LOGI(TAG, ">>> recording (auto-stops after %dms silence below peak %d, or tap REC, max %ds) <<<",
             (int)set.silence_hold_ms, (int)set.silence_peak, (int)set.max_record_seconds);
-    display_status("REC", rec_line2, COL_REC);
+    // Wordless state pill. No transcript of what the customer is saying — the
+    // box just shows that it is listening, and talks back with audio.
+    display_status("LISTENING", rec_line2, COL_REC);
 
     const uint32_t chunk = 1024;
     uint8_t tmp[1024];
@@ -988,10 +990,10 @@ void play_begin(play_session_t *ps, const uint8_t h[44], uint32_t body_len,
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 
     ps->opts = *opts;
-    if (opts->reply_txt[0]) {
-        display_caption("BOX", COL_OK, opts->reply_txt);
-    } else if (!opts->quiet) {
-        display_status("PLAYING", NULL, COL_OK);
+    // Wordless state pill — the reply is heard, not read. X-Reply-Text is still
+    // accepted on the wire (see play_opts_t) but no longer drawn.
+    if (!opts->quiet) {
+        display_status("SPEAKING", NULL, COL_OK);
     }
 
     esp_codec_dev_sample_info_t fs = { .bits_per_sample = bits, .channel = ch, .sample_rate = rate };
@@ -1107,12 +1109,15 @@ void play_after(play_session_t *ps)
         // Greeting just finished — go straight into a listen turn, no button
         // needed. Same recording+upload path BOOT uses, so everything
         // downstream (STT, backend, order) is completely unchanged.
-        run_auto_listen("LISTENING...");
+        run_auto_listen("TAP WHEN DONE");
         if ((int32_t)(s_caption_at_tick - s_upload_done_tick) <= 0) show_ready();
         return;
     }
 
-    if (ps->opts.reply_txt[0] || ps->opts.final) vTaskDelay(pdMS_TO_TICKS(3500));
+    // A short settle so the SPEAKING pill does not snap straight to the idle
+    // screen. This was a 3.5s hold to let the customer read the reply caption;
+    // there is no caption now, so it only needs to not look abrupt.
+    vTaskDelay(pdMS_TO_TICKS(800));
     if ((int32_t)(s_caption_at_tick - ps->end_tick) <= 0) show_ready();
 }
 
@@ -1168,15 +1173,18 @@ static esp_err_t play_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-// Show a live caption. Body = the text; optional "X-Speaker" header ("YOU"/"BOX")
-// picks the bar label + color (defaults to YOU / amber). Used by the Mac to push
-// "what was heard" the moment STT finishes, before the reply audio arrives.
+// The /caption route still exists and is still called by the server (both
+// transports), but this box no longer renders subtitles — see the body.
 void do_caption(const char *text, const char *who)
 {
-    uint16_t bar = (strcmp(who, "BOX") == 0) ? COL_OK   // green
-                                             : COL_ACCENT; // amber
+    // Subtitles are disabled on this box: the customer hears the reply and
+    // watches the order list, nothing else. Kept as a no-op (rather than
+    // dropping the route) so both transports still ack and no server change is
+    // required. The tick is still stamped, so whenever the server does send a
+    // transcript it keeps the idle screen from flashing between turns.
+    (void)who;
+    ESP_LOGI(TAG, "caption suppressed: %.100s", text ? text : "");
     s_caption_at_tick = xTaskGetTickCount();
-    display_caption(who, bar, text);
 }
 
 static esp_err_t caption_handler(httpd_req_t *req)
