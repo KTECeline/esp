@@ -18,7 +18,6 @@ MAC_IP=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/nul
 echo "Voice assistant health:"
 check "Ollama (LLM)"        "http://localhost:11434/api/tags"
 check "MOSS-TTS"            "http://localhost:8080/docs"
-check "Restaurant agent"    "http://localhost:4000/health"
 check "MCP core"            "http://${MAC_IP:-localhost}:8000/health"
 check "Box (on WiFi)"       "http://$BOX_IP/caption"              # 405 = alive (POST-only route)
 

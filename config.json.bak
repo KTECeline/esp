@@ -1,0 +1,59 @@
+{
+  "boxes": [
+    {
+      "id": "BOX-C3B4",
+      "name": "BOX-C3B4",
+      "ip": "172.20.10.3"
+    }
+  ],
+  "_devices_comment": "OrangePi (\"spc\") devices, reached over plain HTTP at base_url — run spc-agent/spc_agent.py on the Pi. Use its Tailscale MagicDNS name, NOT a LAN ip: the Pi is on the tailnet and a 100.x address is CGNAT that will not survive a network change (same landmine as the boxes). `capabilities` decides which spc_* tools exist and is authoritative even when the Pi is offline; add \"look\" once a camera is plugged in and restart. Confirm what the Pi actually has with: curl http://<host>:8080/health",
+  "devices": [
+    {
+      "id": "SPC-1",
+      "name": "OrangePi",
+      "kind": "spc",
+      "base_url": "http://orangepi5max:8080",
+      "_capabilities_note": "Verified against the Pi 2026-08-08: it reports exactly speak+listen. \"sense\" was removed because no sensors are wired yet and a declared-but-absent capability registers a tool that can only fail. Add \"sense\" back (plus SPC_SENSE_CMD or SPC_PRESENCE_GPIO in the systemd unit) and \"look\" (plus a camera) when the hardware exists, then restart mcp-core.",
+      "_screen_note": "\"screen\" is declared ahead of the hardware on purpose (2026-08-16): the panel is not attached yet, but the face and the QR/message panel are built and can be driven and watched from any browser at http://orangepi5max:8080/face. spc-agent only claims the capability when it sees a display, so set SPC_SCREEN=1 in its unit until the real panel is plugged in — otherwise spc_expression exists here and answers 501 there.",
+      "capabilities": [
+        "speak",
+        "listen",
+        "screen"
+      ]
+    }
+  ],
+  "backends": {
+    "priority": [
+      "agent",
+      "local_llm"
+    ],
+    "agent": {
+      "webhook_url": "http://localhost:4000/agent"
+    },
+    "local_llm": {
+      "url": "http://localhost:11434/v1/chat/completions",
+      "model": "llama3.2:3b",
+      "token": "",
+      "system_prompt": "You are a helpful voice assistant. Keep replies to 1-2 short spoken sentences."
+    }
+  },
+  "stt": {
+    "language": "auto",
+    "prompt_file": "voice-mcp-server/manglish_prompt.txt",
+    "model": "whisper.cpp/models/ggml-small.bin"
+  },
+  "_vision_comment": "The counter camera, addressed by NAME rather than index — mcp-core warns about this at startup because avfoundation indexes shift when cameras are plugged or unplugged, and index 0 would silently become the MacBook's own lens. Re-check names with: ffmpeg -f avfoundation -list_devices true -i \"\". 640x480 is this camera's maximum.",
+  "vision": {
+    "device": "USB2.0 PC CAMERA",
+    "backend": "avfoundation",
+    "width": 640,
+    "height": 480,
+    "framerate": 30
+  },
+  "listen_port": 8000,
+  "greeting_text": "Hi! Go ahead!",
+  "_ws_url_comment": "Empty = derive ws://<lanIp>:<port>/ws (LAN, reliable). Setting this to a Tailscale Funnel wss:// URL reaches boxes on any network, but Funnel currently drops the socket on large audio pushes — see ROADMAP item 9.",
+  "ws_url": "",
+  "fleet_token_env": "ESP_FLEET_TOKEN",
+  "mcp_token_env": "ESP_MCP_TOKEN"
+}

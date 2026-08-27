@@ -880,8 +880,16 @@ static void run_auto_listen(const char *rec_line2)
 // Start a turn immediately — record until silence, upload, straight to the
 // backend. NO greeting: tapping to order goes straight to listening (a
 // greeting-on-approach can come later from a presence sensor).
-// Runs on the main-task stack (called from the main loop, not an httpd
-// handler), so record_toggle_and_send() needs no trampoline task.
+// Routed through run_auto_listen()'s dedicated 8KB-stack task rather than
+// called inline on the main task: a tap landing while the shared duplex I2S
+// codec is still mid-reconfig from a just-finished/in-flight playback (the
+// greeting) pushes record_toggle_and_send()'s call depth past the ~3.5KB
+// main-task stack — reproduced on hardware as a stack-overflow reboot right
+// after "I2S_IF: STD: RX ..." / "i2s_channel_disable ... not enabled yet",
+// landing the box back at the WiFi-connect/greeting screen in a loop. The
+// httpd /play path hit the identical overflow for the identical reason (see
+// run_auto_listen()'s comment) and was already moved off the main stack;
+// this path just never got the same fix.
 static void report_session_start(void);   // defined below, near end_session_on_server
 
 static void start_listening(void)
@@ -896,7 +904,7 @@ static void start_listening(void)
     if (!s_session_active) report_session_start();
     s_session_active = true;
     note_activity();
-    record_toggle_and_send("TAP WHEN DONE");
+    run_auto_listen("TAP WHEN DONE");
     if ((int32_t)(s_caption_at_tick - s_upload_done_tick) <= 0) {
         show_ready();
     }

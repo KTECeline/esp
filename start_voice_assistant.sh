@@ -21,7 +21,6 @@ pkill -f "node bridge-server.js" 2>/dev/null          # legacy
 pkill -f "assistant_via_bridge.py" 2>/dev/null         # legacy
 pkill -f "assistant_server.py" 2>/dev/null             # legacy
 pkill -f "mcp-core/server.js" 2>/dev/null
-pkill -f "agents/restaurant/agent.js" 2>/dev/null
 sleep 2
 
 # nohup everywhere: closing this terminal must not kill the services. (Learned
@@ -40,13 +39,12 @@ TTS_PID=$!
 echo "Waiting for TTS/Ollama to warm up..."
 sleep 5
 
-# Full paths on purpose: the pkill patterns above match on them (a bare
-# "node server.js" would be unkillable by name next run).
-echo "Starting restaurant agent (the business logic)..."
-nohup node ~/esp/agents/restaurant/agent.js > /tmp/restaurant-agent.log 2>&1 &
-AGENT_PID=$!
-
-sleep 1
+# The demo mamak restaurant agent that used to run here on :4000 is gone —
+# the real ordering agent (OpenClaw + menu-importer/supabase-ordering, backed
+# by the live menu in local-db-server) runs on whichever board is the fleet's
+# brain (Radxa/OrangePi), not on this Mac. mcp-core's "agent" backend below
+# will fail over to local_llm (plain chat) if nothing answers :4000 locally —
+# that's expected for Mac-side dev/testing, not a bug.
 
 # Secrets (fleet + /mcp tokens) live in ~/esp/.env, which is gitignored — they
 # must never sit in config.json, which is committed-adjacent and gets pasted
@@ -70,7 +68,6 @@ echo ""
 echo "All running:"
 echo "  Ollama            (PID $OLLAMA_PID)  - log: /tmp/ollama.log"
 echo "  MOSS-TTS          (PID $TTS_PID)     - log: /tmp/moss-tts.log"
-echo "  Restaurant agent  (PID $AGENT_PID)   - log: /tmp/restaurant-agent.log"
 echo "  MCP core + STT    (PID $CORE_PID)    - log: /tmp/mcp-core.log"
 echo ""
 echo "Check health: ./check_health.sh"

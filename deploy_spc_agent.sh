@@ -29,7 +29,7 @@ SRC="$HERE/spc-agent/spc_agent.py"
 # script, so a partial copy degrades quietly: a missing spc_faceparts.py makes
 # spc_face.py unimportable, which makes /face serve an apology, and a missing
 # spc_expressions.py leaves the agent unable to validate a face at all.
-SCREEN_SRCS="spc_face.py spc_faceparts.py spc_picker.py spc_expressions.py"
+SCREEN_SRCS="spc_face.py spc_faceparts.py spc_picker.py spc_expressions.py spc_qr.py"
 # The faces themselves. A directory rather than a file, and the one piece of
 # this deploy that a user is expected to add to on the device — so it is copied
 # INTO place without deleting what is already there.

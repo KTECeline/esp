@@ -59,6 +59,14 @@ except ImportError:
     # uncovered character. Everything else about the face works unaffected.
     _CJK_GLYPHS, _CJK_W, _CJK_H, _CJK_CODEPOINTS = [], 0, 0, []
 
+try:
+    import spc_qr
+except ImportError:
+    # No encoder beside this file -- a `qr` panel falls back to showing the
+    # payload as text, exactly as it did before spc_qr.py existed. Everything
+    # else about the face is unaffected.
+    spc_qr = None
+
 AGENT = os.environ.get("SPC_FB_URL", "http://127.0.0.1:8080").rstrip("/")
 FB_DEVICE = os.environ.get("SPC_FB_DEVICE", "/dev/fb0")
 ROTATE = int(os.environ.get("SPC_FB_ROTATE", "270"))
@@ -122,6 +130,11 @@ TEXT = (0xEA, 0xF4, 0xFF)
 TEXT_DIM = (0xA9, 0xCD, 0xF0)
 TILE = (0xF2, 0xF7, 0xFF)
 TILE_INK = (0x10, 0x30, 0x5E)
+# A QR code is the one thing on this screen that must be pure black on pure
+# white -- a phone's decoder wants the contrast, and the card's blue would eat
+# the finder patterns. The 4-module quiet zone is drawn as part of the white.
+QR_LIGHT = (0xFF, 0xFF, 0xFF)
+QR_DARK = (0x00, 0x00, 0x00)
 
 
 def hex_rgb(value, fallback=INK):
@@ -905,17 +918,53 @@ class Panel:
             y += tile_h + 12
 
     def _qr(self, panel, cx, card_y, card_h, inner_w):
-        # No encoder here yet — the browser page draws a real code. Showing the
-        # link as text is at least actionable; pretending to draw a QR would not
-        # be, and an unscannable square is worse than a readable URL.
         big, small = self._scales()
         caption = (panel.get("qr_caption") or "Scan to continue").strip()
         data = (panel.get("qr_data") or "").strip()
+
+        grid = spc_qr.modules(data) if (spc_qr and data) else None
+
+        # Caption sits above the code either way.
         y = card_y + self.pad
-        y = self._stack(self.font.wrap(caption, big, inner_w), cx, y, big, TEXT)
+        y = self._stack(self.font.wrap(caption, small, inner_w), cx, y, small, TEXT)
         y += self.pad // 2
-        self._stack(self.font.wrap(data, max(1, small - 1), inner_w)[:6], cx, y,
-                    max(1, small - 1), TEXT_DIM)
+
+        n = len(grid) if grid else 0
+        quiet = 4                               # modules, per ISO/IEC 18004
+        total = n + quiet * 2
+        avail_h = card_y + card_h - self.pad - y
+        # Integer module size so every cell is identical: a fractional scale
+        # rounds some cells a pixel larger and a decoder reads the drift as
+        # noise. max(1, ...) keeps a value even on the cropped kiosk panel.
+        scale = max(1, min(inner_w // total, avail_h // total)) if grid else 0
+
+        if not grid or scale * total > inner_w or scale * total > avail_h:
+            # No encoder, nothing to encode, a payload too long for any
+            # version, or a card too small to hold the smallest version. The
+            # payload as text is at least actionable; a clipped square is not.
+            self._stack(self.font.wrap(data, max(1, small - 1), inner_w)[:6], cx, y,
+                        max(1, small - 1), TEXT_DIM)
+            return
+
+        side = scale * total
+        qx = cx - side // 2
+        qy = y + max(0, (avail_h - side) // 2)
+
+        self.s.rect(qx, qy, side, side, QR_LIGHT)   # white field incl. quiet zone
+        left = qx + quiet * scale
+        for gy in range(n):
+            row = grid[gy]
+            ry = qy + (quiet + gy) * scale
+            gx = 0
+            while gx < n:
+                if not row[gx]:
+                    gx += 1
+                    continue
+                run = 1
+                while gx + run < n and row[gx + run]:
+                    run += 1
+                self.s.rect(left + gx * scale, ry, run * scale, scale, QR_DARK)
+                gx += run
 
     def _scales(self):
         """Font multipliers picked off the panel width, so text stays readable
