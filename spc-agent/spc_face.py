@@ -167,15 +167,18 @@ _FACE_HTML = r"""<!doctype html>
     min-height: 0;
     overflow: hidden;
   }
+  /* --fit shrinks a message that doesn't fit its card -- see fitCard() below.
+     Every other panel mode leaves it at 1 and renders exactly as before. */
+  .card { --fit: 1; }
   .title {
-    font-size: clamp(24px, 7vmin, 64px);
+    font-size: calc(clamp(24px, 7vmin, 64px) * var(--fit));
     font-weight: 800;
     letter-spacing: -0.01em;
     line-height: 1.12;
   }
   .subtitle {
     margin-top: 1.4vmin;
-    font-size: clamp(15px, 4.2vmin, 38px);
+    font-size: calc(clamp(15px, 4.2vmin, 38px) * var(--fit));
     font-weight: 500;
     color: #a9cdf0;
     line-height: 1.3;
@@ -680,12 +683,36 @@ const escapeHtml = (s) =>
   String(s ?? "").replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
+// panel.font_size picks where the shrink below starts; "medium" (or nothing)
+// is --fit:1, i.e. exactly the sizing this page always had.
+const FONT_SIZE_START = { small: 0.85, medium: 1, large: 1.15 };
+
+// The mirror of spc_fb.py's shrink loop, for the browser renderer: .card has
+// max-height:100% and overflow:hidden (see CSS), so once --fit is applied,
+// scrollHeight staying above clientHeight means the text is still clipped.
+// Shrinking one step at a time until it isn't is what makes a long agent
+// answer lose type size before it loses words, on this renderer as well as
+// the framebuffer one.
+function fitCard(card, panel) {
+  const FLOOR = 0.35, STEP = 0.92;
+  let fit = FONT_SIZE_START[panel && panel.font_size] ?? 1;
+  card.style.setProperty("--fit", fit);
+  while (fit > FLOOR && card.scrollHeight > card.clientHeight) {
+    fit *= STEP;
+    card.style.setProperty("--fit", fit);
+  }
+}
+
 function renderPanel(panel) {
   const mode = (panel && panel.mode) || "blank";
   const root = el("panel");
   const card = el("card");
   root.className = mode === "blank" ? "blank" : "";
   if (mode === "blank") { card.innerHTML = ""; return; }
+  // Reset before every draw: font_size and the auto-shrink only apply to
+  // mode=message, and a stale --fit left over from a previous message must
+  // not quietly shrink the next qr/choices/order panel.
+  card.style.setProperty("--fit", 1);
 
   if (mode === "message") {
     // A subtitle with no title is the whole message — what spc_speak mirrors
@@ -697,6 +724,7 @@ function renderPanel(panel) {
       (panel.subtitle
         ? `<div class="${lone ? "title" : "subtitle"}">${escapeHtml(panel.subtitle)}</div>`
         : "");
+    fitCard(card, panel);
     return;
   }
 

@@ -136,6 +136,11 @@ TILE_INK = (0x10, 0x30, 0x5E)
 QR_LIGHT = (0xFF, 0xFF, 0xFF)
 QR_DARK = (0x00, 0x00, 0x00)
 
+# panel.font_size (mode=message only) shifts where the auto-shrink in
+# Panel._message starts, relative to _scales()'s own "medium". Omitting the
+# field lands on 0 -- a panel with no opinion looks exactly as it always has.
+FONT_SIZE_BIAS = {"small": -1, "medium": 0, "large": 1}
+
 
 def hex_rgb(value, fallback=INK):
     """"#ffb347" or "#fb3" -> (r, g, b). Falls back rather than raising.
@@ -802,35 +807,48 @@ class Panel:
     def _message(self, panel, cx, card_y, card_h, inner_w):
         title = (panel.get("title") or "").strip()
         subtitle = (panel.get("subtitle") or "").strip()
-        big, small = self._scales()
+        default_big, _ = self._scales()
+        bias = FONT_SIZE_BIAS.get(panel.get("font_size"), 0)
+        start = max(1, default_big + bias)
 
-        # A subtitle with no title above it IS the message — that is the shape
-        # spc_speak sends when it mirrors what it is saying. Rendering it as
-        # fine print would put the spoken line in the smallest type on screen.
-        sub_scale, sub_color = (big, TEXT) if not title else (small, TEXT_DIM)
+        def layout(big):
+            small = max(1, big - 1)
+            # A subtitle with no title above it IS the message — that is the
+            # shape spc_speak sends when it mirrors what it is saying.
+            # Rendering it as fine print would put the spoken line in the
+            # smallest type on screen.
+            sub_scale, sub_color = (big, TEXT) if not title else (small, TEXT_DIM)
+            t_lines = self.font.wrap(title, big, inner_w) if title else []
+            s_lines = self.font.wrap(subtitle, sub_scale, inner_w) if subtitle else []
+            t_gap = self.font.h * big * 1.25
+            s_gap = self.font.h * sub_scale * 1.25
+            title_gap = int(self.font.h * small * 0.4) if t_lines and s_lines else 0
+            total = len(t_lines) * t_gap + title_gap + len(s_lines) * s_gap
+            return t_lines, s_lines, sub_scale, sub_color, t_gap, s_gap, title_gap, total
 
-        t_gap = self.font.h * big * 1.25
-        s_gap = self.font.h * sub_scale * 1.25
-        title_gap = int(self.font.h * small * 0.4)   # spacer between title and subtitle
+        # Shrink one step at a time until the whole message fits, down to a
+        # floor of scale 1. A long agent answer -- or a Chinese reply once
+        # every character actually renders instead of mostly "?" -- loses type
+        # size before it loses words, not the other way round.
+        big = start
+        t_lines, s_lines, sub_scale, sub_color, t_gap, s_gap, title_gap, total = layout(big)
+        while total > card_h and big > 1:
+            big -= 1
+            t_lines, s_lines, sub_scale, sub_color, t_gap, s_gap, title_gap, total = layout(big)
 
-        # Capped to what card_h can actually hold, title first (it's the
-        # short, load-bearing line) then as much subtitle as still fits. A
-        # message too long to fit is truncated here, not spilled past the
-        # card the way an uncapped wrap used to (a long spc_speak mirror, or
-        # any Chinese reply once every character actually renders instead of
-        # mostly '?', is routinely this long).
-        t_lines = self.font.wrap(title, big, inner_w) if title else []
-        max_t = max(1, int(card_h // t_gap)) if t_lines else 0
-        t_lines = t_lines[:max_t]
+        # Still doesn't fit even at the floor scale -- an extreme wall of
+        # text. Cap what's drawn to what card_h can hold, title first (it's
+        # the short, load-bearing line), rather than spilling past the card.
+        if total > card_h:
+            max_t = max(1, int(card_h // t_gap)) if t_lines else 0
+            t_lines = t_lines[:max_t]
+            used = len(t_lines) * t_gap + (title_gap if t_lines and s_lines else 0)
+            max_s = max(0, int((card_h - used) // s_gap)) if s_lines else 0
+            s_lines = s_lines[:max_s]
+            total = (len(t_lines) * t_gap
+                     + (title_gap if t_lines and s_lines else 0)
+                     + len(s_lines) * s_gap)
 
-        s_lines = self.font.wrap(subtitle, sub_scale, inner_w) if subtitle else []
-        used = len(t_lines) * t_gap + (title_gap if t_lines and s_lines else 0)
-        max_s = max(0, int((card_h - used) // s_gap)) if s_lines else 0
-        s_lines = s_lines[:max_s]
-
-        total = (len(t_lines) * t_gap
-                 + (title_gap if t_lines and s_lines else 0)
-                 + len(s_lines) * s_gap)
         y = int(card_y + (card_h - total) / 2)
         if t_lines:
             y = self._stack(t_lines, cx, y, big, TEXT)
