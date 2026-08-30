@@ -842,10 +842,22 @@ static void record_toggle_and_send(const char *rec_line2)
     s_record_len = 0;
 
     s_upload_done_tick = xTaskGetTickCount();
-    if (status == 200) display_status("SENT", NULL, COL_OK);
-    else if (status < 0) display_status("NO PC", "START SERVER", COL_ERR);
-    else display_status("SEND", "FAILED", COL_ERR);
-    vTaskDelay(pdMS_TO_TICKS(1200));
+    if (status == 200) {
+        // The agent's turn runs entirely server-side (STT -> LLM -> first TTS
+        // chunk) before /play arrives. Hold a THINKING screen for that gap so it
+        // doesn't read as a frozen SENT; play_begin()'s display_speaking() takes
+        // over the instant audio starts. Claim the screen via s_caption_at_tick
+        // (same trick do_order uses) so start_listening()/play_after()'s
+        // "nothing claimed it" guard won't repaint READY over this.
+        display_thinking();
+        s_caption_at_tick = xTaskGetTickCount();
+    } else if (status < 0) {
+        display_status("NO PC", "START SERVER", COL_ERR);
+        vTaskDelay(pdMS_TO_TICKS(1200));
+    } else {
+        display_status("SEND", "FAILED", COL_ERR);
+        vTaskDelay(pdMS_TO_TICKS(1200));
+    }
 }
 
 typedef struct {
@@ -990,11 +1002,12 @@ void play_begin(play_session_t *ps, const uint8_t h[44], uint32_t body_len,
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 
     ps->opts = *opts;
-    // Wordless state pill — the reply is heard, not read. X-Reply-Text is still
-    // accepted on the wire (see play_opts_t) but no longer drawn.
-    if (!opts->quiet) {
-        display_status("SPEAKING", NULL, COL_OK);
-    }
+    // Wordless "talking" screen for the whole reply — quiet chunks included, so a
+    // pipelined multi-sentence answer shows the box is speaking instead of
+    // leaving the previous frame (SENT / LISTENING / the last order) frozen.
+    // X-Reply-Text is still accepted on the wire (see play_opts_t) but never
+    // drawn — the reply is heard, not read.
+    display_speaking();
 
     esp_codec_dev_sample_info_t fs = { .bits_per_sample = bits, .channel = ch, .sample_rate = rate };
     esp_codec_dev_open(s_spk, &fs);

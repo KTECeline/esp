@@ -31,6 +31,19 @@ void display_init(void);
 // flood -- pass a palette color such as COL_OK or COL_ERR).
 void display_status(const char *line1, const char *line2, uint16_t accent);
 
+// Waiting-for-the-agent screen: three dots under "THINKING". Shown from the
+// upload ack until the reply audio starts, so the gap while the server runs
+// STT -> LLM -> TTS doesn't look like a frozen "SENT".
+void display_thinking(void);
+
+// Talking-back screen: a centred sound-wave motif under the word "SPEAKING".
+// Held for the whole time the box is playing the agent's reply so a customer
+// can see at a glance that it is answering them. No transcript -- subtitles are
+// deliberately off on this box (see display_caption's note). Call it once per
+// streamed reply chunk; successive calls shift the wave so it visibly pulses
+// instead of sitting frozen.
+void display_speaking(void);
+
 // Stamps a small state pill in the top-right corner of whatever is currently on
 // screen. Call it AFTER the screen it annotates — it composites over the
 // existing framebuffer and flushes itself.

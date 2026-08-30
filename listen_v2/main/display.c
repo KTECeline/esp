@@ -413,6 +413,60 @@ void display_status(const char *line1, const char *line2, uint16_t accent)
     flush();
 }
 
+// Wordless "thinking" screen: three dots under "THINKING", shown from the
+// moment the upload is acked until the first reply audio arrives so the wait
+// for the agent (STT -> LLM -> first TTS chunk, all server side) doesn't read
+// as a frozen "SENT". Each call advances which dot is brightest.
+void display_thinking(void)
+{
+    if (!s_fb) return;
+    backdrop();
+    rect(0, 0, LCD_W, 3, COL_INFO);               // blue rule: working
+
+    enum { NDOTS = 3, DOT = 18, GAP = 24 };
+    static int lit = 0;
+    lit = (lit + 1) % NDOTS;
+
+    const int span = NDOTS * DOT + (NDOTS - 1) * GAP;
+    int x = (LCD_W - span) / 2;
+    const int cy = LCD_H / 2 - 14;
+    for (int i = 0; i < NDOTS; i++) {
+        uint16_t c = (i == lit) ? COL_INFO : shade(COL_INFO, 42);
+        round_rect(x, cy - DOT / 2, DOT, DOT, DOT / 2, c, c);
+        x += DOT + GAP;
+    }
+
+    text_center(0, LCD_W, cy + 34, &F_HEAD, C_TEXT, "THINKING");
+    flush();
+}
+
+// Wordless "talking" screen, shown for the whole reply. Six rounded bars around
+// a centre axis form a sound-wave under "SPEAKING"; each call rotates the height
+// table by one so a pipelined multi-sentence answer pulses instead of freezing.
+void display_speaking(void)
+{
+    if (!s_fb) return;
+    backdrop();
+    rect(0, 0, LCD_W, 3, COL_OK);                 // green rule: box is active
+
+    static const uint8_t BAR_H[] = { 16, 30, 52, 68, 44, 24 };
+    enum { NBARS = 6, BW = 16, GAP = 14 };
+    static int phase = 0;
+    phase = (phase + 1) % NBARS;
+
+    const int span = NBARS * BW + (NBARS - 1) * GAP;
+    int x = (LCD_W - span) / 2;
+    const int axis = LCD_H / 2 - 14;              // bars grow symmetrically about this
+    for (int i = 0; i < NBARS; i++) {
+        int bh = BAR_H[(i + phase) % NBARS];
+        round_rect(x, axis - bh / 2, BW, bh, BW / 2, COL_OK, shade(COL_OK, 68));
+        x += BW + GAP;
+    }
+
+    text_center(0, LCD_W, axis + 40, &F_HEAD, C_TEXT, "SPEAKING");
+    flush();
+}
+
 // Small state pill, top-right. Drawn OVER whatever is already on screen and
 // flushed on its own, so callers draw their screen first and then stamp this on
 // top rather than every screen function growing a status argument.
